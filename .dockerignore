@@ -1,0 +1,10 @@
+node_modules
+dist
+docs/.vitepress/dist
+.git
+.serena
+.yarn/install-state.gz
+npm-debug.log
+yarn-error.log
+coverage
+*.pcap

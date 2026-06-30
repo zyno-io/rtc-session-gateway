@@ -1,0 +1,50 @@
+{
+  "name": "@zyno-io/rtc-session-gateway",
+  "version": "1.0.0",
+  "packageManager": "yarn@4.17.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsc",
+    "dev": "APP_ENV=development npm-run-all clean -p dev:tsc dev:run",
+    "dev:tsc": "tsc -w --preserveWatchOutput -p tsconfig.json",
+    "dev:run": "sh -c 'while ! [ -f dist/index.js ]; do sleep 1; done; yarn start:dist:debug'",
+    "docs:build": "vitepress build docs",
+    "docs:dev": "vitepress dev docs --host 0.0.0.0",
+    "docs:preview": "vitepress preview docs --host 0.0.0.0",
+    "e2e:compose": "node scripts/run-compose-e2e.mjs",
+    "format": "oxfmt",
+    "start": "node .",
+    "start:dist:debug": "node-dev --inspect=9228 dist/index.js",
+    "start:dist:debug:wait": "node-dev --inspect-brk=9228 dist/index.js",
+    "test": "tsx --test test/**/*.test.ts"
+  },
+  "author": "Zyno Consulting <hello@zyno.io>",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "axios": "^1.7.4",
+    "drachtio-srf": "^5.0.24",
+    "express": "^4.19.2",
+    "pino": "^9.2.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@tsconfig/node20": "^20.1.4",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.1.0",
+    "@types/ws": "^8.18.1",
+    "@typescript-eslint/eslint-plugin": "^7.14.1",
+    "@typescript-eslint/parser": "^7.14.1",
+    "eslint": "^8.56.0",
+    "eslint-plugin-simple-import-sort": "^12.1.0",
+    "eslint-plugin-unused-imports": "^3.2.0",
+    "node-dev": "^8.0.0",
+    "npm-run-all": "^4.1.5",
+    "oxfmt": "^0.36.0",
+    "pino-pretty": "^11.2.2",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.2",
+    "vitepress": "^1.6.4",
+    "werift": "^0.23.0"
+  }
+}

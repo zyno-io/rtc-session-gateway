@@ -1,0 +1,262 @@
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import test from 'node:test';
+
+import { CallRegistry } from '../src/call-registry';
+import { ControlRouteMatch } from '../src/control-hub';
+import type { GatewayConfig } from '../src/config';
+import { DrachtioGateway } from '../src/drachtio-gateway';
+import { GatewayHttpClient } from '../src/http-client';
+
+test('unmatched INVITE receives 404', async () => {
+    const registry = new CallRegistry();
+    const gateway = new DrachtioGateway(config([]), registry, new FakeHttpClient([]), new FakeSrf() as any);
+    const res = new FakeResponse();
+
+    await gateway.handleInvite(fakeInvite(), res as any);
+
+    assert.deepEqual(res.sent, { status: 404, reason: 'No Route', opts: {} });
+    assert.equal(registry.size, 0);
+});
+
+test('answered INVITE creates a call and sends answered event to receiver URL', async () => {
+    const registry = new CallRegistry();
+    const httpClient = new FakeHttpClient([
+        {
+            action: 'answer',
+            sdp: 'local-sdp',
+            receiverUrl: 'https://receiver.example.com/call'
+        },
+        { ok: true }
+    ]);
+    const srf = new FakeSrf();
+    const gateway = new DrachtioGateway(
+        config([{ match: 'exact', value: 'support', url: 'https://route.example.com/sip' }]),
+        registry,
+        httpClient,
+        srf as any
+    );
+    const res = new FakeResponse();
+
+    await gateway.handleInvite(fakeInvite(), res as any);
+    await new Promise(resolve => setImmediate(resolve));
+
+    const calls = registry.list();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].callId, 'abc@example.com');
+    assert.equal(calls[0].receiverUrl, 'https://receiver.example.com/call');
+    assert.equal(srf.createdUas?.opts.localSdp, 'local-sdp');
+    assert.equal(httpClient.posts[0].url, 'https://route.example.com/sip');
+    assert.equal(httpClient.posts[1].url, 'https://receiver.example.com/call');
+    assert.equal((httpClient.posts[1].body as any).event, 'answered');
+});
+
+test('control route answers INVITE without HTTP route callback', async () => {
+    const registry = new CallRegistry();
+    const httpClient = new FakeHttpClient([]);
+    const srf = new FakeSrf();
+    const controlHub = new FakeControlHub({ action: 'answer', sdp: 'control-local-sdp' });
+    const gateway = new DrachtioGateway(
+        config([{ match: 'exact', value: 'support', url: 'https://route.example.com/sip' }]),
+        registry,
+        httpClient,
+        srf as any,
+        controlHub as any
+    );
+    const res = new FakeResponse();
+
+    await gateway.handleInvite(fakeInvite(), res as any);
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(httpClient.posts.length, 0);
+    assert.equal(controlHub.requests.length, 1);
+    assert.equal(controlHub.requests[0].method, 'sip.invite');
+    assert.equal((controlHub.requests[0].params as any).sdp, 'remote-sdp');
+    assert.equal(srf.createdUas?.opts.localSdp, 'control-local-sdp');
+    assert.equal(registry.list()[0].controlConnectionId, 'conn-1');
+});
+
+test('control-only route answers INVITE without static HTTP route', async () => {
+    const registry = new CallRegistry();
+    const httpClient = new FakeHttpClient([]);
+    const srf = new FakeSrf();
+    const controlHub = new FakeControlHub({ action: 'answer', sdp: 'control-local-sdp' });
+    const gateway = new DrachtioGateway(
+        config([]),
+        registry,
+        httpClient,
+        srf as any,
+        controlHub as any
+    );
+    const res = new FakeResponse();
+
+    await gateway.handleInvite(fakeInvite(), res as any);
+    await new Promise(resolve => setImmediate(resolve));
+
+    const calls = registry.list();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].routeUrl, 'control://conn-1');
+    assert.equal(calls[0].receiverUrl, 'control://conn-1');
+    assert.equal(httpClient.posts.length, 0);
+    assert.equal(controlHub.requests[0].method, 'sip.invite');
+    assert.equal(srf.createdUas?.opts.localSdp, 'control-local-sdp');
+});
+
+test('control route can reject INVITE before HTTP or dialog creation', async () => {
+    const registry = new CallRegistry();
+    const httpClient = new FakeHttpClient([]);
+    const srf = new FakeSrf();
+    const controlHub = new FakeControlHub({ action: 'reject', status: 486, reason: 'Busy Here' });
+    const gateway = new DrachtioGateway(
+        config([{ match: 'exact', value: 'support', url: 'https://route.example.com/sip' }]),
+        registry,
+        httpClient,
+        srf as any,
+        controlHub as any
+    );
+    const res = new FakeResponse();
+
+    await gateway.handleInvite(fakeInvite(), res as any);
+
+    assert.deepEqual(res.sent, { status: 486, reason: 'Busy Here', opts: { headers: undefined } });
+    assert.equal(httpClient.posts.length, 0);
+    assert.equal(srf.createdUas, undefined);
+    assert.equal(registry.size, 0);
+});
+
+test('createOutbound creates a UAC dialog and registers it as an active call', async () => {
+    const registry = new CallRegistry();
+    const httpClient = new FakeHttpClient([]);
+    const srf = new FakeSrf();
+    const gateway = new DrachtioGateway(config([]), registry, httpClient, srf as any);
+
+    const result = await gateway.createOutbound({
+        requestUri: 'sip:15551234567@carrier.example.com',
+        sdp: 'local-offer-sdp',
+        controlConnectionId: 'conn-1',
+        callingNumber: '18005551212',
+        callingName: 'ACME SUPPORT',
+        headers: { 'X-Test': 'yes' }
+    });
+
+    assert.deepEqual(result, {
+        sessionId: 'outbound@example.com',
+        sipCallId: 'outbound@example.com',
+        sdp: 'remote-answer-sdp'
+    });
+    assert.equal(srf.createdUac?.uri, 'sip:15551234567@carrier.example.com');
+    assert.equal((srf.createdUac?.opts as any).localSdp, 'local-offer-sdp');
+    assert.equal((srf.createdUac?.opts as any).callingNumber, '18005551212');
+    assert.equal((srf.createdUac?.opts as any).headers['X-Test'], 'yes');
+    assert.equal(registry.list().length, 1);
+    assert.equal(registry.list()[0].receiverUrl, 'control://conn-1');
+    assert.equal(registry.list()[0].remoteSdp, 'remote-answer-sdp');
+});
+
+class FakeHttpClient implements GatewayHttpClient {
+    posts: { url: string; body: unknown; timeoutMs: number }[] = [];
+
+    constructor(private responses: unknown[]) { }
+
+    async postJson<T>(url: string, body: unknown, timeoutMs: number): Promise<T> {
+        this.posts.push({ url, body, timeoutMs });
+        return this.responses.shift() as T;
+    }
+}
+
+class FakeSrf {
+    createdUas?: { req: unknown; res: unknown; opts: unknown };
+    createdUac?: { uri: string; opts: unknown };
+
+    async connect() { }
+    on() { return this; }
+    invite() { }
+
+    async createUAS(req: unknown, res: unknown, opts: unknown) {
+        this.createdUas = { req, res, opts };
+        return new EventEmitter();
+    }
+
+    async createUAC(uri: string, opts: unknown) {
+        this.createdUac = { uri, opts };
+        const dialog = new EventEmitter() as any;
+        dialog.sip = { callId: 'outbound@example.com' };
+        dialog.local = { sdp: (opts as any).localSdp };
+        dialog.remote = { sdp: 'remote-answer-sdp' };
+        return dialog;
+    }
+}
+
+class FakeControlHub {
+    requests: { connectionId: string; method: string; params: unknown; timeoutMs: number }[] = [];
+
+    constructor(private response: unknown) { }
+
+    findRoute(): ControlRouteMatch {
+        return {
+            connectionId: 'conn-1',
+            route: { match: 'exact', value: 'support', url: 'control://conn-1' }
+        };
+    }
+
+    async request(connectionId: string, method: string, params: unknown, timeoutMs: number) {
+        this.requests.push({ connectionId, method, params, timeoutMs });
+        return this.response;
+    }
+
+    isConnected() {
+        return true;
+    }
+
+    sendEvent() {
+        return true;
+    }
+}
+
+class FakeResponse {
+    finalResponseSent = false;
+    sent?: { status: number; reason?: string; opts?: unknown };
+
+    send(status: number, reason?: string | object, opts?: unknown) {
+        this.finalResponseSent = status >= 200;
+        if (typeof reason === 'object') {
+            this.sent = { status, opts: reason };
+        } else {
+            this.sent = { status, reason, opts };
+        }
+    }
+}
+
+function fakeInvite() {
+    const headers = {
+        'call-id': 'abc@example.com',
+        from: '<sip:+15551234567@example.net>',
+        to: '<sip:support@example.net>',
+        contact: '<sip:caller@example.net>'
+    };
+    return {
+        uri: 'sip:support@example.net',
+        callId: 'abc@example.com',
+        headers,
+        body: 'remote-sdp',
+        sdp: 'remote-sdp',
+        from: headers.from,
+        to: headers.to,
+        get: (name: string) => headers[name.toLowerCase() as keyof typeof headers]
+    };
+}
+
+function config(routes: GatewayConfig['ROUTES']): GatewayConfig {
+    return {
+        DRACHTIO_HOST: '127.0.0.1',
+        DRACHTIO_PORT: 9022,
+        HTTP_PORT: 3001,
+        CONTROL_WS_PATH: '/control',
+        CONTROL_AUTH_MODE: 'none',
+        CONTROL_MAX_PAYLOAD_BYTES: 1_048_576,
+        CONTROL_REQUEST_TIMEOUT_MS: 15_000,
+        INVITE_HTTP_TIMEOUT_MS: 15_000,
+        EVENT_HTTP_TIMEOUT_MS: 15_000,
+        ROUTES: routes
+    };
+}

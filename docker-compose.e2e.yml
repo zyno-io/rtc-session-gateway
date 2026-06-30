@@ -1,0 +1,81 @@
+services:
+  drachtio:
+    image: drachtio/drachtio-server:latest
+    command:
+      - drachtio
+      - --contact
+      - sip:*:5060;transport=tcp,udp
+      - --port
+      - "9022"
+      - --secret
+      - cymru
+      - --loglevel
+      - info
+    ports:
+      - "5060:5060/tcp"
+      - "5060:5060/udp"
+      - "9022:9022/tcp"
+
+  rtpbridge:
+    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:latest}
+    command:
+      - --listen
+      - 0.0.0.0:9100
+      - --media-ip
+      - 10.89.42.10
+    ports:
+      - "9100:9100/tcp"
+      - "30000-30100:30000-30100/udp"
+    volumes:
+      - rtpbridge-recordings:/var/lib/rtpbridge/recordings
+    networks:
+      default:
+        ipv4_address: 10.89.42.10
+        aliases:
+          - rtpbridge-e2e
+
+  rtpbridge-b:
+    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:latest}
+    command:
+      - --listen
+      - 0.0.0.0:9100
+      - --media-ip
+      - 10.89.42.11
+    ports:
+      - "9101:9100/tcp"
+    volumes:
+      - rtpbridge-recordings-b:/var/lib/rtpbridge/recordings
+    networks:
+      default:
+        ipv4_address: 10.89.42.11
+        aliases:
+          - rtpbridge-e2e
+
+  gateway:
+    build: .
+    depends_on:
+      - drachtio
+      - rtpbridge
+      - rtpbridge-b
+    environment:
+      DRACHTIO_HOST: drachtio
+      DRACHTIO_PORT: "9022"
+      DRACHTIO_SECRET: cymru
+      HTTP_PORT: "3001"
+      CONTROL_AUTH_MODE: none
+      RTPBRIDGE_HOST: rtpbridge-e2e
+      RTPBRIDGE_PORT: "9100"
+      RECORDINGS_PATH: /var/lib/rtpbridge/recordings
+      ROUTES_JSON: "[]"
+    ports:
+      - "3001:3001/tcp"
+
+volumes:
+  rtpbridge-recordings:
+  rtpbridge-recordings-b:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.89.42.0/24
