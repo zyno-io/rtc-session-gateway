@@ -41,6 +41,10 @@ GET /recordings/rtpbridge-0/call_42__seg_0001.pcap
 
 Recording paths are constrained to `RECORDINGS_PATH` and validated before proxying to rtpbridge.
 
+`GET /recordings` queries rtpbridge recording indexes. When the gateway has multiple rtpbridge backends, an all-backend list request fans out across each configured backend and combines the results. Use it for diagnostics, operator browsing, and recovery/backfill workflows.
+
+Production call-finalization flows should avoid prefix scans. Generate deterministic segment filenames in the application. If the application chooses the `filePath`, it already knows the `recordingPath`; in multi-backend deployments it should also persist the returned `backendId`. Use those known `{ backendId, path }` targets directly for download, merge, and delete operations.
+
 ## Ordered PCAP Merge
 
 ```http
@@ -62,6 +66,12 @@ The gateway streams one merged PCAP:
 - It appends packet records in target order.
 
 This is designed for continuity when an application intentionally records ordered raw PCAP segments. It does not currently sort packets by timestamp across targets.
+
+## Decoding PCAP
+
+The gateway stores and merges raw rtpbridge PCAP recordings. Decode merged or downloaded files with rtpbridge `pcap2audio`.
+
+See [rtpbridge Recording: Decoding (pcap2audio)](https://zyno-io.github.io/rtpbridge/protocol/recording.html#decoding-pcap2audio).
 
 ## Delete
 

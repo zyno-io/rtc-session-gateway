@@ -13,6 +13,7 @@ This plan tracks the reusable gateway as a standalone Zyno Consulting project. I
 - RTP media sessions, bridge/unbridge operations, playback, DTMF, gather, and leave-message workflows.
 - rtpbridge backend selection and per-call backend pinning.
 - Recording proxy routes and ordered raw PCAP segment merging.
+- Deterministic recording retrieval using explicit `{backendId, path}` targets returned by recording commands.
 - A generic public control protocol usable by multiple applications.
 
 It is not responsible for:
@@ -50,6 +51,7 @@ The VitePress documentation should become the authoritative public contract for 
 - SIP routing guide.
 - Media sessions guide.
 - Recording proxy and PCAP merge guide.
+- PCAP decoding guide that links to rtpbridge `pcap2audio`.
 - Operations guide.
 - Control protocol reference.
 - HTTP endpoint reference.

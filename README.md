@@ -151,6 +151,8 @@ HTTP recording routes are bearer-protected when `CONTROL_AUTH_MODE=bearer`.
 - `POST /recordings/merge`
 - `DELETE /recordings/:backendId/*`
 
+Production applications should prefer deterministic recording filenames over prefix scans. If the application chooses the `filePath` when starting each segment, it already knows the recording path and should not need `GET /recordings` on the hot path. In multi-backend deployments, also retain the `backendId` returned by `recording.start` and `recording.stop`; direct download, delete, and merge targets are `{ backendId, path }`. `GET /recordings` fans out across configured rtpbridge backends and is best reserved for diagnostics, operator browsing, or recovery/backfill flows.
+
 `POST /recordings/merge` accepts an ordered target list and streams one PCAP response. The gateway writes the first global PCAP header once, validates that every source segment has the same global header, and appends packet records in request order.
 
 ```json
@@ -163,3 +165,5 @@ HTTP recording routes are bearer-protected when `CONTROL_AUTH_MODE=bearer`.
 ```
 
 Clients should delete source segments only after the merged artifact is durably stored.
+
+Merged or downloaded PCAP files can be decoded with rtpbridge `pcap2audio`; see the rtpbridge recording docs at <https://zyno-io.github.io/rtpbridge/protocol/recording.html#decoding-pcap2audio>.

@@ -69,3 +69,5 @@ Response:
 - `DELETE /recordings/:backendId/*`
 
 Streaming routes return PCAP bytes and should be consumed as binary streams.
+
+`GET /recordings` scans rtpbridge recording indexes and can fan out across multiple configured backends. Production archival flows should usually choose deterministic `filePath` values, persist the returned `backendId`, and then download or merge explicit `{ backendId, path }` targets without a prefix scan.

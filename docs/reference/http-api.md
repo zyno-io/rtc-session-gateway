@@ -60,11 +60,13 @@
 | --- | --- | --- |
 | `POST` | `/sessions/:sessionId/recordings` | Start recording. |
 | `POST` | `/recordings/:recordingId/stop` | Stop recording. |
-| `GET` | `/recordings` | List recordings across backends. |
+| `GET` | `/recordings` | List recordings across backends. Best for diagnostics and recovery; production archival should use deterministic filenames plus the `backendId` returned by recording commands. |
 | `GET` | `/recordings/:backendId` | List recordings for one backend. |
 | `GET` | `/recordings/:backendId/*` | Stream one recording. |
 | `POST` | `/recordings/merge` | Stream ordered merged PCAP. |
 | `DELETE` | `/recordings/:backendId/*` | Delete one recording. |
+
+Decoded audio is not served by this API. Use rtpbridge `pcap2audio` for PCAP-to-WAV conversion: <https://zyno-io.github.io/rtpbridge/protocol/recording.html#decoding-pcap2audio>.
 
 ## Process
 

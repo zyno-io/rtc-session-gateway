@@ -19,6 +19,7 @@
 - Keep ordered PCAP segment concatenation for continuity.
 - Consider optional timestamp-sorted merge for advanced archival workflows.
 - Add retention and storage integration examples.
+- Keep `GET /recordings` positioned as a diagnostic/recovery API rather than the preferred production archival path.
 
 ## Operations
 
