@@ -2,6 +2,7 @@ import type http from 'node:http';
 
 import { WebSocketServer } from 'ws';
 
+import { isSensitiveControlRequest, scrubControlError, scrubControlEvent, scrubControlRequest, scrubControlResponse } from './control-log';
 import { ControlHub } from './control-hub';
 import {
     ControlErrorBody,
@@ -50,16 +51,26 @@ export class ControlServer {
                 this.logger.info({ connectionId }, 'Control connection established');
                 ws.on('message', data => {
                     this.handleMessage(connectionId, data.toString()).catch(err => {
-                        this.logger.warn({ err, connectionId }, 'Control message failed');
+                        this.logger.warn({ error: scrubControlError(err), connectionId }, 'Control message failed');
                     });
                 });
-                ws.send(JSON.stringify({
+                const connectedEvent = {
                     type: 'event',
                     event: 'control.connected',
                     eventId: connectionId,
                     occurredAt: new Date().toISOString(),
                     data: { connectionId }
-                }));
+                } as const;
+                const payload = JSON.stringify(connectedEvent);
+                this.logger.debug(
+                    {
+                        connectionId,
+                        payloadBytes: Buffer.byteLength(payload),
+                        body: scrubControlEvent(connectedEvent)
+                    },
+                    'Sending control event'
+                );
+                ws.send(payload);
             });
         });
     }
@@ -73,17 +84,27 @@ export class ControlServer {
         try {
             parsed = parseControlMessage(JSON.parse(raw));
         } catch (err) {
+            this.logger.debug({ connectionId, payloadBytes: Buffer.byteLength(raw) }, 'Received invalid control message');
             this.sendProtocolError(connectionId, err);
             return;
         }
 
         if (parsed.type === 'response') {
-            this.hub.handleResponse(connectionId, parsed);
+            if (!this.hub.handleResponse(connectionId, parsed)) {
+                this.logger.debug(
+                    {
+                        connectionId,
+                        payloadBytes: Buffer.byteLength(raw),
+                        body: scrubControlResponse(parsed)
+                    },
+                    'Ignoring unmatched control response'
+                );
+            }
             return;
         }
 
         if (parsed.type === 'event') {
-            this.logger.debug({ connectionId, event: parsed.event }, 'Ignoring client event');
+            this.logger.debug({ connectionId, payloadBytes: Buffer.byteLength(raw), body: scrubControlEvent(parsed) }, 'Ignoring client event');
             return;
         }
 
@@ -92,18 +113,29 @@ export class ControlServer {
 
     private async handleRequest(connectionId: string, request: ControlRequest) {
         const startedAt = Date.now();
-        const logContext = { connectionId, requestId: request.id, method: request.method };
+        const logContext = {
+            connectionId,
+            requestId: request.id,
+            method: request.method,
+            body: scrubControlRequest(request)
+        };
         this.logger.debug(logContext, 'Control request received');
         try {
-            const result = request.method === 'route.register'
-                ? { routes: this.hub.setRoutes(connectionId, parseRouteRegistrations(request.params)) }
-                : await this.commands.execute(request.method, request.params, { controlConnectionId: connectionId });
-            this.sendResponse(connectionId, request.id, true, result);
+            const result =
+                request.method === 'route.register'
+                    ? { routes: this.hub.setRoutes(connectionId, parseRouteRegistrations(request.params)) }
+                    : await this.commands.execute(request.method, request.params, {
+                          controlConnectionId: connectionId
+                      });
+            this.sendResponse(connectionId, request, true, result);
             this.logger.debug({ ...logContext, durationMs: Date.now() - startedAt }, 'Control request completed');
         } catch (err) {
             const error = errorForCommand(err);
-            this.logger.warn({ err, ...logContext, code: error.code, durationMs: Date.now() - startedAt }, 'Control request failed');
-            this.sendResponse(connectionId, request.id, false, undefined, error);
+            this.logger.warn(
+                { error: scrubControlError(err), ...logContext, code: error.code, durationMs: Date.now() - startedAt },
+                'Control request failed'
+            );
+            this.sendResponse(connectionId, request, false, undefined, error);
         }
     }
 
@@ -118,10 +150,17 @@ export class ControlServer {
         });
     }
 
-    private sendResponse(connectionId: string, id: string, ok: boolean, result?: unknown, error?: ControlErrorBody) {
-        this.hub.sendRaw(connectionId, ok
-            ? { type: 'response', id, ok, result }
-            : { type: 'response', id, ok, error });
+    private sendResponse(
+        connectionId: string,
+        request: Pick<ControlRequest, 'id' | 'method' | 'params'>,
+        ok: boolean,
+        result?: unknown,
+        error?: ControlErrorBody
+    ) {
+        this.hub.sendRaw(connectionId, ok ? { type: 'response', id: request.id, ok, result } : { type: 'response', id: request.id, ok, error }, {
+            method: request.method,
+            sensitive: isSensitiveControlRequest(request.method, request.params)
+        });
     }
 
     private isAuthorized(header: string | undefined) {

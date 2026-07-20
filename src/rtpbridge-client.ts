@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 
 import WebSocket from 'ws';
 
+import { scrubControlError, scrubRtpbridgeEvent, scrubRtpbridgeRequest, scrubRtpbridgeResponse } from './control-log';
 import { BaseLogger } from './logger';
 
 export interface RtpbridgeClientOptions {
@@ -93,11 +94,13 @@ export class RtpbridgeClient extends EventEmitter {
             });
         });
         this.ready.catch(err => this.logger.debug({ err }, 'rtpbridge ready promise rejected'));
-        this.ready.then(() => {
-            this.pingInterval = setInterval(() => {
-                if (this.ws.readyState === WebSocket.OPEN) this.ws.ping();
-            }, 30_000);
-        }).catch(() => {});
+        this.ready
+            .then(() => {
+                this.pingInterval = setInterval(() => {
+                    if (this.ws.readyState === WebSocket.OPEN) this.ws.ping();
+                }, 30_000);
+            })
+            .catch(() => {});
     }
 
     get backendId() {
@@ -235,7 +238,15 @@ export class RtpbridgeClient extends EventEmitter {
     private async sendRequest(method: string, params: Record<string, unknown>): Promise<any> {
         await this.ready;
         const id = randomUUID();
-        const payload = JSON.stringify({ id, method, params: toSnakeCase(params) });
+        const wireParams = toSnakeCase(params);
+        const payload = JSON.stringify({ id, method, params: wireParams });
+        this.logger.debug(
+            {
+                payloadBytes: Buffer.byteLength(payload),
+                body: scrubRtpbridgeRequest(id, method, wireParams)
+            },
+            'Sending rtpbridge request'
+        );
         const timeoutMs = this.options.timeoutMs ?? 10_000;
         const promise = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
@@ -262,24 +273,13 @@ export class RtpbridgeClient extends EventEmitter {
         try {
             parsed = JSON.parse(raw);
         } catch (err) {
-            this.logger.warn({ err, messageLength: raw.length }, 'Failed to parse rtpbridge message');
+            this.logger.warn({ error: scrubControlError(err), messageLength: raw.length }, 'Failed to parse rtpbridge message');
             return;
         }
 
         if (parsed.event) {
             const data = toCamelCase(parsed.data);
-            if (parsed.event === 'dtmf') {
-                const dtmf = data as RtpbridgeDtmfEvent;
-                this.logger.debug(
-                    {
-                        endpointId: dtmf.endpointId,
-                        digit: dtmf.sensitive === true ? '~' : dtmf.digit,
-                        durationMs: dtmf.durationMs,
-                        sensitive: dtmf.sensitive === true
-                    },
-                    'rtpbridge DTMF event received'
-                );
-            }
+            this.logger.debug({ payloadBytes: Buffer.byteLength(raw), body: scrubRtpbridgeEvent(parsed.event, data) }, 'Received rtpbridge event');
             this.emit(parsed.event, data);
             this.emit('rtpbridge.event', { event: parsed.event, data });
             return;
@@ -287,14 +287,21 @@ export class RtpbridgeClient extends EventEmitter {
 
         const pending = this.pending.get(parsed.id);
         if (!pending) {
-            this.logger.warn({ id: parsed.id }, 'No pending rtpbridge request');
+            this.logger.warn({ body: scrubRtpbridgeResponse(parsed.id, '<unknown>', parsed) }, 'No pending rtpbridge request');
             return;
         }
         this.pending.delete(parsed.id);
         clearTimeout(pending.timer);
+        this.logger.debug(
+            {
+                payloadBytes: Buffer.byteLength(raw),
+                body: scrubRtpbridgeResponse(parsed.id, pending.method, parsed)
+            },
+            'Received rtpbridge response'
+        );
 
         if (parsed.error) {
-            const message = typeof parsed.error === 'string' ? parsed.error : parsed.error.message ?? JSON.stringify(parsed.error);
+            const message = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message ?? JSON.stringify(parsed.error));
             pending.reject(new Error(message));
             return;
         }

@@ -3,13 +3,8 @@ import { EventEmitter } from 'node:events';
 
 import WebSocket from 'ws';
 
-import {
-    ControlErrorBody,
-    ControlResponse,
-    ControlProtocolError,
-    makeControlError,
-    RouteRegistration
-} from './control-protocol';
+import { ControlLogContext, isSensitiveControlRequest, scrubControlEvent, scrubControlRequest, scrubControlResponse } from './control-log';
+import { ControlEvent, ControlErrorBody, ControlResponse, ControlProtocolError, makeControlError, RouteRegistration } from './control-protocol';
 import { BaseLogger } from './logger';
 import { InviteDestination, matchRoute, normalizeRouteValue, RouteConfig } from './routing';
 
@@ -19,11 +14,12 @@ export class ControlRequestError extends Error {
     }
 }
 
-export class ControlConnectionUnavailableError extends Error { }
+export class ControlConnectionUnavailableError extends Error {}
 
 interface PendingRequest {
     connectionId: string;
     method: string;
+    sensitive: boolean;
     resolve: (value: unknown) => void;
     reject: (err: unknown) => void;
     timer: NodeJS.Timeout;
@@ -90,20 +86,30 @@ export class ControlHub extends EventEmitter {
     async request(connectionId: string, method: string, params: unknown, timeoutMs = this.requestTimeoutMs) {
         const connection = this.requireConnection(connectionId);
         const id = randomUUID();
-        const payload = JSON.stringify({ type: 'request', id, method, params });
+        const message = { type: 'request' as const, id, method, params };
+        const payload = JSON.stringify(message);
+        const sensitive = isSensitiveControlRequest(method, params);
 
         const promise = new Promise<unknown>((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(id);
                 reject(new ControlConnectionUnavailableError(`Control request ${method} timed out`));
             }, timeoutMs);
-            this.pending.set(id, { connectionId, method, resolve, reject, timer });
+            this.pending.set(id, { connectionId, method, sensitive, resolve, reject, timer });
         });
 
         if (connection.ws.readyState !== WebSocket.OPEN) {
             this.rejectPending(id, new ControlConnectionUnavailableError(`Control connection ${connectionId} is not open`));
         } else {
             try {
+                this.logger.debug(
+                    {
+                        connectionId,
+                        payloadBytes: Buffer.byteLength(payload),
+                        body: scrubControlRequest(message)
+                    },
+                    'Sending control request'
+                );
                 connection.ws.send(payload, err => {
                     if (err) this.rejectPending(id, err);
                 });
@@ -121,7 +127,7 @@ export class ControlHub extends EventEmitter {
         if (connection.ws.readyState !== WebSocket.OPEN) return false;
         const sequence = event.sessionId ? nextSequence(connection.sequenceBySession, event.sessionId) : undefined;
         try {
-            connection.ws.send(JSON.stringify({
+            const message: ControlEvent = {
                 type: 'event',
                 event: event.event,
                 eventId: randomUUID(),
@@ -129,7 +135,17 @@ export class ControlHub extends EventEmitter {
                 sequence,
                 occurredAt: new Date().toISOString(),
                 data: event.data
-            }), err => {
+            };
+            const payload = JSON.stringify(message);
+            this.logger.debug(
+                {
+                    connectionId,
+                    payloadBytes: Buffer.byteLength(payload),
+                    body: scrubControlEvent(message)
+                },
+                'Sending control event'
+            );
+            connection.ws.send(payload, err => {
                 if (err) this.logger.warn({ err, connectionId, event: event.event }, 'Control event send failed');
             });
             return true;
@@ -139,12 +155,21 @@ export class ControlHub extends EventEmitter {
         }
     }
 
-    sendRaw(connectionId: string, message: unknown) {
+    sendRaw(connectionId: string, message: ControlResponse, context: ControlLogContext = {}) {
         const connection = this.connections.get(connectionId);
         if (!connection) return false;
         if (connection.ws.readyState !== WebSocket.OPEN) return false;
         try {
-            connection.ws.send(JSON.stringify(message), err => {
+            const payload = JSON.stringify(message);
+            this.logger.debug(
+                {
+                    connectionId,
+                    payloadBytes: Buffer.byteLength(payload),
+                    body: scrubControlResponse(message, context)
+                },
+                'Sending control response'
+            );
+            connection.ws.send(payload, err => {
                 if (err) this.logger.warn({ err, connectionId }, 'Control message send failed');
             });
             return true;
@@ -158,15 +183,19 @@ export class ControlHub extends EventEmitter {
         const pending = this.pending.get(response.id);
         if (!pending) return false;
         if (pending.connectionId !== connectionId) {
-            this.logger.warn({
-                responseId: response.id,
-                expectedConnectionId: pending.connectionId,
-                actualConnectionId: connectionId
-            }, 'Ignoring response from wrong control connection');
+            this.logger.warn(
+                {
+                    responseId: response.id,
+                    expectedConnectionId: pending.connectionId,
+                    actualConnectionId: connectionId
+                },
+                'Ignoring response from wrong control connection'
+            );
             return false;
         }
         this.pending.delete(response.id);
         clearTimeout(pending.timer);
+        this.logger.debug({ connectionId, body: scrubControlResponse(response, pending) }, 'Received control response');
 
         if (response.ok) {
             pending.resolve(response.result);
