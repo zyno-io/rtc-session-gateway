@@ -9,6 +9,7 @@ import { pipeline } from 'node:stream/promises';
 
 import axios, { AxiosError } from 'axios';
 
+import { BaseLogger } from './logger';
 import {
     CreateMediaSessionParams,
     BridgeParams,
@@ -28,7 +29,7 @@ import {
     PlayAndWaitParams
 } from './media-controller';
 import { MediaServerManager, RtpbridgeBackend } from './media-server-manager';
-import { RtpbridgeClient, RtpbridgeServerInfo } from './rtpbridge-client';
+import { RtpbridgeClient, RtpbridgeDtmfEvent, RtpbridgeServerInfo } from './rtpbridge-client';
 
 interface MediaSessionRecord {
     sessionId: string;
@@ -76,6 +77,7 @@ const PCAP_HEADER_BYTES = 24;
 const MAX_RECORDING_MERGE_TARGETS = 1000;
 
 export class MediaSessionService implements GatewayMediaController {
+    private logger = BaseLogger.child({ ns: 'MediaSessionService' });
     private sessions = new Map<string, MediaSessionRecord>();
     private endpointToSession = new Map<string, string>();
     private recordings = new Map<string, RecordingMetadata>();
@@ -314,14 +316,16 @@ export class MediaSessionService implements GatewayMediaController {
 
     async gather(sessionId: string, params: GatherParams) {
         const session = this.requireEndpointInSession(sessionId, params.endpointId);
-        return this.collectDtmf(session, params);
+        this.assertDtmfGatherAvailable(params.endpointId, params.sensitive === true);
+        const gather = () => this.collectDtmf(session, params);
+        return params.sensitive ? this.withSensitiveDtmf(session, params.endpointId, gather) : gather();
     }
 
     async playAndGather(sessionId: string, params: PlayAndGatherParams) {
         const session = this.requireEndpointInSession(sessionId, params.endpointId);
+        this.assertDtmfGatherAvailable(params.endpointId, params.sensitive === true);
         let playbackEndpointId: string | undefined;
         let playbackStopped = false;
-        if (params.sensitive) this.sensitiveGatherEndpointIds.add(params.endpointId);
 
         const stopPlayback = async () => {
             if (!playbackEndpointId || playbackStopped) return;
@@ -329,24 +333,27 @@ export class MediaSessionService implements GatewayMediaController {
             await this.removeTrackedEndpoint(session, playbackEndpointId).catch(() => undefined);
         };
 
-        try {
-            const playback = await session.client.createFileEndpoint(sessionId, {
-                source: params.source,
-                loopCount: params.loopCount,
-                cacheTtlSecs: params.cacheTtlSecs,
-                headers: params.headers
-            });
-            playbackEndpointId = playback.endpointId;
-            this.addEndpoint(session, playbackEndpointId, 'file');
+        const gather = async () => {
+            try {
+                const playback = await session.client.createFileEndpoint(sessionId, {
+                    source: params.source,
+                    loopCount: params.loopCount,
+                    cacheTtlSecs: params.cacheTtlSecs,
+                    headers: params.headers
+                });
+                playbackEndpointId = playback.endpointId;
+                this.addEndpoint(session, playbackEndpointId, 'file');
 
-            const result = await this.collectDtmf(session, params, {
-                onFirstDigit: params.stopPlaybackOnDigit === false ? undefined : stopPlayback
-            });
-            return { ...result, playbackEndpointId };
-        } finally {
-            await stopPlayback();
-            if (params.sensitive) queueMicrotask(() => this.sensitiveGatherEndpointIds.delete(params.endpointId));
-        }
+                const result = await this.collectDtmf(session, params, {
+                    onFirstDigit: params.stopPlaybackOnDigit === false ? undefined : stopPlayback
+                });
+                return { ...result, playbackEndpointId };
+            } finally {
+                await stopPlayback();
+            }
+        };
+
+        return params.sensitive ? this.withSensitiveDtmf(session, params.endpointId, gather) : gather();
     }
 
     async playAndWait(sessionId: string, params: PlayAndWaitParams) {
@@ -567,7 +574,10 @@ export class MediaSessionService implements GatewayMediaController {
         this.cancelSessionActions(session);
         this.dropPairedBridgeEndpoints(session);
         this.sessions.delete(sessionId);
-        for (const endpointId of session.endpoints.keys()) this.endpointToSession.delete(endpointId);
+        for (const endpointId of session.endpoints.keys()) {
+            this.endpointToSession.delete(endpointId);
+            this.sensitiveGatherEndpointIds.delete(endpointId);
+        }
         for (const endpointId of session.endpoints.keys()) this.pendingIceRestarts.delete(endpointId);
         for (const [recordingId, metadata] of this.recordings) {
             if (metadata.sessionId === sessionId) this.recordings.delete(recordingId);
@@ -586,7 +596,6 @@ export class MediaSessionService implements GatewayMediaController {
         const terminator = params.terminator ?? '#';
         let cancel: () => void = () => undefined;
         const release = this.claimEndpointAction(params.endpointId, 'gather', () => cancel());
-        if (params.sensitive) this.sensitiveGatherEndpointIds.add(params.endpointId);
 
         return new Promise<GatherResult>(resolve => {
             let digits = '';
@@ -598,9 +607,6 @@ export class MediaSessionService implements GatewayMediaController {
                 if (timer) clearTimeout(timer);
                 session.client.removeListener('dtmf', onDtmf);
                 release();
-                if (params.sensitive) {
-                    queueMicrotask(() => this.sensitiveGatherEndpointIds.delete(params.endpointId));
-                }
             };
 
             const finish = (reason: GatherResult['reason']) => {
@@ -741,6 +747,7 @@ export class MediaSessionService implements GatewayMediaController {
         this.endpointToSession.delete(endpointId);
         this.pendingIceRestarts.delete(endpointId);
         this.activeEndpointActions.delete(endpointId);
+        this.sensitiveGatherEndpointIds.delete(endpointId);
         this.touch(session);
     }
 
@@ -778,13 +785,51 @@ export class MediaSessionService implements GatewayMediaController {
         for (const endpointId of session.endpoints.keys()) this.cancelEndpointAction(endpointId);
     }
 
+    private assertDtmfGatherAvailable(endpointId: string, sensitive: boolean) {
+        const active = this.activeEndpointActions.get(endpointId);
+        if (this.sensitiveGatherEndpointIds.has(endpointId) || (sensitive && active)) {
+            throw new MediaActionConflictError(`Endpoint ${endpointId} already has active ${active?.name ?? 'sensitive gather'}`);
+        }
+    }
+
+    private async withSensitiveDtmf<T>(
+        session: MediaSessionRecord,
+        endpointId: string,
+        operation: () => Promise<T>
+    ): Promise<T> {
+        this.sensitiveGatherEndpointIds.add(endpointId);
+        try {
+            await session.client.setSensitiveDtmf(endpointId, true);
+        } catch (err) {
+            this.sensitiveGatherEndpointIds.delete(endpointId);
+            this.logger.error({ err, endpointId }, 'Failed to enable sensitive DTMF mode');
+            throw err;
+        }
+
+        try {
+            return await operation();
+        } finally {
+            try {
+                await session.client.setSensitiveDtmf(endpointId, false);
+                this.sensitiveGatherEndpointIds.delete(endpointId);
+            } catch (err) {
+                // Fail closed: keep redacting downstream events if rtpbridge could
+                // not confirm that the endpoint left sensitive mode.
+                this.logger.error(
+                    { err, endpointId },
+                    'Failed to disable sensitive DTMF mode; continuing to redact endpoint events'
+                );
+            }
+        }
+    }
+
     private publishRtpbridgeEvent(session: MediaSessionRecord, event: unknown) {
         if (!session.ownerConnectionId || !this.eventPublisher) return;
-        if (isSensitiveDtmfEvent(event, this.sensitiveGatherEndpointIds)) return;
+        const publishableEvent = redactSensitiveDtmfEvent(event, this.sensitiveGatherEndpointIds);
         this.eventPublisher.sendEvent(session.ownerConnectionId, {
             event: 'media.rtpbridge',
             sessionId: session.sessionId,
-            data: event
+            data: publishableEvent
         });
     }
 
@@ -884,12 +929,24 @@ export class MediaSessionService implements GatewayMediaController {
     }
 }
 
-function isSensitiveDtmfEvent(event: unknown, sensitiveEndpointIds: Set<string>) {
-    if (!event || typeof event !== 'object' || Array.isArray(event)) return false;
+function redactSensitiveDtmfEvent(event: unknown, sensitiveEndpointIds: Set<string>): unknown {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) return event;
     const message = event as { event?: unknown; data?: unknown };
-    if (message.event !== 'dtmf' || !message.data || typeof message.data !== 'object' || Array.isArray(message.data)) return false;
-    const endpointId = (message.data as { endpointId?: unknown }).endpointId;
-    return typeof endpointId === 'string' && sensitiveEndpointIds.has(endpointId);
+    if (message.event !== 'dtmf' || !message.data || typeof message.data !== 'object' || Array.isArray(message.data)) {
+        return event;
+    }
+    const data = message.data as Partial<RtpbridgeDtmfEvent>;
+    const sensitive =
+        data.sensitive === true || (typeof data.endpointId === 'string' && sensitiveEndpointIds.has(data.endpointId));
+    if (!sensitive) return event;
+    return {
+        ...message,
+        data: {
+            ...data,
+            digit: '~',
+            sensitive: true
+        }
+    };
 }
 
 function selectCoturnIpv4(mediaIp: RtpbridgeServerInfo['mediaIp']): string | undefined {

@@ -39,6 +39,13 @@ export interface RtpbridgeServerInfo {
     mediaIp: string | string[];
 }
 
+export interface RtpbridgeDtmfEvent {
+    endpointId: string;
+    digit: string;
+    durationMs: number;
+    sensitive?: boolean;
+}
+
 interface PendingRequest {
     resolve: (value: any) => void;
     reject: (err: Error) => void;
@@ -175,6 +182,10 @@ export class RtpbridgeClient extends EventEmitter {
         await this.sendRequest('endpoint.dtmf.inject', { endpointId, digit });
     }
 
+    async setSensitiveDtmf(endpointId: string, enabled: boolean): Promise<void> {
+        await this.sendRequest('endpoint.dtmf.set_sensitive', { endpointId, enabled });
+    }
+
     async createFileEndpoint(sessionId: string, params: FileEndpointParams): Promise<{ endpointId: string }> {
         return this.sendRequest('endpoint.create_with_file', { sessionId, ...params });
     }
@@ -251,12 +262,24 @@ export class RtpbridgeClient extends EventEmitter {
         try {
             parsed = JSON.parse(raw);
         } catch (err) {
-            this.logger.warn({ err, raw }, 'Failed to parse rtpbridge message');
+            this.logger.warn({ err, messageLength: raw.length }, 'Failed to parse rtpbridge message');
             return;
         }
 
         if (parsed.event) {
             const data = toCamelCase(parsed.data);
+            if (parsed.event === 'dtmf') {
+                const dtmf = data as RtpbridgeDtmfEvent;
+                this.logger.debug(
+                    {
+                        endpointId: dtmf.endpointId,
+                        digit: dtmf.sensitive === true ? '~' : dtmf.digit,
+                        durationMs: dtmf.durationMs,
+                        sensitive: dtmf.sensitive === true
+                    },
+                    'rtpbridge DTMF event received'
+                );
+            }
             this.emit(parsed.event, data);
             this.emit('rtpbridge.event', { event: parsed.event, data });
             return;

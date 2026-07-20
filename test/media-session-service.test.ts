@@ -4,7 +4,7 @@ import { EventEmitter, once } from 'node:events';
 import http from 'node:http';
 import test from 'node:test';
 
-import { MediaSessionService, MediaUnavailableError } from '../src/media-session-service';
+import { MediaActionConflictError, MediaSessionService, MediaUnavailableError } from '../src/media-session-service';
 
 test('media session service forwards rtpbridge events to the owner control connection', async () => {
     const client = new FakeRtpbridgeClient();
@@ -151,7 +151,7 @@ test('media session service gathers DTMF locally from an endpoint', async () => 
     assert.deepEqual(await promise, { digits: '45', reason: 'digits' });
 });
 
-test('media session service does not fan out DTMF events during a sensitive gather', async () => {
+test('media session service redacts fanned-out DTMF events during a sensitive gather', async () => {
     const client = new FakeRtpbridgeClient();
     const publisher = new FakePublisher();
     const service = new MediaSessionService(new FakeMediaServerManager(client) as any, '/recordings', publisher);
@@ -166,13 +166,97 @@ test('media session service does not fan out DTMF events during a sensitive gath
         sensitive: true
     });
 
-    client.emit('dtmf', { endpointId: 'rtp-1', digit: '4' });
-    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '4' } });
-    client.emit('dtmf', { endpointId: 'rtp-1', digit: '5' });
-    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '5' } });
+    await new Promise(resolve => setImmediate(resolve));
+    client.emit('dtmf', { endpointId: 'rtp-1', digit: '4', sensitive: true });
+    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '4', sensitive: true } });
+    client.emit('dtmf', { endpointId: 'rtp-1', digit: '5', sensitive: true });
+    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '5', sensitive: true } });
 
     assert.deepEqual(await promise, { digits: '45', reason: 'digits' });
-    assert.deepEqual(publisher.events, []);
+    assert.deepEqual(client.sensitiveDtmfChanges, [
+        { endpointId: 'rtp-1', enabled: true },
+        { endpointId: 'rtp-1', enabled: false }
+    ]);
+    assert.deepEqual(publisher.events.map(published => (published.event.data as any).data.digit), ['~', '~']);
+    assert.equal(JSON.stringify(publisher.events).includes('4'), false);
+    assert.equal(JSON.stringify(publisher.events).includes('5'), false);
+});
+
+test('media session service leaves normal DTMF event values visible', async () => {
+    const client = new FakeRtpbridgeClient();
+    const publisher = new FakePublisher();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any, '/recordings', publisher);
+
+    await service.createSession({ ownerConnectionId: 'conn-1' });
+    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '7', sensitive: false } });
+
+    assert.equal((publisher.events[0].event.data as any).data.digit, '7');
+});
+
+test('media session service fails closed when rtpbridge cannot enable sensitive DTMF', async () => {
+    const client = new FakeRtpbridgeClient();
+    client.sensitiveDtmfError = new Error('privacy control unavailable');
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+
+    await service.createSession({ ownerConnectionId: 'conn-1' });
+    await service.createRtpOffer('media-session-1');
+
+    await assert.rejects(
+        service.gather('media-session-1', {
+            endpointId: 'rtp-1',
+            numDigits: 1,
+            sensitive: true
+        }),
+        /privacy control unavailable/
+    );
+    assert.equal(client.listenerCount('dtmf'), 0);
+});
+
+test('media session service keeps redacting when rtpbridge cannot disable sensitive DTMF', async () => {
+    const client = new FakeRtpbridgeClient();
+    const publisher = new FakePublisher();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any, '/recordings', publisher);
+
+    await service.createSession({ ownerConnectionId: 'conn-1' });
+    await service.createRtpOffer('media-session-1');
+    const promise = service.gather('media-session-1', {
+        endpointId: 'rtp-1',
+        numDigits: 1,
+        sensitive: true
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    client.sensitiveDtmfDisableError = new Error('privacy release unavailable');
+    client.emit('dtmf', { endpointId: 'rtp-1', digit: '8', sensitive: true });
+    assert.deepEqual(await promise, { digits: '8', reason: 'digits' });
+
+    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '9', sensitive: false } });
+    assert.equal((publisher.events[0].event.data as any).data.digit, '~');
+});
+
+test('media session service rejects overlapping gathers while sensitive mode is being established', async () => {
+    const client = new FakeRtpbridgeClient();
+    let releaseSensitiveMode!: () => void;
+    client.sensitiveDtmfDelay = new Promise(resolve => {
+        releaseSensitiveMode = resolve;
+    });
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+
+    await service.createSession();
+    await service.createRtpOffer('media-session-1');
+    const sensitiveGather = service.gather('media-session-1', {
+        endpointId: 'rtp-1',
+        numDigits: 1,
+        sensitive: true
+    });
+
+    await assert.rejects(
+        service.gather('media-session-1', { endpointId: 'rtp-1', numDigits: 1 }),
+        MediaActionConflictError
+    );
+    releaseSensitiveMode();
+    await new Promise(resolve => setImmediate(resolve));
+    client.emit('dtmf', { endpointId: 'rtp-1', digit: '1', sensitive: true });
+    assert.deepEqual(await sensitiveGather, { digits: '1', reason: 'digits' });
 });
 
 test('media session service stops playback when playAndGather collects a digit', async () => {
@@ -616,6 +700,10 @@ class FakeRtpbridgeClient extends EventEmitter {
     startedVad: Array<{ endpointId: string; options: unknown }> = [];
     stoppedVad: string[] = [];
     injectedDtmf: Array<{ endpointId: string; digit: string }> = [];
+    sensitiveDtmfChanges: Array<{ endpointId: string; enabled: boolean }> = [];
+    sensitiveDtmfError?: Error;
+    sensitiveDtmfDisableError?: Error;
+    sensitiveDtmfDelay?: Promise<void>;
     updatedDirections: Array<{ endpointId: string; direction: string }> = [];
     bridgedSessions: Array<{ targetSessionId: string; direction?: string }> = [];
     bridgeSessionDelay?: Promise<void>;
@@ -680,6 +768,13 @@ class FakeRtpbridgeClient extends EventEmitter {
 
     async injectDtmf(endpointId: string, digit: string) {
         this.injectedDtmf.push({ endpointId, digit });
+    }
+
+    async setSensitiveDtmf(endpointId: string, enabled: boolean) {
+        this.sensitiveDtmfChanges.push({ endpointId, enabled });
+        if (enabled && this.sensitiveDtmfError) throw this.sensitiveDtmfError;
+        if (enabled) await this.sensitiveDtmfDelay;
+        if (!enabled && this.sensitiveDtmfDisableError) throw this.sensitiveDtmfDisableError;
     }
 
     async updateDirection(endpointId: string, direction: string) {
