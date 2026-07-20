@@ -83,6 +83,7 @@ RTP:
 Media:
 
 - `media.play`
+- `media.playAndWait`
 - `media.stop`
 - `media.bridge`
 - `media.unbridge`
