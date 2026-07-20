@@ -65,7 +65,7 @@ test('media session service reuses pending ICE restart until the matching answer
 });
 
 test('media session service returns renewable ICE credentials for the coturn cohosted with its selected backend', async () => {
-    const client = new FakeRtpbridgeClient('media-session-1', 'rtpbridge-0', '108.85.76.234');
+    const client = new FakeRtpbridgeClient('media-session-1', 'rtpbridge-0', ['2001:db8::234', '108.85.76.234']);
     const service = new MediaSessionService(
         new FakeMediaServerManager(client) as any,
         '/recordings',
@@ -96,8 +96,8 @@ test('media session service returns renewable ICE credentials for the coturn coh
 });
 
 test('media session ICE configuration follows each newly selected rtpbridge backend', async () => {
-    const clientA = new FakeRtpbridgeClient('media-session-a', 'rtpbridge-0', '108.85.76.234');
-    const clientB = new FakeRtpbridgeClient('media-session-b', 'rtpbridge-1', '108.85.76.233');
+    const clientA = new FakeRtpbridgeClient('media-session-a', 'rtpbridge-0', ['108.85.76.234']);
+    const clientB = new FakeRtpbridgeClient('media-session-b', 'rtpbridge-1', ['108.85.76.233']);
     const service = new MediaSessionService(
         new FakeMediaServerManager(clientA, clientB) as any,
         '/recordings',
@@ -119,7 +119,7 @@ test('media session ICE configuration follows each newly selected rtpbridge back
 });
 
 test('media session setup fails closed when rtpbridge reports an invalid coturn media IP', async () => {
-    const client = new FakeRtpbridgeClient('media-session-1', 'rtpbridge-0', '999.85.76.234');
+    const client = new FakeRtpbridgeClient('media-session-1', 'rtpbridge-0', ['2001:db8::234', '999.85.76.234']);
     const service = new MediaSessionService(
         new FakeMediaServerManager(client) as any,
         '/recordings',
@@ -584,7 +584,7 @@ class FakeRtpbridgeClient extends EventEmitter {
     constructor(
         private sessionId = 'media-session-1',
         backendId = 'rtpbridge-0',
-        private mediaIp = '108.85.76.234'
+        private mediaIp: string | string[] = ['108.85.76.234']
     ) {
         super();
         this.backendId = backendId;

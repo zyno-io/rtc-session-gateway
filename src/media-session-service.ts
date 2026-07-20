@@ -27,7 +27,7 @@ import {
     PlayAndGatherParams
 } from './media-controller';
 import { MediaServerManager, RtpbridgeBackend } from './media-server-manager';
-import { RtpbridgeClient } from './rtpbridge-client';
+import { RtpbridgeClient, RtpbridgeServerInfo } from './rtpbridge-client';
 
 interface MediaSessionRecord {
     sessionId: string;
@@ -188,8 +188,8 @@ export class MediaSessionService implements GatewayMediaController {
         if (!secret) return undefined;
 
         const serverInfo = await client.getServerInfo();
-        const mediaIp = serverInfo.mediaIp?.trim();
-        if (!mediaIp || isIP(mediaIp) !== 4) {
+        const mediaIp = selectCoturnIpv4(serverInfo.mediaIp);
+        if (!mediaIp) {
             throw new MediaUnavailableError('rtpbridge server.info returned no usable IPv4 media_ip for cohosted coturn');
         }
 
@@ -867,6 +867,16 @@ export class MediaSessionService implements GatewayMediaController {
             throw recordingProxyError(err, 'rtpbridge recording download failed');
         }
     }
+}
+
+function selectCoturnIpv4(mediaIp: RtpbridgeServerInfo['mediaIp']): string | undefined {
+    const candidates = Array.isArray(mediaIp) ? mediaIp : [mediaIp];
+    for (const candidate of candidates) {
+        if (typeof candidate !== 'string') continue;
+        const trimmed = candidate.trim();
+        if (isIP(trimmed) === 4) return trimmed;
+    }
+    return undefined;
 }
 
 function snapshotSession(session: MediaSessionRecord): MediaSessionSnapshot {

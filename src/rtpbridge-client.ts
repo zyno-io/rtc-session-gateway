@@ -33,6 +33,12 @@ export interface VadOptions {
     speechThreshold?: number;
 }
 
+export interface RtpbridgeServerInfo {
+    hostname: string;
+    version?: string;
+    mediaIp: string | string[];
+}
+
 interface PendingRequest {
     resolve: (value: any) => void;
     reject: (err: Error) => void;
@@ -99,7 +105,7 @@ export class RtpbridgeClient extends EventEmitter {
         }
     }
 
-    async getServerInfo(): Promise<{ hostname: string; mediaIp: string }> {
+    async getServerInfo(): Promise<RtpbridgeServerInfo> {
         return this.sendRequest('server.info', {});
     }
 
