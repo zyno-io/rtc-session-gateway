@@ -16,7 +16,7 @@ Delete:
 { "type": "request", "id": "2", "method": "session.delete", "params": { "sessionId": "media-session-1" } }
 ```
 
-Sessions created through a control connection are owned by that connection and are cleaned up when it disconnects.
+Media sessions created through a control connection are owned by that connection and are cleaned up when it disconnects. SIP dialogs created or accepted through that connection are terminated at the same time so calls cannot remain alive without an application owner.
 
 ## WebRTC
 

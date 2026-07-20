@@ -9,8 +9,9 @@ import WebSocket from 'ws';
 
 const composeFile = 'docker-compose.e2e.yml';
 const projectName = process.env.COMPOSE_PROJECT_NAME || `rtc-session-gateway-e2e-${process.pid}`;
-const gatewayBaseUrl = process.env.E2E_GATEWAY_URL || 'http://127.0.0.1:3001';
-const controlUrl = process.env.E2E_CONTROL_URL || 'ws://127.0.0.1:3001/control';
+const gatewayPort = process.env.E2E_GATEWAY_PORT || '3001';
+const gatewayBaseUrl = process.env.E2E_GATEWAY_URL || `http://127.0.0.1:${gatewayPort}`;
+const controlUrl = process.env.E2E_CONTROL_URL || `ws://127.0.0.1:${gatewayPort}/control`;
 const drachtioHost = process.env.E2E_SIP_HOST || '127.0.0.1';
 const drachtioPort = Number(process.env.E2E_SIP_PORT || 5060);
 const rtpbridgeMediaHost = process.env.E2E_RTPBRIDGE_MEDIA_HOST;
@@ -511,7 +512,7 @@ async function sendVadPatternUntilSettled(actionPromise, probe, peerId, rtpTarge
 
 function pickRtpbridgeImage() {
     const candidates = [
-        'ghcr.io/zyno-io/rtpbridge:latest'
+        'ghcr.io/zyno-io/rtpbridge:main'
     ];
     for (const candidate of candidates) {
         if (dockerImageExists(candidate)) return candidate;

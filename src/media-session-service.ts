@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream, WriteStream } from 'node:fs';
 import { mkdtemp, open, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { posix as path } from 'node:path';
@@ -358,7 +358,16 @@ export class MediaSessionService implements GatewayMediaController {
 
     async destroySessionsForOwner(ownerConnectionId: string) {
         const owned = [...this.sessions.values()].filter(session => session.ownerConnectionId === ownerConnectionId);
-        await Promise.allSettled(owned.map(session => this.destroySession(session.sessionId)));
+        for (const session of owned) this.dropSession(session.sessionId);
+        await Promise.allSettled(
+            owned.map(async session => {
+                try {
+                    await session.client.destroySession(session.sessionId);
+                } finally {
+                    session.client.close();
+                }
+            })
+        );
     }
 
     async stopRecording(recordingId: string) {
@@ -888,7 +897,7 @@ async function readPcapHeader(filePath: string) {
     }
 }
 
-async function appendFileRange(output: ReturnType<typeof createWriteStream>, filePath: string, start: number) {
+async function appendFileRange(output: WriteStream, filePath: string, start: number) {
     const input = createReadStream(filePath, { start });
     try {
         for await (const chunk of input) {

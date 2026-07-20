@@ -10,6 +10,8 @@ A production deployment needs:
 - rtpbridge backends reachable from the gateway when media is enabled.
 - UDP media paths between rtpbridge and remote RTP/WebRTC peers.
 
+When Drachtio uses outbound request routing, configure `DRACHTIO_APP_TAG` and point Drachtio's `INVITE` request handler at `/drachtio/route`. The route endpoint selects the gateway tag only for a currently registered gateway route. If `DRACHTIO_ROUTE_FALLBACK_URL` is configured, all other requests are forwarded to that existing router.
+
 ## Health
 
 `GET /healthz` returns process health and active call count.
@@ -27,7 +29,7 @@ The service uses Pino. Log records include namespace fields for gateway, control
 
 ## Shutdown
 
-The `/terminate` route triggers process exit. Prefer platform-native graceful shutdown where available. Active SIP dialogs and media sessions should be explicitly torn down by the owning application before shutdown.
+The `/terminate` route triggers process exit. Prefer platform-native graceful shutdown where available. Closing a control WebSocket tears down its owned media sessions and SIP dialogs; HTTP-owned resources should be explicitly torn down by their application before shutdown.
 
 ## Local Compose
 

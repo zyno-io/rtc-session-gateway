@@ -102,6 +102,45 @@ test('control-only route answers INVITE without static HTTP route', async () => 
     assert.equal(srf.createdUas?.opts.localSdp, 'control-local-sdp');
 });
 
+test('control route receives a termination event when SIP answer setup fails', async () => {
+    const registry = new CallRegistry();
+    const srf = new FakeSrf();
+    srf.createUasError = new Error('createUAS failed');
+    const controlHub = new FakeControlHub({ action: 'answer', sdp: 'control-local-sdp' });
+    const gateway = new DrachtioGateway(config([]), registry, new FakeHttpClient([]), srf as any, controlHub as any);
+    const res = new FakeResponse();
+
+    await gateway.handleInvite(fakeInvite(), res as any);
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(registry.size, 0);
+    assert.deepEqual(res.sent, { status: 502, reason: 'Bad Gateway', opts: {} });
+    assert.equal(controlHub.events.length, 1);
+    assert.equal(controlHub.events[0].event.event, 'sip.terminated');
+    assert.equal(controlHub.events[0].event.sessionId, 'abc@example.com');
+    assert.equal((controlHub.events[0].event.data as any).reason, 'answer-failed');
+});
+
+test('answered SIP dialog is destroyed when call registration fails', async () => {
+    const registry = new CallRegistry();
+    registry.activate = () => {
+        throw new Error('registration failed');
+    };
+    const srf = new FakeSrf();
+    const controlHub = new FakeControlHub({ action: 'answer', sdp: 'control-local-sdp' });
+    const gateway = new DrachtioGateway(config([]), registry, new FakeHttpClient([]), srf as any, controlHub as any);
+    const res = new FakeResponse();
+
+    await gateway.handleInvite(fakeInvite(), res as any);
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(registry.size, 0);
+    assert.equal(srf.destroyedDialogs, 1);
+    assert.equal(controlHub.events.length, 1);
+    assert.equal(controlHub.events[0].event.event, 'sip.terminated');
+    assert.equal((controlHub.events[0].event.data as any).reason, 'answer-failed');
+});
+
 test('control route can reject INVITE before HTTP or dialog creation', async () => {
     const registry = new CallRegistry();
     const httpClient = new FakeHttpClient([]);
@@ -153,6 +192,27 @@ test('createOutbound creates a UAC dialog and registers it as an active call', a
     assert.equal(registry.list()[0].remoteSdp, 'remote-answer-sdp');
 });
 
+test('terminates SIP calls owned by a disconnected control connection', async () => {
+    const registry = new CallRegistry();
+    const controlHub = new FakeControlHub({});
+    const srf = new FakeSrf();
+    const gateway = new DrachtioGateway(config([]), registry, new FakeHttpClient([]), srf as any, controlHub as any);
+
+    await gateway.createOutbound({
+        requestUri: 'sip:15551234567@carrier.example.com',
+        sdp: 'local-offer-sdp',
+        controlConnectionId: 'conn-1'
+    });
+    const termination = gateway.terminateCallsForControlConnection('conn-1');
+
+    assert.equal(registry.size, 0);
+    await termination;
+    assert.equal(srf.destroyedDialogs, 1);
+    assert.equal(controlHub.events.length, 1);
+    assert.equal(controlHub.events[0].event.event, 'sip.terminated');
+    assert.equal((controlHub.events[0].event.data as any).reason, 'control-disconnected');
+});
+
 class FakeHttpClient implements GatewayHttpClient {
     posts: { url: string; body: unknown; timeoutMs: number }[] = [];
 
@@ -167,6 +227,8 @@ class FakeHttpClient implements GatewayHttpClient {
 class FakeSrf {
     createdUas?: { req: unknown; res: unknown; opts: unknown };
     createdUac?: { uri: string; opts: unknown };
+    createUasError?: Error;
+    destroyedDialogs = 0;
 
     async connect() { }
     on() { return this; }
@@ -174,21 +236,32 @@ class FakeSrf {
 
     async createUAS(req: unknown, res: unknown, opts: unknown) {
         this.createdUas = { req, res, opts };
-        return new EventEmitter();
+        if (this.createUasError) throw this.createUasError;
+        return this.createDialog();
     }
 
     async createUAC(uri: string, opts: unknown) {
         this.createdUac = { uri, opts };
-        const dialog = new EventEmitter() as any;
+        const dialog = this.createDialog();
         dialog.sip = { callId: 'outbound@example.com' };
         dialog.local = { sdp: (opts as any).localSdp };
         dialog.remote = { sdp: 'remote-answer-sdp' };
+        return dialog;
+    }
+
+    private createDialog() {
+        const dialog = new EventEmitter() as any;
+        dialog.destroy = (_opts: unknown, callback: (err?: Error) => void) => {
+            this.destroyedDialogs++;
+            callback();
+        };
         return dialog;
     }
 }
 
 class FakeControlHub {
     requests: { connectionId: string; method: string; params: unknown; timeoutMs: number }[] = [];
+    events: { connectionId: string; event: { event: string; sessionId?: string; data?: unknown } }[] = [];
 
     constructor(private response: unknown) { }
 
@@ -208,7 +281,8 @@ class FakeControlHub {
         return true;
     }
 
-    sendEvent() {
+    sendEvent(connectionId: string, event: { event: string; sessionId?: string; data?: unknown }) {
+        this.events.push({ connectionId, event });
         return true;
     }
 }

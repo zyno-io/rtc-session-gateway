@@ -9,6 +9,10 @@ services:
       - "9022"
       - --secret
       - cymru
+      - --http-handler
+      - http://gateway:3001/drachtio/route
+      - --http-method
+      - GET
       - --loglevel
       - info
     ports:
@@ -17,7 +21,7 @@ services:
       - "9022:9022/tcp"
 
   rtpbridge:
-    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:latest}
+    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:main}
     command:
       - --listen
       - 0.0.0.0:9100
@@ -35,7 +39,7 @@ services:
           - rtpbridge-e2e
 
   rtpbridge-b:
-    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:latest}
+    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:main}
     command:
       - --listen
       - 0.0.0.0:9100
@@ -52,7 +56,9 @@ services:
           - rtpbridge-e2e
 
   gateway:
-    build: .
+    build:
+      context: .
+      target: e2e
     depends_on:
       - drachtio
       - rtpbridge
@@ -61,6 +67,7 @@ services:
       DRACHTIO_HOST: drachtio
       DRACHTIO_PORT: "9022"
       DRACHTIO_SECRET: cymru
+      DRACHTIO_APP_TAG: rtc-session-gateway
       HTTP_PORT: "3001"
       CONTROL_AUTH_MODE: none
       RTPBRIDGE_HOST: rtpbridge-e2e
@@ -68,7 +75,7 @@ services:
       RECORDINGS_PATH: /var/lib/rtpbridge/recordings
       ROUTES_JSON: "[]"
     ports:
-      - "3001:3001/tcp"
+      - "${E2E_GATEWAY_PORT:-3001}:3001/tcp"
 
 volumes:
   rtpbridge-recordings:

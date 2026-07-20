@@ -48,7 +48,7 @@ export class DrachtioGateway {
         srf?: Srf,
         private controlHub?: ControlHub
     ) {
-        this.srf = srf ?? new Srf();
+        this.srf = srf ?? (config.DRACHTIO_APP_TAG ? new Srf(config.DRACHTIO_APP_TAG) : new Srf());
     }
 
     get isConnected() {
@@ -99,6 +99,8 @@ export class DrachtioGateway {
         const inviteRequest = buildInviteRequest(req, callId, sipCallId, destinationUri, destinationUser);
         const routeUrl = controlRoute?.route.url ?? httpRoute!.url;
 
+        let acceptedReceiverUrl: string | undefined;
+        let answeredDialog: Srf.Dialog | undefined;
         try {
             const action = controlRoute
                 ? await this.requestInviteActionFromControl(controlRoute.connectionId, inviteRequest)
@@ -111,10 +113,13 @@ export class DrachtioGateway {
                 return;
             }
 
+            acceptedReceiverUrl = controlRoute ? controlRoute.route.url : action.receiverUrl ?? httpRoute!.url;
+
             const dialog = await this.srf.createUAS(req, res, {
                 localSdp: action.sdp,
                 headers: action.headers
             });
+            answeredDialog = dialog;
             const now = new Date().toISOString();
             const call = this.registry.activate({
                 callId,
@@ -133,6 +138,7 @@ export class DrachtioGateway {
             });
 
             this.bindDialog(call);
+            answeredDialog = undefined;
             this.logger.info({ call: snapshotCall(call) }, 'SIP dialog answered');
             void this.sendFollowUpEvent(call, {
                 event: 'answered',
@@ -144,12 +150,33 @@ export class DrachtioGateway {
                 receivedAt: new Date().toISOString()
             });
         } catch (err) {
+            this.registry.remove(callId);
             this.registry.releaseReservation(callId);
+            if (answeredDialog) await this.destroyFailedInviteDialog(answeredDialog, callId);
             this.logger.warn({ err, callId, routeUrl }, 'Failed to route INVITE');
+            if (acceptedReceiverUrl) {
+                void this.sendFailedInviteEvent(controlRoute?.connectionId, acceptedReceiverUrl, {
+                    event: 'terminated',
+                    callId,
+                    sipCallId,
+                    reason: 'answer-failed',
+                    receivedAt: new Date().toISOString()
+                });
+            }
             if (!res.finalResponseSent) {
                 const status = sipStatusForError(err);
                 res.send(status, status === 504 ? 'Gateway Timeout' : 'Bad Gateway', {});
             }
+        }
+    }
+
+    private async destroyFailedInviteDialog(dialog: Srf.Dialog, callId: string) {
+        try {
+            await new Promise<void>((resolve, reject) => {
+                dialog.destroy({ headers: {} }, err => (err ? reject(err) : resolve()));
+            });
+        } catch (err) {
+            this.logger.warn({ err, callId }, 'Failed to destroy SIP dialog after INVITE setup failure');
         }
     }
 
@@ -212,7 +239,6 @@ export class DrachtioGateway {
         if (!call) throw new CallNotFoundError(`Call ${callId} not found`);
 
         const byeHeaders = { ...(headers ?? {}) };
-        if (reason && !byeHeaders.Reason) byeHeaders.Reason = reason;
 
         await new Promise<void>((resolve, reject) => {
             call.dialog.destroy({ headers: byeHeaders }, err => (err ? reject(err) : resolve()));
@@ -231,6 +257,33 @@ export class DrachtioGateway {
                 receivedAt: new Date().toISOString()
             });
         }
+    }
+
+    async terminateCallsForControlConnection(connectionId: string) {
+        const calls = this.registry
+            .list()
+            .filter(call => call.controlConnectionId === connectionId)
+            .map(call => this.registry.remove(call.callId))
+            .filter((call): call is ActiveCall => !!call);
+        await Promise.allSettled(
+            calls.map(async call => {
+                try {
+                    await new Promise<void>((resolve, reject) => {
+                        call.dialog.destroy({ headers: {} }, err => (err ? reject(err) : resolve()));
+                    });
+                    void this.sendFollowUpEvent(call, {
+                        event: 'terminated',
+                        callId: call.callId,
+                        sipCallId: call.sipCallId,
+                        reason: 'control-disconnected',
+                        headers: {},
+                        receivedAt: new Date().toISOString()
+                    });
+                } catch (err) {
+                    this.logger.warn({ err, callId: call.callId, connectionId }, 'Failed to terminate control-owned SIP call');
+                }
+            })
+        );
     }
 
     private bindDialog(call: ActiveCall) {
@@ -373,6 +426,24 @@ export class DrachtioGateway {
             this.config.INVITE_HTTP_TIMEOUT_MS
         );
         return parseSipActionResponse(response, { allowReceiverUrl: true });
+    }
+
+    private async sendFailedInviteEvent(connectionId: string | undefined, receiverUrl: string, event: FollowUpHttpEvent) {
+        if (connectionId && this.controlHub?.isConnected(connectionId)) {
+            this.controlHub.sendEvent(connectionId, {
+                event: 'sip.terminated',
+                sessionId: event.callId,
+                data: event
+            });
+            return;
+        }
+        if (isControlUrl(receiverUrl)) return;
+
+        try {
+            await this.httpClient.postJson(receiverUrl, event, this.config.EVENT_HTTP_TIMEOUT_MS);
+        } catch (err) {
+            this.logger.warn({ err, callId: event.callId }, 'Failed to deliver failed INVITE termination event');
+        }
     }
 }
 

@@ -1,9 +1,11 @@
-import { parseRoutesJson } from './routing';
+import { parseRoutesJson, RouteConfig } from './routing';
 
 export interface GatewayConfig {
     DRACHTIO_HOST: string;
     DRACHTIO_PORT: number;
     DRACHTIO_SECRET?: string;
+    DRACHTIO_APP_TAG?: string;
+    DRACHTIO_ROUTE_FALLBACK_URL?: string;
     HTTP_PORT: number;
     CONTROL_WS_PATH: string;
     CONTROL_AUTH_MODE: 'bearer' | 'none';
@@ -18,7 +20,7 @@ export interface GatewayConfig {
     RECORDINGS_PATH: string;
     INVITE_HTTP_TIMEOUT_MS: number;
     EVENT_HTTP_TIMEOUT_MS: number;
-    ROUTES: ReturnType<typeof parseRoutesJson>;
+    ROUTES: RouteConfig[];
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
@@ -27,6 +29,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         DRACHTIO_HOST: env.DRACHTIO_HOST || '127.0.0.1',
         DRACHTIO_PORT: readPositiveInteger(env.DRACHTIO_PORT, 9022, 'DRACHTIO_PORT'),
         DRACHTIO_SECRET: env.DRACHTIO_SECRET || undefined,
+        DRACHTIO_APP_TAG: readDrachtioAppTag(env.DRACHTIO_APP_TAG),
+        DRACHTIO_ROUTE_FALLBACK_URL: readOptionalUrl(env.DRACHTIO_ROUTE_FALLBACK_URL, 'DRACHTIO_ROUTE_FALLBACK_URL'),
         HTTP_PORT: readPositiveInteger(env.HTTP_PORT, 3001, 'HTTP_PORT'),
         CONTROL_WS_PATH: env.CONTROL_WS_PATH || '/control',
         CONTROL_AUTH_MODE: controlAuthMode,
@@ -43,6 +47,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         EVENT_HTTP_TIMEOUT_MS: readPositiveInteger(env.EVENT_HTTP_TIMEOUT_MS, 15_000, 'EVENT_HTTP_TIMEOUT_MS'),
         ROUTES: parseRoutesJson(env.ROUTES_JSON)
     };
+}
+
+function readDrachtioAppTag(value: string | undefined) {
+    if (!value?.trim()) return undefined;
+    const tag = value.trim();
+    if (tag.length > 32 || !/^[a-zA-Z0-9-_+@:]+$/.test(tag)) {
+        throw new Error('DRACHTIO_APP_TAG must be at most 32 characters and contain only letters, numbers, -, _, +, @, or :');
+    }
+    return tag;
+}
+
+function readOptionalUrl(value: string | undefined, name: string) {
+    if (!value?.trim()) return undefined;
+    try {
+        return new URL(value).toString();
+    } catch {
+        throw new Error(`${name} must be a valid URL`);
+    }
 }
 
 function readPositiveInteger(value: string | undefined, fallback: number, name: string) {

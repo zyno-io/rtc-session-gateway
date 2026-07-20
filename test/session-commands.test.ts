@@ -226,10 +226,18 @@ test('HTTP recording proxy lists and streams backend recordings', async () => {
             limit: 100
         });
 
-        const downloaded = await fetch(`http://127.0.0.1:${port}/recordings/rtpbridge-0/call_42.pcap`);
+        const downloaded = await fetch(`http://127.0.0.1:${port}/recordings/rtpbridge-0/calls/42/call_42.pcap`);
         assert.equal(downloaded.status, 200);
         assert.equal(downloaded.headers.get('content-type'), 'application/vnd.tcpdump.pcap');
         assert.equal(await downloaded.text(), 'pcap-bytes');
+        assert.deepEqual(media.calls.at(-1), ['downloadRecording', 'rtpbridge-0', 'calls/42/call_42.pcap']);
+
+        const deleted = await fetch(`http://127.0.0.1:${port}/recordings/rtpbridge-0/calls/42/call_42.pcap`, {
+            method: 'DELETE'
+        });
+        assert.equal(deleted.status, 200);
+        assert.deepEqual(await deleted.json(), { deleted: true });
+        assert.deepEqual(media.calls.at(-1), ['deleteRecording', 'rtpbridge-0', 'calls/42/call_42.pcap']);
 
         const merged = await fetch(`http://127.0.0.1:${port}/recordings/merge`, {
             method: 'POST',

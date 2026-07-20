@@ -116,4 +116,4 @@ The WebSocket command surface is the canonical command surface. HTTP routes call
 
 ## Ownership Cleanup
 
-Media sessions created by a control connection are tied to that connection. When the connection closes, owned sessions are torn down.
+Media sessions and SIP dialogs created or accepted by a control connection are tied to that connection. When the connection closes, owned media is torn down and owned SIP dialogs are terminated.

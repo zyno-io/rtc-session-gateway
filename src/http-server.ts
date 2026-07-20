@@ -1,3 +1,4 @@
+import axios from 'axios';
 import express from 'express';
 import http from 'node:http';
 
@@ -11,6 +12,7 @@ import { BaseLogger } from './logger';
 import type { GatewayMediaController } from './media-controller';
 import { MediaBackendNotFoundError } from './media-server-manager';
 import { MediaActionConflictError, MediaEndpointNotFoundError, MediaRecordingProxyError, MediaSessionNotFoundError, MediaUnavailableError } from './media-session-service';
+import { getSipUser, matchRoute } from './routing';
 import { CommandNotImplementedError, CommandValidationError, SessionCommandHandler } from './session-commands';
 
 export interface GatewayController {
@@ -29,11 +31,31 @@ export interface GatewayController {
     bye(callId: string, reason?: string, headers?: Record<string, string>): Promise<void>;
 }
 
+type RecordingPathRouteParams = {
+    backendId: string;
+    recordingPath: string[];
+};
+
+type CallRouteParams = {
+    callId: string;
+};
+
+export type HttpAuthConfig = Pick<GatewayConfig, 'CONTROL_AUTH_MODE' | 'CONTROL_AUTH_TOKEN'>;
+
+export type DrachtioHttpRouteConfig = Pick<
+    GatewayConfig,
+    'DRACHTIO_APP_TAG' | 'DRACHTIO_ROUTE_FALLBACK_URL' | 'INVITE_HTTP_TIMEOUT_MS' | 'ROUTES'
+>;
+
+type HttpServerConfig = Pick<GatewayConfig, 'HTTP_PORT' | 'CONTROL_WS_PATH' | 'CONTROL_MAX_PAYLOAD_BYTES'> &
+    HttpAuthConfig &
+    DrachtioHttpRouteConfig;
+
 export class HttpServer {
     private logger = BaseLogger.child({ ns: 'HttpServer' });
 
     constructor(
-        private config: Pick<GatewayConfig, 'HTTP_PORT' | 'CONTROL_WS_PATH' | 'CONTROL_AUTH_MODE' | 'CONTROL_AUTH_TOKEN' | 'CONTROL_MAX_PAYLOAD_BYTES'>,
+        private config: HttpServerConfig,
         private registry: CallRegistry,
         private gateway: GatewayController,
         private controlHub?: ControlHub,
@@ -41,7 +63,7 @@ export class HttpServer {
     ) { }
 
     start() {
-        const app = createHttpApp(this.registry, this.gateway, this.media, this.config);
+        const app = createHttpApp(this.registry, this.gateway, this.media, this.config, this.config, this.controlHub);
         const server = http.createServer(app);
         if (this.controlHub) {
             new ControlServer(
@@ -66,7 +88,9 @@ export function createHttpApp(
     registry: CallRegistry,
     gateway: GatewayController,
     media?: GatewayMediaController,
-    authConfig?: Pick<GatewayConfig, 'CONTROL_AUTH_MODE' | 'CONTROL_AUTH_TOKEN'>
+    authConfig?: HttpAuthConfig,
+    drachtioRouteConfig?: DrachtioHttpRouteConfig,
+    controlHub?: ControlHub
 ) {
     const logger = BaseLogger.child({ ns: 'Http' });
     const app = express();
@@ -79,8 +103,46 @@ export function createHttpApp(
     });
 
     app.get('/healthz', (_req, res) => {
-        res.send({ ok: gateway.isConnected, calls: registry.size });
+        res.status(gateway.isConnected ? 200 : 503).send({ ok: gateway.isConnected, calls: registry.size });
     });
+
+    if (drachtioRouteConfig?.DRACHTIO_APP_TAG) {
+        app.get('/drachtio/route', asyncHandler(async (req, res) => {
+            const destinationUri = queryString(req.query.uri) ?? buildSipUri(req.query);
+            const destinationUser = queryString(req.query.uriUser) ?? getSipUser(destinationUri);
+            const destination = { destinationUri, destinationUser };
+            const hasGatewayRoute = !!controlHub?.findRoute(destination) || !!matchRoute(drachtioRouteConfig.ROUTES, destination);
+
+            if (hasGatewayRoute) {
+                res.send({
+                    action: 'route',
+                    data: { tag: drachtioRouteConfig.DRACHTIO_APP_TAG }
+                });
+                return;
+            }
+
+            if (!drachtioRouteConfig.DRACHTIO_ROUTE_FALLBACK_URL) {
+                res.send(drachtioReject(404, 'No Route'));
+                return;
+            }
+
+            try {
+                const response = await axios.get(drachtioRouteConfig.DRACHTIO_ROUTE_FALLBACK_URL, {
+                    params: req.query,
+                    timeout: drachtioRouteConfig.INVITE_HTTP_TIMEOUT_MS,
+                    responseType: 'text',
+                    transformResponse: [data => data],
+                    validateStatus: () => true
+                });
+                const contentType = response.headers['content-type'];
+                if (typeof contentType === 'string') res.type(contentType);
+                res.status(response.status).send(response.data);
+            } catch (err) {
+                logger.error({ err }, 'Drachtio fallback route lookup failed');
+                res.send(drachtioReject(502, 'Route Lookup Failed'));
+            }
+        }));
+    }
 
     app.use(httpBearerAuth(authConfig));
 
@@ -232,22 +294,22 @@ export function createHttpApp(
         pipeRecordingStream(result.stream, res);
     }));
 
-    app.get('/recordings/:backendId/*', asyncHandler(async (req, res) => {
+    app.get('/recordings/:backendId/*recordingPath', asyncHandler<RecordingPathRouteParams>(async (req, res) => {
         if (!media) throw new MediaUnavailableError('Media commands require RTPBRIDGE_HOST');
-        const result = await media.downloadRecording(req.params.backendId, req.params[0]);
+        const result = await media.downloadRecording(req.params.backendId, req.params.recordingPath.join('/'));
         res.status(result.status);
         copyRecordingHeaders(result.headers, res);
         pipeRecordingStream(result.stream, res);
     }));
 
-    app.delete('/recordings/:backendId/*', asyncHandler(async (req, res) => {
+    app.delete('/recordings/:backendId/*recordingPath', asyncHandler<RecordingPathRouteParams>(async (req, res) => {
         res.send(await commands.execute('recording.delete', {
             backendId: req.params.backendId,
-            path: req.params[0]
+            path: req.params.recordingPath.join('/')
         }));
     }));
 
-    app.post('/calls/:callId/reinvite', asyncHandler(async (req, res) => {
+    app.post('/calls/:callId/reinvite', asyncHandler<CallRouteParams>(async (req, res) => {
         if (typeof req.body?.sdp !== 'string' || !req.body.sdp.trim()) {
             res.status(400).send({ error: 'Missing sdp' });
             return;
@@ -258,7 +320,7 @@ export function createHttpApp(
         res.send(result);
     }));
 
-    app.post('/calls/:callId/bye', asyncHandler(async (req, res) => {
+    app.post('/calls/:callId/bye', asyncHandler<CallRouteParams>(async (req, res) => {
         const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
         const headers = parseOptionalHeaders(req.body?.headers);
         await gateway.bye(req.params.callId, reason, headers);
@@ -317,13 +379,13 @@ export function createHttpApp(
     return app;
 }
 
-function asyncHandler(fn: (req: express.Request, res: express.Response) => Promise<void>) {
-    return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+function asyncHandler<RouteParams = express.Request['params']>(fn: (req: express.Request<RouteParams>, res: express.Response) => Promise<void>) {
+    return (req: express.Request<RouteParams>, res: express.Response, next: express.NextFunction) => {
         fn(req, res).catch(next);
     };
 }
 
-function httpBearerAuth(authConfig?: Pick<GatewayConfig, 'CONTROL_AUTH_MODE' | 'CONTROL_AUTH_TOKEN'>) {
+function httpBearerAuth(authConfig?: HttpAuthConfig) {
     return (req: express.Request, res: express.Response, next: express.NextFunction) => {
         if (authConfig?.CONTROL_AUTH_MODE !== 'bearer') {
             next();
@@ -336,6 +398,23 @@ function httpBearerAuth(authConfig?: Pick<GatewayConfig, 'CONTROL_AUTH_MODE' | '
         }
 
         next();
+    };
+}
+
+function queryString(value: unknown) {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function buildSipUri(query: express.Request['query']) {
+    const user = queryString(query.uriUser) ?? queryString(query.toUser) ?? '';
+    const domain = queryString(query.domain);
+    return `sip:${user}${domain ? `@${domain}` : ''}`;
+}
+
+function drachtioReject(status: number, reason: string) {
+    return {
+        action: 'reject',
+        data: { status, reason }
     };
 }
 

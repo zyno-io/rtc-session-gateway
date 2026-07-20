@@ -4,6 +4,8 @@ import { WebSocketServer } from 'ws';
 
 import { ControlHub } from './control-hub';
 import {
+    ControlErrorBody,
+    ControlMessage,
     ControlProtocolError,
     ControlRequest,
     makeControlError,
@@ -67,7 +69,7 @@ export class ControlServer {
     }
 
     private async handleMessage(connectionId: string, raw: string) {
-        let parsed: ReturnType<typeof parseControlMessage>;
+        let parsed: ControlMessage;
         try {
             parsed = parseControlMessage(JSON.parse(raw));
         } catch (err) {
@@ -111,7 +113,7 @@ export class ControlServer {
         });
     }
 
-    private sendResponse(connectionId: string, id: string, ok: boolean, result?: unknown, error?: ReturnType<typeof makeControlError>) {
+    private sendResponse(connectionId: string, id: string, ok: boolean, result?: unknown, error?: ControlErrorBody) {
         this.hub.sendRaw(connectionId, ok
             ? { type: 'response', id, ok, result }
             : { type: 'response', id, ok, error });

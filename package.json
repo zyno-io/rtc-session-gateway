@@ -1,7 +1,10 @@
 {
   "name": "@zyno-io/rtc-session-gateway",
-  "version": "1.0.0",
+  "version": "0.0.0",
   "packageManager": "yarn@4.17.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "main": "dist/index.js",
   "scripts": {
     "clean": "rm -rf dist",
@@ -15,36 +18,39 @@
     "e2e:compose": "node scripts/run-compose-e2e.mjs",
     "format": "oxfmt",
     "start": "node .",
-    "start:dist:debug": "node-dev --inspect=9228 dist/index.js",
-    "start:dist:debug:wait": "node-dev --inspect-brk=9228 dist/index.js",
+    "start:dist:debug": "node --watch --inspect=9228 dist/index.js",
+    "start:dist:debug:wait": "node --watch --inspect-brk=9228 dist/index.js",
     "test": "tsx --test test/**/*.test.ts"
   },
   "author": "Zyno Consulting <hello@zyno.io>",
   "license": "UNLICENSED",
   "dependencies": {
-    "axios": "^1.7.4",
-    "drachtio-srf": "^5.0.24",
-    "express": "^4.19.2",
-    "pino": "^9.2.0",
-    "ws": "^8.21.0"
+    "axios": "^1.18.1",
+    "drachtio-srf": "^5.0.27",
+    "express": "^5.2.1",
+    "pino": "^10.3.1",
+    "ws": "^8.21.1"
   },
   "devDependencies": {
-    "@tsconfig/node20": "^20.1.4",
-    "@types/express": "^4.17.21",
-    "@types/node": "^22.1.0",
+    "@tsconfig/node24": "^24.0.4",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.13.3",
     "@types/ws": "^8.18.1",
-    "@typescript-eslint/eslint-plugin": "^7.14.1",
-    "@typescript-eslint/parser": "^7.14.1",
-    "eslint": "^8.56.0",
-    "eslint-plugin-simple-import-sort": "^12.1.0",
-    "eslint-plugin-unused-imports": "^3.2.0",
-    "node-dev": "^8.0.0",
-    "npm-run-all": "^4.1.5",
-    "oxfmt": "^0.36.0",
-    "pino-pretty": "^11.2.2",
-    "tsx": "^4.16.2",
-    "typescript": "^5.5.2",
+    "@typescript-eslint/eslint-plugin": "^8.64.0",
+    "@typescript-eslint/parser": "^8.64.0",
+    "eslint": "^10.7.0",
+    "eslint-plugin-simple-import-sort": "^14.0.0",
+    "eslint-plugin-unused-imports": "^4.4.1",
+    "npm-run-all2": "^9.0.2",
+    "oxfmt": "^0.59.0",
+    "pino-pretty": "^13.1.3",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3",
     "vitepress": "^1.6.4",
     "werift": "^0.23.0"
+  },
+  "resolutions": {
+    "@types/node": "24.13.3",
+    "vite": "6.4.3"
   }
 }

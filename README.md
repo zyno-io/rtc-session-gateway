@@ -35,7 +35,7 @@ Start with:
 
 ## Development
 
-This project uses Yarn Berry through Corepack.
+This project uses Node.js 24 and Yarn Berry through Corepack.
 
 ```sh
 corepack enable
@@ -56,7 +56,7 @@ Run the automated local E2E stack:
 yarn e2e:compose
 ```
 
-The compose runner defaults to `ghcr.io/zyno-io/rtpbridge:latest`. To test a local rtpbridge checkout, set `RTPBRIDGE_LOCAL_CHECKOUT=/path/to/rtpbridge`. To test a specific image, set `RTPBRIDGE_IMAGE=registry.example.com/rtpbridge:tag`.
+The compose runner defaults to the CI-published `ghcr.io/zyno-io/rtpbridge:main` image. To test a local rtpbridge checkout, set `RTPBRIDGE_LOCAL_CHECKOUT=/path/to/rtpbridge`. To test a specific image, set `RTPBRIDGE_IMAGE=registry.example.com/rtpbridge:tag`. Set `E2E_GATEWAY_PORT` when host port `3001` is already in use.
 
 ## Configuration
 
@@ -65,6 +65,8 @@ Core environment variables:
 - `DRACHTIO_HOST`: Drachtio server host, defaults to `127.0.0.1`.
 - `DRACHTIO_PORT`: Drachtio control port, defaults to `9022`.
 - `DRACHTIO_SECRET`: Drachtio shared secret, optional.
+- `DRACHTIO_APP_TAG`: application tag advertised to a Drachtio server using outbound request routing.
+- `DRACHTIO_ROUTE_FALLBACK_URL`: existing Drachtio HTTP router to use when no gateway route owns an INVITE.
 - `HTTP_PORT`: HTTP/control port, defaults to `3001`.
 - `CONTROL_WS_PATH`: backend control WebSocket path, defaults to `/control`.
 - `CONTROL_AUTH_MODE`: `bearer` or `none`.
@@ -140,7 +142,7 @@ Or answer after creating or selecting media:
 }
 ```
 
-Media sessions created over a control connection are owned by that connection and are torn down when the connection disconnects.
+Media sessions and SIP dialogs created or accepted over a control connection are owned by that connection and are torn down when it disconnects.
 
 ## Recording Proxy
 

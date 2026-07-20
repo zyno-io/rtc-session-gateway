@@ -18,7 +18,21 @@ export interface ActiveCall {
     dialog: Srf.Dialog;
 }
 
-export interface ActiveCallSnapshot extends Omit<ActiveCall, 'dialog'> { }
+export type ActiveCallSnapshot = Pick<
+    ActiveCall,
+    | 'callId'
+    | 'sipCallId'
+    | 'routeUrl'
+    | 'receiverUrl'
+    | 'controlConnectionId'
+    | 'destinationUri'
+    | 'destinationUser'
+    | 'sourceUri'
+    | 'localSdp'
+    | 'remoteSdp'
+    | 'createdAt'
+    | 'updatedAt'
+>;
 
 export class CallRegistry {
     private calls = new Map<string, ActiveCall>();

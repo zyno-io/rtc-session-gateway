@@ -28,8 +28,12 @@ async function run() {
     const mediaServers = Config.RTPBRIDGE_HOST ? new MediaServerManager(Config) : undefined;
     const media = mediaServers ? new MediaSessionService(mediaServers, Config.RECORDINGS_PATH, controlHub, Config.RTPBRIDGE_REQUEST_TIMEOUT_MS) : undefined;
     if (mediaServers) mediaServers.isCallActive = callId => !!registry.get(callId) || !!media?.get(callId);
-    if (media) controlHub.on('disconnect', connectionId => void media.destroySessionsForOwner(connectionId));
     const gateway = new DrachtioGateway(Config, registry, new AxiosGatewayHttpClient(), undefined, controlHub);
+    controlHub.on('disconnect', connectionId => {
+        const cleanup = [gateway.terminateCallsForControlConnection(connectionId)];
+        if (media) cleanup.push(media.destroySessionsForOwner(connectionId));
+        void Promise.allSettled(cleanup);
+    });
     new HttpServer(Config, registry, gateway, controlHub, media).start();
     await gateway.start();
 }

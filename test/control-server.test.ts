@@ -270,6 +270,18 @@ test('production config requires control auth unless explicitly disabled', () =>
     assert.equal(config.CONTROL_AUTH_MODE, 'none');
 });
 
+test('Drachtio application routing configuration is validated', () => {
+    assert.throws(() => loadConfig({ DRACHTIO_APP_TAG: 'invalid tag' } as NodeJS.ProcessEnv), /DRACHTIO_APP_TAG/);
+    assert.throws(() => loadConfig({ DRACHTIO_ROUTE_FALLBACK_URL: 'not a url' } as NodeJS.ProcessEnv), /DRACHTIO_ROUTE_FALLBACK_URL/);
+
+    const config = loadConfig({
+        DRACHTIO_APP_TAG: 'rtc-session-gateway',
+        DRACHTIO_ROUTE_FALLBACK_URL: 'http://zynotalk-pilot-server:3000/drachtio/route'
+    } as NodeJS.ProcessEnv);
+    assert.equal(config.DRACHTIO_APP_TAG, 'rtc-session-gateway');
+    assert.equal(config.DRACHTIO_ROUTE_FALLBACK_URL, 'http://zynotalk-pilot-server:3000/drachtio/route');
+});
+
 async function listen(server: http.Server) {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');

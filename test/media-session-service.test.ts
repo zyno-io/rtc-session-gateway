@@ -35,11 +35,12 @@ test('media session service destroys sessions owned by a disconnected control co
     await service.createSession({ callId: 'call-a', ownerConnectionId: 'conn-a' });
     await service.createSession({ callId: 'call-b', ownerConnectionId: 'conn-b' });
 
-    await service.destroySessionsForOwner('conn-a');
+    const destruction = service.destroySessionsForOwner('conn-a');
 
+    assert.equal(service.get('media-session-a'), undefined);
+    await destruction;
     assert.deepEqual(clientA.destroyedSessions, ['media-session-a']);
     assert.deepEqual(clientB.destroyedSessions, []);
-    assert.equal(service.get('media-session-a'), undefined);
     assert.equal(service.get('media-session-b')?.sessionId, 'media-session-b');
 });
 
