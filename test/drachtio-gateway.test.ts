@@ -8,6 +8,37 @@ import type { GatewayConfig } from '../src/config';
 import { DrachtioGateway } from '../src/drachtio-gateway';
 import { GatewayHttpClient } from '../src/http-client';
 
+interface FakeSrfConnectOptions {
+    reconnect?: {
+        retryMaxDelay: number;
+    };
+}
+
+test('backs off before starting drachtio-srf when the endpoint is unavailable', async () => {
+    const srf = new FakeSrf();
+    const attempts: number[] = [];
+    const retryDelays: number[] = [];
+    const gateway = new DrachtioGateway(config([]), new CallRegistry(), new FakeHttpClient([]), srf as any, undefined, {
+        endpointProbe: async endpoint => {
+            attempts.push(endpoint.timeoutMs);
+            if (attempts.length < 4) throw new Error('not ready');
+        },
+        retryDelay: async delayMs => {
+            retryDelays.push(delayMs);
+        },
+        initialRetryDelayMs: 100,
+        maxRetryDelayMs: 250,
+        endpointTimeoutMs: 50
+    });
+
+    await gateway.start();
+
+    assert.deepEqual(attempts, [50, 50, 50, 50]);
+    assert.deepEqual(retryDelays, [100, 200, 250]);
+    assert.equal(srf.connectCalls, 1);
+    assert.deepEqual(srf.connectOptions?.reconnect, { retryMaxDelay: 250 });
+});
+
 test('unmatched INVITE receives 404', async () => {
     const registry = new CallRegistry();
     const gateway = new DrachtioGateway(config([]), registry, new FakeHttpClient([]), new FakeSrf() as any);
@@ -229,8 +260,13 @@ class FakeSrf {
     createdUac?: { uri: string; opts: unknown };
     createUasError?: Error;
     destroyedDialogs = 0;
+    connectCalls = 0;
+    connectOptions?: FakeSrfConnectOptions;
 
-    async connect() { }
+    async connect(options?: FakeSrfConnectOptions) {
+        this.connectCalls++;
+        this.connectOptions = options;
+    }
     on() { return this; }
     invite() { }
 

@@ -1,4 +1,5 @@
 import Srf = require('drachtio-srf');
+import { createConnection } from 'node:net';
 
 import type { ActiveCall } from './call-registry';
 import { CallRegistry, snapshotCall } from './call-registry';
@@ -36,19 +37,63 @@ export interface OutboundSipCallResult {
     sdp: string;
 }
 
+export interface DrachtioEndpoint {
+    host: string;
+    port: number;
+    timeoutMs: number;
+}
+
+export type DrachtioEndpointProbe = (endpoint: DrachtioEndpoint) => Promise<void>;
+export type DrachtioRetryDelay = (delayMs: number) => Promise<void>;
+
+export interface DrachtioConnectionOptions {
+    endpointProbe?: DrachtioEndpointProbe;
+    retryDelay?: DrachtioRetryDelay;
+    initialRetryDelayMs?: number;
+    maxRetryDelayMs?: number;
+    endpointTimeoutMs?: number;
+}
+
+interface ResolvedDrachtioConnectionOptions {
+    endpointProbe: DrachtioEndpointProbe;
+    retryDelay: DrachtioRetryDelay;
+    initialRetryDelayMs: number;
+    maxRetryDelayMs: number;
+    endpointTimeoutMs: number;
+}
+
+interface DrachtioReconnectOptions {
+    retryMaxDelay: number;
+}
+
+type DrachtioSrfConfig = Srf.SrfConfig & { reconnect: DrachtioReconnectOptions };
+
+const DefaultInitialRetryDelayMs = 250;
+const DefaultMaxRetryDelayMs = 5_000;
+const DefaultEndpointTimeoutMs = 1_000;
+
 export class DrachtioGateway {
     private logger = BaseLogger.child({ ns: 'DrachtioGateway' });
     private srf: Srf;
     private connected = false;
+    private connectionOptions: ResolvedDrachtioConnectionOptions;
 
     constructor(
         private config: GatewayConfig,
         private registry: CallRegistry,
         private httpClient: GatewayHttpClient,
         srf?: Srf,
-        private controlHub?: ControlHub
+        private controlHub?: ControlHub,
+        connectionOptions: DrachtioConnectionOptions = {}
     ) {
         this.srf = srf ?? (config.DRACHTIO_APP_TAG ? new Srf(config.DRACHTIO_APP_TAG) : new Srf());
+        this.connectionOptions = {
+            endpointProbe: connectionOptions.endpointProbe ?? probeTcpEndpoint,
+            retryDelay: connectionOptions.retryDelay ?? delay,
+            initialRetryDelayMs: connectionOptions.initialRetryDelayMs ?? DefaultInitialRetryDelayMs,
+            maxRetryDelayMs: connectionOptions.maxRetryDelayMs ?? DefaultMaxRetryDelayMs,
+            endpointTimeoutMs: connectionOptions.endpointTimeoutMs ?? DefaultEndpointTimeoutMs
+        };
     }
 
     get isConnected() {
@@ -74,11 +119,39 @@ export class DrachtioGateway {
             });
         });
 
-        await this.srf.connect({
+        await this.waitForDrachtioEndpoint();
+        const connectConfig: DrachtioSrfConfig = {
             host: this.config.DRACHTIO_HOST,
             port: this.config.DRACHTIO_PORT,
-            secret: this.config.DRACHTIO_SECRET
-        });
+            secret: this.config.DRACHTIO_SECRET,
+            reconnect: { retryMaxDelay: this.connectionOptions.maxRetryDelayMs }
+        };
+        await this.srf.connect(connectConfig);
+    }
+
+    private async waitForDrachtioEndpoint() {
+        let attempt = 1;
+        let retryDelayMs = this.connectionOptions.initialRetryDelayMs;
+        const endpoint: DrachtioEndpoint = {
+            host: this.config.DRACHTIO_HOST,
+            port: this.config.DRACHTIO_PORT,
+            timeoutMs: this.connectionOptions.endpointTimeoutMs
+        };
+
+        while (true) {
+            try {
+                await this.connectionOptions.endpointProbe(endpoint);
+                if (attempt > 1) {
+                    this.logger.info({ attempt, host: endpoint.host, port: endpoint.port }, 'Drachtio endpoint is available');
+                }
+                return;
+            } catch (err) {
+                this.logger.warn({ err, attempt, retryDelayMs, host: endpoint.host, port: endpoint.port }, 'Drachtio endpoint unavailable; retrying');
+                await this.connectionOptions.retryDelay(retryDelayMs);
+                retryDelayMs = Math.min(retryDelayMs * 2, this.connectionOptions.maxRetryDelayMs);
+                attempt++;
+            }
+        }
     }
 
     async handleInvite(req: Srf.SrfRequest, res: Srf.SrfResponse) {
@@ -506,6 +579,30 @@ function isControlUrl(url: string) {
 
 function controlUrl(connectionId: string) {
     return `control://${connectionId}`;
+}
+
+async function probeTcpEndpoint(endpoint: DrachtioEndpoint) {
+    await new Promise<void>((resolve, reject) => {
+        const socket = createConnection({ host: endpoint.host, port: endpoint.port });
+        let settled = false;
+
+        const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            if (err) reject(err);
+            else resolve();
+        };
+
+        socket.setTimeout(endpoint.timeoutMs);
+        socket.once('connect', () => finish());
+        socket.once('error', err => finish(err));
+        socket.once('timeout', () => finish(new Error(`Timed out connecting to ${endpoint.host}:${endpoint.port}`)));
+    });
+}
+
+async function delay(delayMs: number) {
+    await new Promise<void>(resolve => setTimeout(resolve, delayMs));
 }
 
 function getSourceUri(headers?: SipHeaders) {
