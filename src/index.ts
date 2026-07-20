@@ -26,7 +26,12 @@ async function run() {
     const registry = new CallRegistry();
     const controlHub = new ControlHub(Config.CONTROL_REQUEST_TIMEOUT_MS);
     const mediaServers = Config.RTPBRIDGE_HOST ? new MediaServerManager(Config) : undefined;
-    const media = mediaServers ? new MediaSessionService(mediaServers, Config.RECORDINGS_PATH, controlHub, Config.RTPBRIDGE_REQUEST_TIMEOUT_MS) : undefined;
+    const media = mediaServers
+        ? new MediaSessionService(mediaServers, Config.RECORDINGS_PATH, controlHub, Config.RTPBRIDGE_REQUEST_TIMEOUT_MS, {
+              authSecret: Config.COTURN_AUTH_SECRET,
+              credentialTtlSeconds: Config.COTURN_CREDENTIAL_TTL_SECONDS
+          })
+        : undefined;
     if (mediaServers) mediaServers.isCallActive = callId => !!registry.get(callId) || !!media?.get(callId);
     const gateway = new DrachtioGateway(Config, registry, new AxiosGatewayHttpClient(), undefined, controlHub);
     controlHub.on('disconnect', connectionId => {

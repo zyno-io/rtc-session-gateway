@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import http from 'node:http';
 import test from 'node:test';
 
-import { MediaSessionService } from '../src/media-session-service';
+import { MediaSessionService, MediaUnavailableError } from '../src/media-session-service';
 
 test('media session service forwards rtpbridge events to the owner control connection', async () => {
     const client = new FakeRtpbridgeClient();
@@ -61,6 +62,74 @@ test('media session service reuses pending ICE restart until the matching answer
     const third = await service.restartIce('webrtc-1');
     assert.deepEqual(third, { sdpOffer: 'restart-sdp-2', offerGeneration: 2 });
     assert.equal(client.iceRestartCalls, 2);
+});
+
+test('media session service returns renewable ICE credentials for the coturn cohosted with its selected backend', async () => {
+    const client = new FakeRtpbridgeClient('media-session-1', 'rtpbridge-0', '108.85.76.234');
+    const service = new MediaSessionService(
+        new FakeMediaServerManager(client) as any,
+        '/recordings',
+        undefined,
+        10_000,
+        { authSecret: 'turn-secret', credentialTtlSeconds: 86_400 }
+    );
+
+    const session = await service.createSession({ ownerConnectionId: 'conn-1' });
+    assert.equal(session.iceConfiguration?.backendId, 'rtpbridge-0');
+    assert.equal(session.iceConfiguration?.mediaIp, '108.85.76.234');
+    assert.deepEqual(session.iceConfiguration?.servers[0], { urls: ['stun:108.85.76.234:3478'] });
+    assert.deepEqual(session.iceConfiguration?.servers[1]?.urls, [
+        'turn:108.85.76.234:3478?transport=udp',
+        'turn:108.85.76.234:3478?transport=tcp',
+        'turns:ip-108-85-76-234.zynoinfra.net:443?transport=tcp'
+    ]);
+
+    const turn = session.iceConfiguration!.servers[1]!;
+    assert.match(turn.username!, /^\d+:rtc-session-media-session-1$/);
+    assert.equal(turn.credential, createHmac('sha1', 'turn-secret').update(turn.username!).digest('base64'));
+    assert.ok(Date.parse(session.iceConfiguration!.expiresAt) > Date.now() + 23 * 60 * 60 * 1000);
+
+    await service.createWebrtcOffer(session.sessionId);
+    const restart = await service.restartIce('webrtc-1');
+    assert.equal(restart.iceConfiguration?.backendId, 'rtpbridge-0');
+    assert.equal(restart.iceConfiguration?.mediaIp, '108.85.76.234');
+});
+
+test('media session ICE configuration follows each newly selected rtpbridge backend', async () => {
+    const clientA = new FakeRtpbridgeClient('media-session-a', 'rtpbridge-0', '108.85.76.234');
+    const clientB = new FakeRtpbridgeClient('media-session-b', 'rtpbridge-1', '108.85.76.233');
+    const service = new MediaSessionService(
+        new FakeMediaServerManager(clientA, clientB) as any,
+        '/recordings',
+        undefined,
+        10_000,
+        { authSecret: 'turn-secret', credentialTtlSeconds: 86_400 }
+    );
+
+    const first = await service.createSession();
+    const replacement = await service.createSession();
+
+    assert.deepEqual(
+        [first, replacement].map(session => [session.backendId, session.iceConfiguration?.mediaIp]),
+        [
+            ['rtpbridge-0', '108.85.76.234'],
+            ['rtpbridge-1', '108.85.76.233']
+        ]
+    );
+});
+
+test('media session setup fails closed when rtpbridge reports an invalid coturn media IP', async () => {
+    const client = new FakeRtpbridgeClient('media-session-1', 'rtpbridge-0', '999.85.76.234');
+    const service = new MediaSessionService(
+        new FakeMediaServerManager(client) as any,
+        '/recordings',
+        undefined,
+        10_000,
+        { authSecret: 'turn-secret', credentialTtlSeconds: 86_400 }
+    );
+
+    await assert.rejects(service.createSession(), MediaUnavailableError);
+    assert.deepEqual(client.destroyedSessions, ['media-session-1']);
 });
 
 test('media session service gathers DTMF locally from an endpoint', async () => {
@@ -512,9 +581,21 @@ class FakeRtpbridgeClient extends EventEmitter {
     bridgeSessionStarted?: () => void;
     fileSources: string[] = [];
 
-    constructor(private sessionId = 'media-session-1', backendId = 'rtpbridge-0') {
+    constructor(
+        private sessionId = 'media-session-1',
+        backendId = 'rtpbridge-0',
+        private mediaIp = '108.85.76.234'
+    ) {
         super();
         this.backendId = backendId;
+    }
+
+    get backendHost() {
+        return this.backendId;
+    }
+
+    async getServerInfo() {
+        return { hostname: this.backendId, mediaIp: this.mediaIp };
     }
 
     async createSession() {

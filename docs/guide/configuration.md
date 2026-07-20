@@ -18,6 +18,8 @@ Configuration is read from environment variables at startup.
 | `RTPBRIDGE_SRV_PORT_NAME` | `ws` | SRV record service name for rtpbridge discovery. |
 | `RTPBRIDGE_REQUEST_TIMEOUT_MS` | `10000` | rtpbridge JSON-RPC request timeout. |
 | `RTPBRIDGE_CONNECTION_TIMEOUT_MS` | `5000` | rtpbridge WebSocket connection timeout. |
+| `COTURN_AUTH_SECRET` | unset | Shared HMAC secret used by the coturn sidecar. When set, media-session and ICE-restart responses include credentials for the coturn instance cohosted with the selected rtpbridge backend. |
+| `COTURN_CREDENTIAL_TTL_SECONDS` | `86400` | Lifetime of issued TURN credentials. Clients should renew before `expiresAt`. |
 | `RECORDINGS_PATH` | `/var/lib/rtpbridge/recordings` | Recording root on rtpbridge backends. |
 | `ROUTES_JSON` | `[]` | Static HTTP route table. |
 | `INVITE_HTTP_TIMEOUT_MS` | `15000` | Timeout for static HTTP INVITE webhooks. |

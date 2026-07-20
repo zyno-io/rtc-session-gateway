@@ -6,7 +6,13 @@ import { CallRegistry } from './call-registry';
 import { GatewayConfig } from './config';
 import { ControlHub } from './control-hub';
 import { ControlServer } from './control-server';
-import { CallNotFoundError, DrachtioGateway, InvalidCallStateError } from './drachtio-gateway';
+import {
+    CallNotFoundError,
+    DrachtioGateway,
+    InvalidCallStateError,
+    type OutboundSipCallParams,
+    type OutboundSipCallResult
+} from './drachtio-gateway';
 import { InvalidHttpActionError, parseOptionalHeaders } from './http-contract';
 import { BaseLogger } from './logger';
 import type { GatewayMediaController } from './media-controller';
@@ -17,16 +23,8 @@ import { CommandNotImplementedError, CommandValidationError, SessionCommandHandl
 
 export interface GatewayController {
     isConnected: boolean;
-    createOutbound(params: {
-        requestUri: string;
-        sdp: string;
-        headers?: Record<string, string>;
-        receiverUrl?: string;
-        controlConnectionId?: string;
-        callingNumber?: string;
-        callingName?: string;
-        proxy?: string;
-    }): Promise<{ sessionId: string; sipCallId: string; sdp: string }>;
+    createOutbound(params: OutboundSipCallParams): Promise<OutboundSipCallResult>;
+    cancelOutbound?(outboundAttemptId: string, controlConnectionId?: string): Promise<{ ok: true }>;
     reinvite(callId: string, sdp: string, headers?: Record<string, string>): Promise<{ sdp: string }>;
     bye(callId: string, reason?: string, headers?: Record<string, string>): Promise<void>;
 }

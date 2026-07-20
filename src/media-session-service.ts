@@ -1,7 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createReadStream, createWriteStream, WriteStream } from 'node:fs';
 import { mkdtemp, open, rm, stat } from 'node:fs/promises';
+import { isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { posix as path } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -19,6 +20,7 @@ import {
     LeaveMessageResult,
     MediaEndpointSnapshot,
     MediaEndpointType,
+    RtcIceConfiguration,
     RecordingMergeTarget,
     MediaSessionSnapshot,
     RecordingListItem,
@@ -31,6 +33,7 @@ interface MediaSessionRecord {
     sessionId: string;
     callId?: string;
     backendId?: string;
+    iceConfiguration?: RtcIceConfiguration;
     ownerConnectionId?: string;
     createdAt: string;
     updatedAt: string;
@@ -82,7 +85,8 @@ export class MediaSessionService implements GatewayMediaController {
         private mediaServers: MediaServerManager,
         private recordingsPath = '/var/lib/rtpbridge/recordings',
         private eventPublisher?: MediaEventPublisher,
-        private recordingHttpTimeoutMs = 10_000
+        private recordingHttpTimeoutMs = 10_000,
+        private turnConfig?: { authSecret?: string; credentialTtlSeconds: number }
     ) { }
 
     list(): MediaSessionSnapshot[] {
@@ -99,26 +103,29 @@ export class MediaSessionService implements GatewayMediaController {
         let sessionId: string | undefined;
         try {
             sessionId = await client.createSession();
+            const iceConfiguration = await this.createIceConfiguration(client, sessionId);
+            const now = new Date().toISOString();
+            const record: MediaSessionRecord = {
+                sessionId,
+                callId: params?.callId,
+                backendId: client.backendId,
+                iceConfiguration,
+                ownerConnectionId: params?.ownerConnectionId,
+                createdAt: now,
+                updatedAt: now,
+                client,
+                endpoints: new Map()
+            };
+            this.sessions.set(sessionId, record);
+            client.onClose(() => this.dropSession(sessionId!));
+            client.on('rtpbridge.event', event => this.publishRtpbridgeEvent(record, event));
+            return snapshotSession(record);
         } catch (err) {
+            if (sessionId) await client.destroySession(sessionId).catch(() => undefined);
             client.close();
             if (params?.callId) this.mediaServers.unregisterCall(params.callId, client.backendId);
             throw err;
         }
-        const now = new Date().toISOString();
-        const record: MediaSessionRecord = {
-            sessionId,
-            callId: params?.callId,
-            backendId: client.backendId,
-            ownerConnectionId: params?.ownerConnectionId,
-            createdAt: now,
-            updatedAt: now,
-            client,
-            endpoints: new Map()
-        };
-        this.sessions.set(sessionId, record);
-        client.onClose(() => this.dropSession(sessionId));
-        client.on('rtpbridge.event', event => this.publishRtpbridgeEvent(record, event));
-        return snapshotSession(record);
     }
 
     async destroySession(sessionId: string) {
@@ -167,7 +174,47 @@ export class MediaSessionService implements GatewayMediaController {
             });
             this.pendingIceRestarts.set(endpointId, pending);
         }
-        return pending;
+        const result = await pending;
+        session.iceConfiguration = await this.createIceConfiguration(session.client, session.sessionId);
+        this.touch(session);
+        return {
+            ...result,
+            ...(session.iceConfiguration ? { iceConfiguration: session.iceConfiguration } : {})
+        };
+    }
+
+    private async createIceConfiguration(client: RtpbridgeClient, sessionId: string): Promise<RtcIceConfiguration | undefined> {
+        const secret = this.turnConfig?.authSecret;
+        if (!secret) return undefined;
+
+        const serverInfo = await client.getServerInfo();
+        const mediaIp = serverInfo.mediaIp?.trim();
+        if (!mediaIp || isIP(mediaIp) !== 4) {
+            throw new MediaUnavailableError('rtpbridge server.info returned no usable IPv4 media_ip for cohosted coturn');
+        }
+
+        const backendId = client.backendId ?? client.backendHost ?? mediaIp;
+        const expiresAtSeconds = Math.floor(Date.now() / 1000) + this.turnConfig!.credentialTtlSeconds;
+        const username = `${expiresAtSeconds}:rtc-session-${sessionId}`;
+        const credential = createHmac('sha1', secret).update(username).digest('base64');
+        const tlsHostname = `ip-${mediaIp.replaceAll('.', '-')}.zynoinfra.net`;
+        return {
+            backendId,
+            mediaIp,
+            expiresAt: new Date(expiresAtSeconds * 1000).toISOString(),
+            servers: [
+                { urls: [`stun:${mediaIp}:3478`] },
+                {
+                    urls: [
+                        `turn:${mediaIp}:3478?transport=udp`,
+                        `turn:${mediaIp}:3478?transport=tcp`,
+                        `turns:${tlsHostname}:443?transport=tcp`
+                    ],
+                    username,
+                    credential
+                }
+            ]
+        };
     }
 
     async createRtpOffer(sessionId: string, params: { direction?: string; srtp?: boolean; codecs?: string[] } = {}) {
@@ -827,6 +874,7 @@ function snapshotSession(session: MediaSessionRecord): MediaSessionSnapshot {
         sessionId: session.sessionId,
         callId: session.callId,
         backendId: session.backendId,
+        ...(session.iceConfiguration ? { iceConfiguration: session.iceConfiguration } : {}),
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         endpoints: [...session.endpoints.values()]

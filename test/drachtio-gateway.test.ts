@@ -61,12 +61,7 @@ test('answered INVITE creates a call and sends answered event to receiver URL', 
         { ok: true }
     ]);
     const srf = new FakeSrf();
-    const gateway = new DrachtioGateway(
-        config([{ match: 'exact', value: 'support', url: 'https://route.example.com/sip' }]),
-        registry,
-        httpClient,
-        srf as any
-    );
+    const gateway = new DrachtioGateway(config([{ match: 'exact', value: 'support', url: 'https://route.example.com/sip' }]), registry, httpClient, srf as any);
     const res = new FakeResponse();
 
     await gateway.handleInvite(fakeInvite(), res as any);
@@ -112,13 +107,7 @@ test('control-only route answers INVITE without static HTTP route', async () => 
     const httpClient = new FakeHttpClient([]);
     const srf = new FakeSrf();
     const controlHub = new FakeControlHub({ action: 'answer', sdp: 'control-local-sdp' });
-    const gateway = new DrachtioGateway(
-        config([]),
-        registry,
-        httpClient,
-        srf as any,
-        controlHub as any
-    );
+    const gateway = new DrachtioGateway(config([]), registry, httpClient, srf as any, controlHub as any);
     const res = new FakeResponse();
 
     await gateway.handleInvite(fakeInvite(), res as any);
@@ -206,7 +195,8 @@ test('createOutbound creates a UAC dialog and registers it as an active call', a
         controlConnectionId: 'conn-1',
         callingNumber: '18005551212',
         callingName: 'ACME SUPPORT',
-        headers: { 'X-Test': 'yes' }
+        headers: { 'X-Test': 'yes' },
+        auth: { username: 'carrier-user', password: 'carrier-password' }
     });
 
     assert.deepEqual(result, {
@@ -218,9 +208,50 @@ test('createOutbound creates a UAC dialog and registers it as an active call', a
     assert.equal((srf.createdUac?.opts as any).localSdp, 'local-offer-sdp');
     assert.equal((srf.createdUac?.opts as any).callingNumber, '18005551212');
     assert.equal((srf.createdUac?.opts as any).headers['X-Test'], 'yes');
+    assert.deepEqual((srf.createdUac?.opts as any).auth, {
+        username: 'carrier-user',
+        password: 'carrier-password'
+    });
     assert.equal(registry.list().length, 1);
     assert.equal(registry.list()[0].receiverUrl, 'control://conn-1');
     assert.equal(registry.list()[0].remoteSdp, 'remote-answer-sdp');
+});
+
+test('cancelOutbound sends CANCEL for a pending UAC attempt', async () => {
+    const srf = new PendingFakeSrf();
+    const gateway = new DrachtioGateway(config([]), new CallRegistry(), new FakeHttpClient([]), srf as any);
+    const creation = gateway.createOutbound({
+        requestUri: 'sip:15551234567@carrier.example.com',
+        sdp: 'local-offer-sdp',
+        controlConnectionId: 'conn-1',
+        outboundAttemptId: 'attempt-1'
+    });
+
+    await new Promise(resolve => setImmediate(resolve));
+    await gateway.cancelOutbound('attempt-1', 'conn-1');
+    assert.equal(srf.cancelCalls, 1);
+
+    srf.rejectUac(new Error('Sip non-success response: 487'));
+    await assert.rejects(creation, /487/);
+});
+
+test('cancelOutbound rejects cancellation from another control connection', async () => {
+    const srf = new PendingFakeSrf();
+    const gateway = new DrachtioGateway(config([]), new CallRegistry(), new FakeHttpClient([]), srf as any);
+    const creation = gateway.createOutbound({
+        requestUri: 'sip:15551234567@carrier.example.com',
+        sdp: 'local-offer-sdp',
+        controlConnectionId: 'conn-1',
+        outboundAttemptId: 'attempt-1'
+    });
+
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(gateway.cancelOutbound('attempt-1', 'conn-2'), /another control connection/);
+    assert.equal(srf.cancelCalls, 0);
+
+    await gateway.cancelOutbound('attempt-1', 'conn-1');
+    srf.rejectUac(new Error('Sip non-success response: 487'));
+    await assert.rejects(creation, /487/);
 });
 
 test('terminates SIP calls owned by a disconnected control connection', async () => {
@@ -247,7 +278,7 @@ test('terminates SIP calls owned by a disconnected control connection', async ()
 class FakeHttpClient implements GatewayHttpClient {
     posts: { url: string; body: unknown; timeoutMs: number }[] = [];
 
-    constructor(private responses: unknown[]) { }
+    constructor(private responses: unknown[]) {}
 
     async postJson<T>(url: string, body: unknown, timeoutMs: number): Promise<T> {
         this.posts.push({ url, body, timeoutMs });
@@ -267,8 +298,10 @@ class FakeSrf {
         this.connectCalls++;
         this.connectOptions = options;
     }
-    on() { return this; }
-    invite() { }
+    on() {
+        return this;
+    }
+    invite() {}
 
     async createUAS(req: unknown, res: unknown, opts: unknown) {
         this.createdUas = { req, res, opts };
@@ -295,11 +328,33 @@ class FakeSrf {
     }
 }
 
+class PendingFakeSrf extends FakeSrf {
+    cancelCalls = 0;
+    private rejectPendingUac?: (err: Error) => void;
+
+    override async createUAC(uri: string, opts: unknown, progressCallbacks?: { cbRequest?: (...args: any[]) => void }): Promise<any> {
+        this.createdUac = { uri, opts };
+        progressCallbacks?.cbRequest?.(null, {
+            cancel: (callback: (err?: Error) => void) => {
+                this.cancelCalls++;
+                callback();
+            }
+        });
+        return new Promise((_resolve, reject) => {
+            this.rejectPendingUac = reject;
+        });
+    }
+
+    rejectUac(err: Error) {
+        this.rejectPendingUac?.(err);
+    }
+}
+
 class FakeControlHub {
     requests: { connectionId: string; method: string; params: unknown; timeoutMs: number }[] = [];
     events: { connectionId: string; event: { event: string; sessionId?: string; data?: unknown } }[] = [];
 
-    constructor(private response: unknown) { }
+    constructor(private response: unknown) {}
 
     findRoute(): ControlRouteMatch {
         return {

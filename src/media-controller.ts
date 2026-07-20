@@ -9,10 +9,24 @@ export interface MediaEndpointSnapshot {
     createdAt: string;
 }
 
+export interface RtcIceServer {
+    urls: string[];
+    username?: string;
+    credential?: string;
+}
+
+export interface RtcIceConfiguration {
+    backendId: string;
+    mediaIp: string;
+    expiresAt: string;
+    servers: RtcIceServer[];
+}
+
 export interface MediaSessionSnapshot {
     sessionId: string;
     callId?: string;
     backendId?: string;
+    iceConfiguration?: RtcIceConfiguration;
     createdAt: string;
     updatedAt: string;
     endpoints: MediaEndpointSnapshot[];
@@ -103,7 +117,7 @@ export interface GatewayMediaController {
     createWebrtcFromOffer(sessionId: string, params: { sdp: string; direction?: string }): Promise<{ endpointId: string; sdpAnswer: string }>;
     acceptWebrtcAnswer(endpointId: string, params: { sdp: string; offerGeneration?: number }): Promise<{ ok: true }>;
     acceptWebrtcOffer(endpointId: string, params: { sdp: string }): Promise<{ sdpAnswer: string }>;
-    restartIce(endpointId: string): Promise<{ sdpOffer: string; offerGeneration: number }>;
+    restartIce(endpointId: string): Promise<{ sdpOffer: string; offerGeneration: number; iceConfiguration?: RtcIceConfiguration }>;
     createRtpOffer(sessionId: string, params?: { direction?: string; srtp?: boolean; codecs?: string[] }): Promise<{ endpointId: string; sdpOffer: string }>;
     createRtpFromOffer(sessionId: string, params: { sdp: string; direction?: string }): Promise<{ endpointId: string; sdpAnswer: string }>;
     acceptRtpAnswer(endpointId: string, params: { sdp: string }): Promise<{ ok: true }>;

@@ -41,7 +41,8 @@ test('session commands create outbound SIP calls through the gateway', async () 
             sdp: 'local-sdp',
             headers: { 'X-Test': 'yes' },
             callingNumber: '18005551212',
-            callingName: 'ACME SUPPORT'
+            callingName: 'ACME SUPPORT',
+            auth: { username: 'carrier-user', password: 'carrier-password' }
         },
         { controlConnectionId: 'conn-1' }
     );
@@ -56,9 +57,45 @@ test('session commands create outbound SIP calls through the gateway', async () 
             controlConnectionId: 'conn-1',
             callingNumber: '18005551212',
             callingName: 'ACME SUPPORT',
-            proxy: undefined
+            proxy: undefined,
+            auth: { username: 'carrier-user', password: 'carrier-password' }
         }
     ]);
+});
+
+test('session commands require complete outbound SIP auth credentials', async () => {
+    const commands = new SessionCommandHandler(new CallRegistry(), fakeGateway);
+
+    await assert.rejects(
+        commands.execute(
+            'sip.createOutbound',
+            {
+                requestUri: 'sip:15551234567@carrier.example.com',
+                sdp: 'local-sdp',
+                auth: { username: 'carrier-user' }
+            },
+            { controlConnectionId: 'conn-1' }
+        ),
+        /auth\.password is required/
+    );
+});
+
+test('session commands cancel a pending outbound SIP attempt on its control connection', async () => {
+    const cancellations: unknown[][] = [];
+    const gateway: GatewayController = {
+        ...fakeGateway,
+        async cancelOutbound(outboundAttemptId, controlConnectionId) {
+            cancellations.push([outboundAttemptId, controlConnectionId]);
+            return { ok: true };
+        }
+    };
+    const commands = new SessionCommandHandler(new CallRegistry(), gateway);
+
+    assert.deepEqual(
+        await commands.execute('sip.cancelOutbound', { outboundAttemptId: 'attempt-1' }, { controlConnectionId: 'conn-1' }),
+        { ok: true }
+    );
+    assert.deepEqual(cancellations, [['attempt-1', 'conn-1']]);
 });
 
 test('session commands route WebRTC and recording operations to media controller', async () => {

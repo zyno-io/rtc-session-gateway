@@ -91,13 +91,18 @@ export class ControlServer {
     }
 
     private async handleRequest(connectionId: string, request: ControlRequest) {
+        const startedAt = Date.now();
+        const logContext = { connectionId, requestId: request.id, method: request.method };
+        this.logger.debug(logContext, 'Control request received');
         try {
             const result = request.method === 'route.register'
                 ? { routes: this.hub.setRoutes(connectionId, parseRouteRegistrations(request.params)) }
                 : await this.commands.execute(request.method, request.params, { controlConnectionId: connectionId });
             this.sendResponse(connectionId, request.id, true, result);
+            this.logger.debug({ ...logContext, durationMs: Date.now() - startedAt }, 'Control request completed');
         } catch (err) {
             const error = errorForCommand(err);
+            this.logger.warn({ err, ...logContext, code: error.code, durationMs: Date.now() - startedAt }, 'Control request failed');
             this.sendResponse(connectionId, request.id, false, undefined, error);
         }
     }

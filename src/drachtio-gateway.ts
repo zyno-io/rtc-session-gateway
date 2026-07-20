@@ -2,7 +2,7 @@ import Srf = require('drachtio-srf');
 import { createConnection } from 'node:net';
 
 import type { ActiveCall } from './call-registry';
-import { CallRegistry, snapshotCall } from './call-registry';
+import { CallRegistry } from './call-registry';
 import type { GatewayConfig } from './config';
 import { ControlConnectionUnavailableError, ControlHub } from './control-hub';
 import {
@@ -20,6 +20,11 @@ import { getSipUser, matchRoute, stripSipUri } from './routing';
 export class CallNotFoundError extends Error { }
 export class InvalidCallStateError extends Error { }
 
+export interface SipAuthCredentials {
+    username: string;
+    password: string;
+}
+
 export interface OutboundSipCallParams {
     requestUri: string;
     sdp: string;
@@ -29,6 +34,8 @@ export interface OutboundSipCallParams {
     callingNumber?: string;
     callingName?: string;
     proxy?: string;
+    auth?: SipAuthCredentials;
+    outboundAttemptId?: string;
 }
 
 export interface OutboundSipCallResult {
@@ -66,6 +73,12 @@ interface DrachtioReconnectOptions {
     retryMaxDelay: number;
 }
 
+interface PendingOutboundSipCall {
+    controlConnectionId?: string;
+    cancelRequested: boolean;
+    request?: Srf.SrfRequest;
+}
+
 type DrachtioSrfConfig = Srf.SrfConfig & { reconnect: DrachtioReconnectOptions };
 
 const DefaultInitialRetryDelayMs = 250;
@@ -77,6 +90,7 @@ export class DrachtioGateway {
     private srf: Srf;
     private connected = false;
     private connectionOptions: ResolvedDrachtioConnectionOptions;
+    private pendingOutboundCalls = new Map<string, PendingOutboundSipCall>();
 
     constructor(
         private config: GatewayConfig,
@@ -212,7 +226,7 @@ export class DrachtioGateway {
 
             this.bindDialog(call);
             answeredDialog = undefined;
-            this.logger.info({ call: snapshotCall(call) }, 'SIP dialog answered');
+            this.logger.info({ call: sipCallLogContext(call) }, 'SIP dialog answered');
             void this.sendFollowUpEvent(call, {
                 event: 'answered',
                 callId,
@@ -270,14 +284,42 @@ export class DrachtioGateway {
         const receiverUrl = params.controlConnectionId ? controlUrl(params.controlConnectionId) : params.receiverUrl;
         if (!receiverUrl) throw new InvalidCallStateError('receiverUrl is required for outbound SIP calls without a control connection');
 
+        const pending = params.outboundAttemptId ? this.registerPendingOutboundCall(params.outboundAttemptId, params.controlConnectionId) : undefined;
+
+        const logContext = outboundSipLogContext(params);
+        this.logger.info(logContext, 'Creating outbound SIP dialog');
         try {
-            const dialog = await this.srf.createUAC(params.requestUri, {
-                localSdp: params.sdp,
-                headers: params.headers,
-                callingNumber: params.callingNumber,
-                callingName: params.callingName,
-                proxy: params.proxy
-            } as Srf.CreateUACOptions & { callingNumber?: string; callingName?: string });
+            const dialog = await this.srf.createUAC(
+                params.requestUri,
+                {
+                    localSdp: params.sdp,
+                    headers: params.headers,
+                    callingNumber: params.callingNumber,
+                    callingName: params.callingName,
+                    proxy: params.proxy,
+                    auth: params.auth
+                } as Srf.CreateUACOptions & { callingNumber?: string; callingName?: string },
+                pending
+                    ? {
+                          cbRequest: ((errOrRequest: Error | Srf.SrfRequest | null, request?: Srf.SrfRequest) => {
+                              if (errOrRequest instanceof Error) return;
+                              const sentRequest = request ?? errOrRequest;
+                              if (!sentRequest) return;
+                              pending.request = sentRequest;
+                              if (pending.cancelRequested) {
+                                  void cancelSipRequest(sentRequest).catch(err => {
+                                      this.logger.warn({ err, ...logContext }, 'Failed to send deferred outbound SIP CANCEL');
+                                  });
+                              }
+                          }) as unknown as (request: Srf.SrfRequest) => void
+                      }
+                    : undefined
+            );
+
+            if (pending?.cancelRequested) {
+                await destroyDialog(dialog);
+                throw new InvalidCallStateError('Outbound SIP call was cancelled');
+            }
 
             const sipCallId = dialog.sip.callId;
             const callId = this.registry.reserveCallId(sipCallId);
@@ -300,11 +342,35 @@ export class DrachtioGateway {
             });
 
             this.bindDialog(call);
-            this.logger.info({ call: snapshotCall(call) }, 'Outbound SIP dialog answered');
+            this.logger.info({ call: sipCallLogContext(call) }, 'Outbound SIP dialog answered');
             return { sessionId: callId, sipCallId, sdp: dialog.remote.sdp };
         } catch (err) {
+            if (pending?.cancelRequested) this.logger.info(logContext, 'Outbound SIP dialog cancelled');
+            else this.logger.warn({ err, ...logContext }, 'Outbound SIP dialog failed');
             throw new InvalidCallStateError(errorMessage(err));
+        } finally {
+            if (params.outboundAttemptId && this.pendingOutboundCalls.get(params.outboundAttemptId) === pending) {
+                this.pendingOutboundCalls.delete(params.outboundAttemptId);
+            }
         }
+    }
+
+    async cancelOutbound(outboundAttemptId: string, controlConnectionId?: string) {
+        const pending = this.pendingOutboundCalls.get(outboundAttemptId);
+        if (!pending) throw new CallNotFoundError(`Outbound SIP attempt ${outboundAttemptId} not found`);
+        if (pending.controlConnectionId !== controlConnectionId) {
+            throw new InvalidCallStateError('Outbound SIP attempt belongs to another control connection');
+        }
+        if (pending.cancelRequested) return { ok: true as const };
+
+        pending.cancelRequested = true;
+        if (pending.request) {
+            await cancelSipRequest(pending.request).catch(err => {
+                this.logger.warn({ err, outboundAttemptId, controlConnectionId }, 'Failed to send outbound SIP CANCEL');
+            });
+        }
+        this.logger.info({ outboundAttemptId, controlConnectionId }, 'Cancelled pending outbound SIP dialog');
+        return { ok: true as const };
     }
 
     async bye(callId: string, reason?: string, headers?: SipHeaders) {
@@ -333,13 +399,17 @@ export class DrachtioGateway {
     }
 
     async terminateCallsForControlConnection(connectionId: string) {
+        const pendingCancellations = [...this.pendingOutboundCalls.entries()]
+            .filter(([, pending]) => pending.controlConnectionId === connectionId)
+            .map(([outboundAttemptId]) => this.cancelOutbound(outboundAttemptId, connectionId));
         const calls = this.registry
             .list()
             .filter(call => call.controlConnectionId === connectionId)
             .map(call => this.registry.remove(call.callId))
             .filter((call): call is ActiveCall => !!call);
-        await Promise.allSettled(
-            calls.map(async call => {
+        await Promise.allSettled([
+            ...pendingCancellations,
+            ...calls.map(async call => {
                 try {
                     await new Promise<void>((resolve, reject) => {
                         call.dialog.destroy({ headers: {} }, err => (err ? reject(err) : resolve()));
@@ -356,7 +426,7 @@ export class DrachtioGateway {
                     this.logger.warn({ err, callId: call.callId, connectionId }, 'Failed to terminate control-owned SIP call');
                 }
             })
-        );
+        ]);
     }
 
     private bindDialog(call: ActiveCall) {
@@ -518,6 +588,55 @@ export class DrachtioGateway {
             this.logger.warn({ err, callId: event.callId }, 'Failed to deliver failed INVITE termination event');
         }
     }
+
+    private registerPendingOutboundCall(outboundAttemptId: string, controlConnectionId?: string) {
+        if (this.pendingOutboundCalls.has(outboundAttemptId)) {
+            throw new InvalidCallStateError(`Outbound SIP attempt ${outboundAttemptId} already exists`);
+        }
+        const pending: PendingOutboundSipCall = { controlConnectionId, cancelRequested: false };
+        this.pendingOutboundCalls.set(outboundAttemptId, pending);
+        return pending;
+    }
+}
+
+async function cancelSipRequest(request: Srf.SrfRequest) {
+    await new Promise<void>((resolve, reject) => {
+        request.cancel(err => (err ? reject(err) : resolve()));
+    });
+}
+
+async function destroyDialog(dialog: Srf.Dialog) {
+    await new Promise<void>((resolve, reject) => {
+        dialog.destroy({ headers: {} }, err => (err ? reject(err) : resolve()));
+    });
+}
+
+function outboundSipLogContext(params: OutboundSipCallParams) {
+    const destinationUri = stripSipUri(params.requestUri);
+    const withoutScheme = destinationUri.replace(/^sips?:/i, '');
+    const atIndex = withoutScheme.lastIndexOf('@');
+    const destinationHost = atIndex === -1 ? undefined : withoutScheme.slice(atIndex + 1);
+    const destinationUser = getSipUser(destinationUri);
+    return {
+        destinationHost,
+        destinationUserSuffix: destinationUser?.slice(-4),
+        transport: /;transport=([^;?]+)/i.exec(params.requestUri)?.[1],
+        authConfigured: !!params.auth,
+        controlConnectionId: params.controlConnectionId
+    };
+}
+
+function sipCallLogContext(call: ActiveCall) {
+    return {
+        callId: call.callId,
+        sipCallId: call.sipCallId,
+        controlConnectionId: call.controlConnectionId,
+        createdAt: call.createdAt,
+        destinationUserSuffix: call.destinationUser?.slice(-4),
+        sourceUserSuffix: call.sourceUri ? getSipUser(call.sourceUri)?.slice(-4) : undefined,
+        hasLocalSdp: !!call.localSdp,
+        hasRemoteSdp: !!call.remoteSdp
+    };
 }
 
 function buildInviteRequest(

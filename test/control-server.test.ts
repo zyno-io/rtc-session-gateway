@@ -282,6 +282,14 @@ test('Drachtio application routing configuration is validated', () => {
     assert.equal(config.DRACHTIO_ROUTE_FALLBACK_URL, 'http://zynotalk-pilot-server:3000/drachtio/route');
 });
 
+test('coturn credential configuration defaults to an all-day lifetime and validates overrides', () => {
+    assert.equal(loadConfig({} as NodeJS.ProcessEnv).COTURN_CREDENTIAL_TTL_SECONDS, 86_400);
+    const config = loadConfig({ COTURN_AUTH_SECRET: 'turn-secret', COTURN_CREDENTIAL_TTL_SECONDS: '43200' } as NodeJS.ProcessEnv);
+    assert.equal(config.COTURN_AUTH_SECRET, 'turn-secret');
+    assert.equal(config.COTURN_CREDENTIAL_TTL_SECONDS, 43_200);
+    assert.throws(() => loadConfig({ COTURN_CREDENTIAL_TTL_SECONDS: '0' } as NodeJS.ProcessEnv), /positive integer/);
+});
+
 async function listen(server: http.Server) {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');

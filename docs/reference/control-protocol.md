@@ -50,8 +50,11 @@ Route:
 SIP:
 
 - `sip.createOutbound`
+- `sip.cancelOutbound`
 - `sip.reinvite`
 - `sip.bye`
+
+`sip.createOutbound` accepts optional SIP digest credentials as `auth: { "username": "...", "password": "..." }`. Both fields are required when `auth` is present. A caller can also supply `outboundAttemptId`; while dialog creation is pending, `sip.cancelOutbound` can send a SIP CANCEL for that ID from the same control connection.
 
 Sessions:
 
@@ -59,6 +62,8 @@ Sessions:
 - `session.get`
 - `session.list`
 - `session.delete`
+
+When coturn authentication is configured, `session.create` returns an `iceConfiguration` tied to the selected RTPBridge backend. `webrtc.restartIce` renews that configuration without changing backends.
 
 WebRTC:
 

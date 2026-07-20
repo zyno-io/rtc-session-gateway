@@ -1,5 +1,5 @@
 import { CallRegistry } from './call-registry';
-import { CallNotFoundError } from './drachtio-gateway';
+import { CallNotFoundError, type SipAuthCredentials } from './drachtio-gateway';
 import type { GatewayController } from './http-server';
 import { InvalidHttpActionError, parseOptionalHeaders } from './http-contract';
 import type { GatewayMediaController } from './media-controller';
@@ -32,6 +32,8 @@ export class SessionCommandHandler {
                 return this.createMediaSession(params, context);
             case 'sip.createOutbound':
                 return this.createOutbound(params, context);
+            case 'sip.cancelOutbound':
+                return this.cancelOutbound(params, context);
             case 'sip.reinvite':
                 return this.reinvite(params);
             case 'sip.bye':
@@ -140,6 +142,8 @@ export class SessionCommandHandler {
             throw new CommandValidationError('receiverUrl is required when sip.createOutbound is not sent over the control WebSocket');
         }
 
+        const auth = parseOptionalSipAuth(body.auth);
+        const outboundAttemptId = optionalString(body.outboundAttemptId, 'outboundAttemptId');
         return this.gateway.createOutbound({
             requestUri: requiredString(body.requestUri, 'requestUri'),
             sdp: requiredString(body.sdp, 'sdp'),
@@ -148,8 +152,16 @@ export class SessionCommandHandler {
             controlConnectionId: context.controlConnectionId,
             callingNumber: optionalString(body.callingNumber, 'callingNumber'),
             callingName: optionalString(body.callingName, 'callingName'),
-            proxy: optionalString(body.proxy, 'proxy')
+            proxy: optionalString(body.proxy, 'proxy'),
+            ...(outboundAttemptId ? { outboundAttemptId } : {}),
+            ...(auth ? { auth } : {})
         });
+    }
+
+    private async cancelOutbound(params: unknown, context: CommandContext) {
+        if (!this.gateway.cancelOutbound) throw new CommandNotImplementedError('sip.cancelOutbound is not implemented');
+        const body = requireObject(params);
+        return this.gateway.cancelOutbound(requiredString(body.outboundAttemptId, 'outboundAttemptId'), context.controlConnectionId);
     }
 
     private async reinvite(params: unknown) {
@@ -391,6 +403,15 @@ function optionalString(value: unknown, name: string) {
     if (value === undefined || value === null) return undefined;
     if (typeof value !== 'string' || !value.trim()) throw new CommandValidationError(`${name} must be a non-empty string`);
     return value;
+}
+
+function parseOptionalSipAuth(value: unknown): SipAuthCredentials | undefined {
+    if (value === undefined || value === null) return undefined;
+    const auth = requireObject(value);
+    return {
+        username: requiredString(auth.username, 'auth.username'),
+        password: requiredString(auth.password, 'auth.password')
+    };
 }
 
 function optionalBoolean(value: unknown, name: string) {
