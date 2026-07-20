@@ -58,6 +58,8 @@ export class SessionCommandHandler {
                 return this.rtpReinvite(params);
             case 'media.play':
                 return this.play(params);
+            case 'media.playAndWait':
+                return this.playAndWait(params);
             case 'media.stop':
                 return this.stopMedia(params);
             case 'endpoint.updateDirection':
@@ -268,6 +270,14 @@ export class SessionCommandHandler {
         });
     }
 
+    private async playAndWait(params: unknown) {
+        const body = requireObject(params);
+        return this.requireMedia().playAndWait(requiredString(body.sessionId, 'sessionId'), {
+            source: requiredString(body.source, 'source'),
+            playbackTimeoutMs: optionalPositiveInteger(body.playbackTimeoutMs, 'playbackTimeoutMs')
+        });
+    }
+
     private async stopMedia(params: unknown) {
         const body = requireObject(params);
         return this.requireMedia().stopMedia(requiredString(body.endpointId, 'endpointId'));
@@ -303,7 +313,8 @@ export class SessionCommandHandler {
             numDigits: optionalPositiveInteger(body.numDigits, 'numDigits'),
             timeoutMs: optionalPositiveInteger(body.timeoutMs, 'timeoutMs'),
             interDigitTimeoutMs: optionalPositiveInteger(body.interDigitTimeoutMs, 'interDigitTimeoutMs'),
-            terminator: optionalString(body.terminator, 'terminator')
+            terminator: optionalString(body.terminator, 'terminator'),
+            sensitive: optionalBoolean(body.sensitive, 'sensitive')
         });
     }
 
@@ -319,7 +330,8 @@ export class SessionCommandHandler {
             timeoutMs: optionalPositiveInteger(body.timeoutMs, 'timeoutMs'),
             interDigitTimeoutMs: optionalPositiveInteger(body.interDigitTimeoutMs, 'interDigitTimeoutMs'),
             terminator: optionalString(body.terminator, 'terminator'),
-            stopPlaybackOnDigit: optionalBoolean(body.stopPlaybackOnDigit, 'stopPlaybackOnDigit')
+            stopPlaybackOnDigit: optionalBoolean(body.stopPlaybackOnDigit, 'stopPlaybackOnDigit'),
+            sensitive: optionalBoolean(body.sensitive, 'sensitive')
         });
     }
 

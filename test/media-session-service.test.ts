@@ -151,6 +151,30 @@ test('media session service gathers DTMF locally from an endpoint', async () => 
     assert.deepEqual(await promise, { digits: '45', reason: 'digits' });
 });
 
+test('media session service does not fan out DTMF events during a sensitive gather', async () => {
+    const client = new FakeRtpbridgeClient();
+    const publisher = new FakePublisher();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any, '/recordings', publisher);
+
+    await service.createSession({ ownerConnectionId: 'conn-1' });
+    await service.createRtpOffer('media-session-1');
+
+    const promise = service.gather('media-session-1', {
+        endpointId: 'rtp-1',
+        numDigits: 2,
+        timeoutMs: 1000,
+        sensitive: true
+    });
+
+    client.emit('dtmf', { endpointId: 'rtp-1', digit: '4' });
+    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '4' } });
+    client.emit('dtmf', { endpointId: 'rtp-1', digit: '5' });
+    client.emit('rtpbridge.event', { event: 'dtmf', data: { endpointId: 'rtp-1', digit: '5' } });
+
+    assert.deepEqual(await promise, { digits: '45', reason: 'digits' });
+    assert.deepEqual(publisher.events, []);
+});
+
 test('media session service stops playback when playAndGather collects a digit', async () => {
     const client = new FakeRtpbridgeClient();
     const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
@@ -173,6 +197,23 @@ test('media session service stops playback when playAndGather collects a digit',
         reason: 'digits',
         playbackEndpointId: 'file-1'
     });
+    assert.deepEqual(client.removedEndpoints, ['file-1']);
+});
+
+test('media session service waits for prompt playback to finish', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+
+    await service.createSession();
+    const promise = service.playAndWait('media-session-1', {
+        source: 'https://audio.example.com/prompt.wav',
+        playbackTimeoutMs: 1000
+    });
+
+    await new Promise(resolve => setImmediate(resolve));
+    client.emit('endpoint.file.finished', { endpointId: 'file-1', reason: 'eof' });
+
+    assert.deepEqual(await promise, { played: true });
     assert.deepEqual(client.removedEndpoints, ['file-1']);
 });
 

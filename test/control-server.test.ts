@@ -363,6 +363,7 @@ class FakeMediaController implements GatewayMediaController {
     async acceptRtpAnswer() { return { ok: true as const }; }
     async rtpReinvite() { return { sdpAnswer: 'answer-sdp' }; }
     async play() { return { endpointId: 'file-1' }; }
+    async playAndWait() { return { played: true }; }
     async stopMedia() { return { ok: true as const }; }
     async updateDirection() { return { ok: true as const }; }
     async bridge() {

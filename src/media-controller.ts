@@ -61,6 +61,7 @@ export interface GatherParams {
     timeoutMs?: number;
     interDigitTimeoutMs?: number;
     terminator?: string;
+    sensitive?: boolean;
 }
 
 export interface GatherResult {
@@ -74,6 +75,11 @@ export interface PlayAndGatherParams extends GatherParams {
     cacheTtlSecs?: number;
     headers?: Record<string, string>;
     stopPlaybackOnDigit?: boolean;
+}
+
+export interface PlayAndWaitParams {
+    source: string;
+    playbackTimeoutMs?: number;
 }
 
 export interface LeaveMessageParams {
@@ -123,6 +129,7 @@ export interface GatewayMediaController {
     acceptRtpAnswer(endpointId: string, params: { sdp: string }): Promise<{ ok: true }>;
     rtpReinvite(endpointId: string, params: { sdp: string }): Promise<{ sdpAnswer: string }>;
     play(sessionId: string, params: { source: string; loopCount?: number | null; cacheTtlSecs?: number; headers?: Record<string, string> }): Promise<{ endpointId: string }>;
+    playAndWait(sessionId: string, params: PlayAndWaitParams): Promise<{ played: boolean }>;
     stopMedia(endpointId: string): Promise<{ ok: true }>;
     updateDirection(endpointId: string, direction: 'sendrecv' | 'recvonly' | 'sendonly' | 'inactive'): Promise<{ ok: true }>;
     bridge(sessionId: string, params: BridgeParams): Promise<BridgeResult>;

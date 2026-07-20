@@ -24,7 +24,8 @@ import {
     RecordingMergeTarget,
     MediaSessionSnapshot,
     RecordingListItem,
-    PlayAndGatherParams
+    PlayAndGatherParams,
+    PlayAndWaitParams
 } from './media-controller';
 import { MediaServerManager, RtpbridgeBackend } from './media-server-manager';
 import { RtpbridgeClient, RtpbridgeServerInfo } from './rtpbridge-client';
@@ -80,6 +81,7 @@ export class MediaSessionService implements GatewayMediaController {
     private recordings = new Map<string, RecordingMetadata>();
     private pendingIceRestarts = new Map<string, Promise<{ sdpOffer: string; offerGeneration: number }>>();
     private activeEndpointActions = new Map<string, ActiveEndpointAction>();
+    private sensitiveGatherEndpointIds = new Set<string>();
 
     constructor(
         private mediaServers: MediaServerManager,
@@ -319,6 +321,7 @@ export class MediaSessionService implements GatewayMediaController {
         const session = this.requireEndpointInSession(sessionId, params.endpointId);
         let playbackEndpointId: string | undefined;
         let playbackStopped = false;
+        if (params.sensitive) this.sensitiveGatherEndpointIds.add(params.endpointId);
 
         const stopPlayback = async () => {
             if (!playbackEndpointId || playbackStopped) return;
@@ -342,7 +345,14 @@ export class MediaSessionService implements GatewayMediaController {
             return { ...result, playbackEndpointId };
         } finally {
             await stopPlayback();
+            if (params.sensitive) queueMicrotask(() => this.sensitiveGatherEndpointIds.delete(params.endpointId));
         }
+    }
+
+    async playAndWait(sessionId: string, params: PlayAndWaitParams) {
+        const session = this.requireSession(sessionId);
+        const played = await this.playToCompletion(session, params.source, params.playbackTimeoutMs ?? 120_000);
+        return { played };
     }
 
     async leaveMessage(sessionId: string, params: LeaveMessageParams): Promise<LeaveMessageResult> {
@@ -576,6 +586,7 @@ export class MediaSessionService implements GatewayMediaController {
         const terminator = params.terminator ?? '#';
         let cancel: () => void = () => undefined;
         const release = this.claimEndpointAction(params.endpointId, 'gather', () => cancel());
+        if (params.sensitive) this.sensitiveGatherEndpointIds.add(params.endpointId);
 
         return new Promise<GatherResult>(resolve => {
             let digits = '';
@@ -587,6 +598,9 @@ export class MediaSessionService implements GatewayMediaController {
                 if (timer) clearTimeout(timer);
                 session.client.removeListener('dtmf', onDtmf);
                 release();
+                if (params.sensitive) {
+                    queueMicrotask(() => this.sensitiveGatherEndpointIds.delete(params.endpointId));
+                }
             };
 
             const finish = (reason: GatherResult['reason']) => {
@@ -766,6 +780,7 @@ export class MediaSessionService implements GatewayMediaController {
 
     private publishRtpbridgeEvent(session: MediaSessionRecord, event: unknown) {
         if (!session.ownerConnectionId || !this.eventPublisher) return;
+        if (isSensitiveDtmfEvent(event, this.sensitiveGatherEndpointIds)) return;
         this.eventPublisher.sendEvent(session.ownerConnectionId, {
             event: 'media.rtpbridge',
             sessionId: session.sessionId,
@@ -867,6 +882,14 @@ export class MediaSessionService implements GatewayMediaController {
             throw recordingProxyError(err, 'rtpbridge recording download failed');
         }
     }
+}
+
+function isSensitiveDtmfEvent(event: unknown, sensitiveEndpointIds: Set<string>) {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) return false;
+    const message = event as { event?: unknown; data?: unknown };
+    if (message.event !== 'dtmf' || !message.data || typeof message.data !== 'object' || Array.isArray(message.data)) return false;
+    const endpointId = (message.data as { endpointId?: unknown }).endpointId;
+    return typeof endpointId === 'string' && sensitiveEndpointIds.has(endpointId);
 }
 
 function selectCoturnIpv4(mediaIp: RtpbridgeServerInfo['mediaIp']): string | undefined {

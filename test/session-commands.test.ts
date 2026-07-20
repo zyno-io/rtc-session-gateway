@@ -131,6 +131,14 @@ test('session commands route WebRTC and recording operations to media controller
         digits: '7',
         reason: 'digits'
     });
+    assert.deepEqual(
+        await commands.execute('media.playAndWait', {
+            sessionId: 'media-session-1',
+            source: 'https://audio.example.com/prompt.wav',
+            playbackTimeoutMs: 30_000
+        }),
+        { played: true }
+    );
     assert.deepEqual(await commands.execute('media.leaveMessage', { sessionId: 'media-session-1', endpointId: 'rtp-1', messageSource: 'https://audio.example.com/message.wav', maxWaitMs: 1000 }), {
         terminator: 'silence',
         messagePlayed: true
@@ -152,7 +160,12 @@ test('session commands route WebRTC and recording operations to media controller
         ['startRecording', 'media-session-1', { endpointId: undefined, filePath: undefined, recordOutbound: undefined }],
         ['listRecordings', { backendId: undefined, startsWith: 'call_', skip: undefined, limit: 10 }],
         ['deleteRecording', 'rtpbridge-0', 'call_42.pcap'],
-        ['gather', 'media-session-1', { endpointId: 'rtp-1', numDigits: 1, timeoutMs: undefined, interDigitTimeoutMs: undefined, terminator: undefined }],
+        [
+            'gather',
+            'media-session-1',
+            { endpointId: 'rtp-1', numDigits: 1, timeoutMs: undefined, interDigitTimeoutMs: undefined, terminator: undefined, sensitive: undefined }
+        ],
+        ['playAndWait', 'media-session-1', { source: 'https://audio.example.com/prompt.wav', playbackTimeoutMs: 30_000 }],
         ['leaveMessage', 'media-session-1', {
             endpointId: 'rtp-1',
             messageSource: 'https://audio.example.com/message.wav',
@@ -423,6 +436,10 @@ class FakeMediaController implements GatewayMediaController {
     acceptRtpAnswer = async () => ({ ok: true as const });
     rtpReinvite = async () => ({ sdpAnswer: 'rtp-answer-sdp' });
     play = async () => ({ endpointId: 'file-1' });
+    playAndWait = async (sessionId: string, params: { source: string; playbackTimeoutMs?: number }) => {
+        this.calls.push(['playAndWait', sessionId, params]);
+        return { played: true };
+    };
     stopMedia = async () => ({ ok: true as const });
     updateDirection = async (endpointId: string, direction: 'sendrecv' | 'recvonly' | 'sendonly' | 'inactive') => {
         this.calls.push(['updateDirection', endpointId, direction]);

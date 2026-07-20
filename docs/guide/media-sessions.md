@@ -96,6 +96,7 @@ Bridge operations require both sessions to be on the same rtpbridge backend. Ses
 Implemented commands:
 
 - `media.play`
+- `media.playAndWait`
 - `media.stop`
 - `media.gather`
 - `media.playAndGather`
@@ -103,6 +104,6 @@ Implemented commands:
 - `dtmf.inject`
 - `endpoint.updateDirection`
 
-`media.gather` and `media.playAndGather` let applications collect digits without repeated application round trips for each RFC4733 event.
+`media.playAndWait` resolves after the file endpoint finishes playback. `media.gather` and `media.playAndGather` let applications collect digits without repeated application round trips for each RFC4733 event. Set `sensitive: true` for PAN, CVV, SSN, or other protected input; the completed gather still returns to its requester, while the underlying per-digit rtpbridge events are suppressed from general control-event fan-out.
 
 `media.leaveMessage` waits for sufficient silence using existing rtpbridge VAD behavior, then plays a configured message source.

@@ -229,6 +229,10 @@ export function createHttpApp(
         res.send(await commands.execute('media.play', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
     }));
 
+    app.post('/sessions/:sessionId/media/play-and-wait', asyncHandler(async (req, res) => {
+        res.send(await commands.execute('media.playAndWait', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
+    }));
+
     app.post('/sessions/:sessionId/media/bridge', asyncHandler(async (req, res) => {
         res.send(await commands.execute('media.bridge', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
     }));
