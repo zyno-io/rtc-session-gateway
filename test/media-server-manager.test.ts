@@ -60,6 +60,29 @@ test('media server manager keeps shared call pins until all references are relea
     }
 });
 
+test('media server manager can move a released agent session to the next backend', async () => {
+    const manager = new MediaServerManager(
+        config(),
+        new FakeResolver({
+            srv: [{ name: 'rtpbridge-0.svc.local.' }, { name: 'rtpbridge-1.svc.local.' }]
+        })
+    );
+
+    try {
+        const first = await manager.createClient({ callId: 'agent-10-20' });
+        assert.equal(first.backendId, 'rtpbridge-0.svc.local');
+        manager.unregisterCall('agent-10-20', first.backendId);
+        first.close();
+
+        const replacement = await manager.createClient({ callId: 'agent-10-20' });
+        assert.equal(replacement.backendId, 'rtpbridge-1.svc.local');
+        manager.unregisterCall('agent-10-20', replacement.backendId);
+        replacement.close();
+    } finally {
+        manager.destroy();
+    }
+});
+
 test('media server manager falls back to A records when SRV lookup fails', async () => {
     const manager = new MediaServerManager(config(), new FakeResolver({
         srvError: new Error('ENOTFOUND'),
