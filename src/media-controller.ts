@@ -9,6 +9,13 @@ export interface MediaEndpointSnapshot {
     createdAt: string;
 }
 
+export interface RtpOfferOptions {
+    direction?: string;
+    srtp?: boolean;
+    srtpOptional?: boolean;
+    codecs?: string[];
+}
+
 export interface RtcIceServer {
     urls: string[];
     username?: string;
@@ -125,7 +132,7 @@ export interface GatewayMediaController {
     acceptWebrtcAnswer(endpointId: string, params: { sdp: string; offerGeneration?: number }): Promise<{ ok: true }>;
     acceptWebrtcOffer(endpointId: string, params: { sdp: string }): Promise<{ sdpAnswer: string }>;
     restartIce(endpointId: string): Promise<{ sdpOffer: string; offerGeneration: number; iceConfiguration?: RtcIceConfiguration }>;
-    createRtpOffer(sessionId: string, params?: { direction?: string; srtp?: boolean; codecs?: string[] }): Promise<{ endpointId: string; sdpOffer: string }>;
+    createRtpOffer(sessionId: string, params?: RtpOfferOptions): Promise<{ endpointId: string; sdpOffer: string }>;
     createRtpFromOffer(sessionId: string, params: { sdp: string; direction?: string }): Promise<{ endpointId: string; sdpAnswer: string }>;
     acceptRtpAnswer(endpointId: string, params: { sdp: string }): Promise<{ ok: true }>;
     rtpReinvite(endpointId: string, params: { sdp: string }): Promise<{ sdpAnswer: string }>;

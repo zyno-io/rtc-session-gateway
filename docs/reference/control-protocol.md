@@ -80,6 +80,8 @@ RTP:
 - `rtp.acceptAnswer`
 - `rtp.reinvite`
 
+`rtp.createOffer` accepts `srtp: true` for required SRTP or `srtpOptional: true` for opportunistic SRTP. The two options are mutually exclusive; opportunistic mode allows the peer to select plain RTP by omitting crypto from its answer.
+
 Media:
 
 - `media.play`

@@ -5,6 +5,7 @@ import WebSocket from 'ws';
 
 import { scrubControlError, scrubRtpbridgeEvent, scrubRtpbridgeRequest, scrubRtpbridgeResponse } from './control-log';
 import { BaseLogger } from './logger';
+import type { RtpOfferOptions } from './media-controller';
 
 export interface RtpbridgeClientOptions {
     url: string;
@@ -157,7 +158,7 @@ export class RtpbridgeClient extends EventEmitter {
 
     async createRtpOffer(
         sessionId: string,
-        params: { direction?: string; srtp?: boolean; codecs?: string[] } = {}
+        params: RtpOfferOptions = {}
     ): Promise<{ endpointId: string; sdpOffer: string }> {
         return this.sendRequest('endpoint.rtp.create_offer', { sessionId, ...params });
     }

@@ -231,9 +231,13 @@ export class SessionCommandHandler {
         if (codecs !== undefined && (!Array.isArray(codecs) || codecs.some(codec => typeof codec !== 'string' || !codec.trim()))) {
             throw new CommandValidationError('codecs must be an array of strings');
         }
+        const srtp = optionalBoolean(body.srtp, 'srtp');
+        const srtpOptional = optionalBoolean(body.srtpOptional, 'srtpOptional');
+        if (srtp && srtpOptional) throw new CommandValidationError('srtp and srtpOptional cannot both be enabled');
         return this.requireMedia().createRtpOffer(requiredString(body.sessionId, 'sessionId'), {
             direction: optionalString(body.direction, 'direction'),
-            srtp: optionalBoolean(body.srtp, 'srtp'),
+            srtp,
+            srtpOptional,
             codecs: codecs as string[] | undefined
         });
     }

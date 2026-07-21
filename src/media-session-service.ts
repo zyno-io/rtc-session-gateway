@@ -26,7 +26,8 @@ import {
     MediaSessionSnapshot,
     RecordingListItem,
     PlayAndGatherParams,
-    PlayAndWaitParams
+    PlayAndWaitParams,
+    RtpOfferOptions
 } from './media-controller';
 import { MediaServerManager, RtpbridgeBackend } from './media-server-manager';
 import { RtpbridgeClient, RtpbridgeDtmfEvent, RtpbridgeServerInfo } from './rtpbridge-client';
@@ -221,7 +222,7 @@ export class MediaSessionService implements GatewayMediaController {
         };
     }
 
-    async createRtpOffer(sessionId: string, params: { direction?: string; srtp?: boolean; codecs?: string[] } = {}) {
+    async createRtpOffer(sessionId: string, params: RtpOfferOptions = {}) {
         const session = this.requireSession(sessionId);
         const result = await session.client.createRtpOffer(sessionId, params);
         this.addEndpoint(session, result.endpointId, 'rtp', params.direction);

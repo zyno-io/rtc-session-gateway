@@ -113,6 +113,19 @@ test('session commands route WebRTC and recording operations to media controller
         sdpOffer: 'restart-sdp',
         offerGeneration: 3
     });
+    assert.deepEqual(
+        await commands.execute('rtp.createOffer', {
+            sessionId: 'media-session-1',
+            direction: 'sendrecv',
+            srtpOptional: true,
+            codecs: ['PCMU']
+        }),
+        { endpointId: 'rtp-1', sdpOffer: 'rtp-offer-sdp' }
+    );
+    await assert.rejects(
+        commands.execute('rtp.createOffer', { sessionId: 'media-session-1', srtp: true, srtpOptional: true }),
+        /srtp and srtpOptional cannot both be enabled/
+    );
     assert.deepEqual(await commands.execute('recording.start', { sessionId: 'media-session-1' }), {
         recordingId: 'rec-1',
         backendId: 'rtpbridge-0',
@@ -157,6 +170,11 @@ test('session commands route WebRTC and recording operations to media controller
         ['createWebrtcOffer', 'media-session-1', { direction: 'sendrecv' }],
         ['acceptWebrtcAnswer', 'webrtc-1', { sdp: 'answer-sdp', offerGeneration: 2 }],
         ['restartIce', 'webrtc-1'],
+        [
+            'createRtpOffer',
+            'media-session-1',
+            { direction: 'sendrecv', srtp: undefined, srtpOptional: true, codecs: ['PCMU'] }
+        ],
         ['startRecording', 'media-session-1', { endpointId: undefined, filePath: undefined, recordOutbound: undefined }],
         ['listRecordings', { backendId: undefined, startsWith: 'call_', skip: undefined, limit: 10 }],
         ['deleteRecording', 'rtpbridge-0', 'call_42.pcap'],
@@ -431,7 +449,10 @@ class FakeMediaController implements GatewayMediaController {
         this.calls.push(['restartIce', endpointId]);
         return { sdpOffer: 'restart-sdp', offerGeneration: 3 };
     };
-    createRtpOffer = async () => ({ endpointId: 'rtp-1', sdpOffer: 'rtp-offer-sdp' });
+    createRtpOffer = async (sessionId: string, params?: unknown) => {
+        this.calls.push(['createRtpOffer', sessionId, params]);
+        return { endpointId: 'rtp-1', sdpOffer: 'rtp-offer-sdp' };
+    };
     createRtpFromOffer = async () => ({ endpointId: 'rtp-1', sdpAnswer: 'rtp-answer-sdp' });
     acceptRtpAnswer = async () => ({ ok: true as const });
     rtpReinvite = async () => ({ sdpAnswer: 'rtp-answer-sdp' });
