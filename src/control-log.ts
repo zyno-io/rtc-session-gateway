@@ -457,6 +457,7 @@ function requestFields(method: string): readonly string[] {
             'interDigitTimeoutMs',
             'terminator',
             'stopPlaybackOnDigit',
+            'postPlaybackTimeoutMs',
             'sensitive'
         ],
         'media.leaveMessage': [

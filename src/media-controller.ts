@@ -75,6 +75,7 @@ export interface PlayAndGatherParams extends GatherParams {
     cacheTtlSecs?: number;
     headers?: Record<string, string>;
     stopPlaybackOnDigit?: boolean;
+    postPlaybackTimeoutMs?: number;
 }
 
 export interface PlayAndWaitParams {

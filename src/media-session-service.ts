@@ -345,7 +345,15 @@ export class MediaSessionService implements GatewayMediaController {
                 this.addEndpoint(session, playbackEndpointId, 'file');
 
                 const result = await this.collectDtmf(session, params, {
-                    onFirstDigit: params.stopPlaybackOnDigit === false ? undefined : stopPlayback
+                    onFirstDigit: params.stopPlaybackOnDigit === false ? undefined : stopPlayback,
+                    resetTimeoutOn:
+                        params.postPlaybackTimeoutMs === undefined
+                            ? undefined
+                            : {
+                                  event: 'endpoint.file.finished',
+                                  timeoutMs: params.postPlaybackTimeoutMs,
+                                  matches: event => event.endpointId === playbackEndpointId
+                              }
                 });
                 return { ...result, playbackEndpointId };
             } finally {
@@ -588,7 +596,14 @@ export class MediaSessionService implements GatewayMediaController {
     private async collectDtmf(
         session: MediaSessionRecord,
         params: GatherParams,
-        hooks: { onFirstDigit?: () => Promise<void> | void } = {}
+        hooks: {
+            onFirstDigit?: () => Promise<void> | void;
+            resetTimeoutOn?: {
+                event: string;
+                timeoutMs: number;
+                matches: (event: { endpointId?: string }) => boolean;
+            };
+        } = {}
     ): Promise<GatherResult> {
         const numDigits = positiveIntegerOrDefault(params.numDigits, undefined);
         const timeoutMs = positiveIntegerOrDefault(params.timeoutMs, 5_000)!;
@@ -606,6 +621,7 @@ export class MediaSessionService implements GatewayMediaController {
             const cleanup = () => {
                 if (timer) clearTimeout(timer);
                 session.client.removeListener('dtmf', onDtmf);
+                if (hooks.resetTimeoutOn) session.client.removeListener(hooks.resetTimeoutOn.event, onTimeoutReset);
                 release();
             };
 
@@ -619,6 +635,11 @@ export class MediaSessionService implements GatewayMediaController {
             const armTimer = (delayMs: number) => {
                 if (timer) clearTimeout(timer);
                 timer = setTimeout(() => finish('timeout'), delayMs);
+            };
+
+            const onTimeoutReset = (event: { endpointId?: string }) => {
+                if (digits || !hooks.resetTimeoutOn?.matches(event)) return;
+                armTimer(hooks.resetTimeoutOn.timeoutMs);
             };
 
             const onDtmf = (event: { endpointId?: string; digit?: string }) => {
@@ -643,6 +664,7 @@ export class MediaSessionService implements GatewayMediaController {
 
             cancel = () => finish('cancelled');
             session.client.on('dtmf', onDtmf);
+            if (hooks.resetTimeoutOn) session.client.on(hooks.resetTimeoutOn.event, onTimeoutReset);
             armTimer(timeoutMs);
         });
     }

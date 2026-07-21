@@ -104,6 +104,6 @@ Implemented commands:
 - `dtmf.inject`
 - `endpoint.updateDirection`
 
-`media.playAndWait` resolves after the file endpoint finishes playback. `media.gather` and `media.playAndGather` let applications collect digits without repeated application round trips for each RFC4733 event. Set `sensitive: true` for PAN, CVV, SSN, or other protected input; the completed gather still returns to its requester, while the underlying per-digit rtpbridge events are suppressed from general control-event fan-out.
+`media.playAndWait` resolves after the file endpoint finishes playback. `media.gather` and `media.playAndGather` let applications collect digits without repeated application round trips for each RFC4733 event. For `media.playAndGather`, set `postPlaybackTimeoutMs` to restart the no-input timer when prompt playback finishes while continuing to accept digits during the prompt. Set `sensitive: true` for PAN, CVV, SSN, or other protected input; the completed gather still returns to its requester, while the underlying per-digit rtpbridge events are suppressed from general control-event fan-out.
 
 `media.leaveMessage` waits for sufficient silence using existing rtpbridge VAD behavior, then plays a configured message source.

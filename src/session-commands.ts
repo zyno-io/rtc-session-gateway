@@ -331,6 +331,7 @@ export class SessionCommandHandler {
             interDigitTimeoutMs: optionalPositiveInteger(body.interDigitTimeoutMs, 'interDigitTimeoutMs'),
             terminator: optionalString(body.terminator, 'terminator'),
             stopPlaybackOnDigit: optionalBoolean(body.stopPlaybackOnDigit, 'stopPlaybackOnDigit'),
+            postPlaybackTimeoutMs: optionalPositiveInteger(body.postPlaybackTimeoutMs, 'postPlaybackTimeoutMs'),
             sensitive: optionalBoolean(body.sensitive, 'sensitive')
         });
     }

@@ -284,6 +284,34 @@ test('media session service stops playback when playAndGather collects a digit',
     assert.deepEqual(client.removedEndpoints, ['file-1']);
 });
 
+test('media session service starts the no-input timeout again after playAndGather playback finishes', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+
+    await service.createSession({ ownerConnectionId: 'conn-1' });
+    await service.createRtpOffer('media-session-1');
+
+    const startedAt = Date.now();
+    const promise = service.playAndGather('media-session-1', {
+        endpointId: 'rtp-1',
+        source: 'https://audio.example.com/menu.wav',
+        numDigits: 1,
+        timeoutMs: 30,
+        postPlaybackTimeoutMs: 40
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    client.emit('endpoint.file.finished', { endpointId: 'file-1', reason: 'eof' });
+
+    assert.deepEqual(await promise, {
+        digits: '',
+        reason: 'timeout',
+        playbackEndpointId: 'file-1'
+    });
+    assert.ok(Date.now() - startedAt >= 50);
+    assert.deepEqual(client.removedEndpoints, ['file-1']);
+});
+
 test('media session service waits for prompt playback to finish', async () => {
     const client = new FakeRtpbridgeClient();
     const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
