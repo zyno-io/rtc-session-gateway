@@ -5,12 +5,9 @@ import type { GatewayConfig } from './config';
 import { BaseLogger } from './logger';
 import { RtpbridgeClient } from './rtpbridge-client';
 import { RtpbridgeTransport } from './rtpbridge-transport';
+import { FileEndpointCatalog, type MediaBackend } from './endpoint-catalog';
 
-export interface RtpbridgeBackend {
-    id: string;
-    url: string;
-    httpUrl: string;
-}
+export type RtpbridgeBackend = MediaBackend;
 
 export interface MediaServerResolver {
     resolveSrv(name: string): Promise<Array<{ name: string }>>;
@@ -20,6 +17,7 @@ export interface MediaServerResolver {
 const CALL_BACKEND_TTL_MS = 4 * 60 * 60 * 1000;
 
 export class MediaBackendNotFoundError extends Error { }
+export class MediaBackendUnavailableError extends Error { }
 
 export class MediaServerManager {
     private logger = BaseLogger.child({ ns: 'MediaServerManager' });
@@ -27,6 +25,7 @@ export class MediaServerManager {
     private nextBackendIndex = 0;
     private sweepTimer: NodeJS.Timeout;
     private transport: RtpbridgeTransport;
+    private catalog?: FileEndpointCatalog;
     isCallActive?: (callId: string) => boolean;
 
     constructor(
@@ -35,7 +34,8 @@ export class MediaServerManager {
             'RTPBRIDGE_HOST' | 'RTPBRIDGE_PORT' | 'RTPBRIDGE_SRV_PORT_NAME' | 'RTPBRIDGE_REQUEST_TIMEOUT_MS' | 'RTPBRIDGE_CONNECTION_TIMEOUT_MS'
         > & Partial<Pick<
             GatewayConfig,
-            'RTPBRIDGE_TLS' | 'RTPBRIDGE_AUTH_HMAC_SECRET_FILE' | 'RTPBRIDGE_TLS_CA_FILE' | 'RTPBRIDGE_TLS_SERVERNAME'
+            'RTPBRIDGE_TLS' | 'RTPBRIDGE_AUTH_HMAC_SECRET_FILE' | 'RTPBRIDGE_TLS_CA_FILE' | 'RTPBRIDGE_TLS_SERVERNAME' |
+            'RTPBRIDGE_ENDPOINTS_FILE' | 'RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT'
         >>,
         private resolver: MediaServerResolver = dns
     ) {
@@ -45,6 +45,8 @@ export class MediaServerManager {
             caFile: config.RTPBRIDGE_TLS_CA_FILE,
             servername: config.RTPBRIDGE_TLS_SERVERNAME ?? (config.RTPBRIDGE_TLS ? dnsHostname : undefined)
         });
+        if (config.RTPBRIDGE_ENDPOINTS_FILE)
+            this.catalog = new FileEndpointCatalog(config.RTPBRIDGE_ENDPOINTS_FILE, config.RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT);
         this.sweepTimer = setInterval(() => this.sweepStaleEntries(), 10 * 60 * 1000);
     }
 
@@ -54,17 +56,15 @@ export class MediaServerManager {
         return new RtpbridgeClient({
             url: backend.url,
             backendId: backend.id,
-            websocketOptions: this.transport.websocketOptions(backend.url),
+            websocketOptions: this.transport.websocketOptions(backend.url, backend.serverName),
+            iceUrls: backend.turnUrls,
             timeoutMs: this.config.RTPBRIDGE_REQUEST_TIMEOUT_MS,
             connectionTimeoutMs: this.config.RTPBRIDGE_CONNECTION_TIMEOUT_MS
         });
     }
 
     async pickBackendForCall(callId: string) {
-        const existing = this.callToBackend.get(callId);
-        if (existing) return existing.backendId;
-        const backend = await this.pickBackend();
-        this.pinCall(callId, backend.id);
+        const backend = await this.pickBackend({ callId });
         return backend.id;
     }
 
@@ -75,6 +75,7 @@ export class MediaServerManager {
             existing.createdAt = Date.now();
             return;
         }
+        if (existing) throw new MediaBackendUnavailableError('Call is pinned to a different backend');
         this.callToBackend.set(callId, { backendId, createdAt: Date.now(), refs: 1 });
     }
 
@@ -87,7 +88,10 @@ export class MediaServerManager {
             existing.createdAt = Date.now();
             return;
         }
-        this.callToBackend.delete(callId);
+        if (this.isCallActive?.(callId)) {
+            existing.refs = 0;
+            existing.createdAt = Date.now();
+        } else this.callToBackend.delete(callId);
     }
 
     getBackendForCall(callId: string) {
@@ -96,14 +100,25 @@ export class MediaServerManager {
 
     destroy() {
         clearInterval(this.sweepTimer);
+        this.catalog?.destroy();
         this.transport.destroy();
     }
 
-    getHttpRequestOptions(method: string, url: string) {
-        return this.transport.httpOptions(method, url);
+    getHttpRequestOptions(method: string, url: string, backend?: RtpbridgeBackend) {
+        return this.transport.httpOptions(method, url, backend?.recordingServerName);
+    }
+
+    get readiness() {
+        return (
+            this.catalog?.status ?? {
+                valid: !!this.config.RTPBRIDGE_HOST,
+                eligibleBackends: this.config.RTPBRIDGE_HOST ? 1 : 0
+            }
+        );
     }
 
     async resolveBackends(): Promise<RtpbridgeBackend[]> {
+        if (this.catalog) return this.catalog.backends;
         const host = this.requireHost();
         const port = this.config.RTPBRIDGE_PORT;
 
@@ -140,25 +155,33 @@ export class MediaServerManager {
     }
 
     private async pickBackend(options?: { backendId?: string; callId?: string }) {
-        const backends = await this.resolveBackends();
-        const preferredId = options?.backendId ?? (options?.callId ? this.callToBackend.get(options.callId)?.backendId : undefined);
-        return this.selectBackend(backends, preferredId);
+        let backends: RtpbridgeBackend[];
+        if (this.catalog) {
+            const snapshot = this.catalog.snapshot;
+            if (!snapshot.valid) throw new MediaBackendUnavailableError('Endpoint catalog is unavailable or expired');
+            backends = snapshot.backends;
+        } else backends = await this.resolveBackends();
+        // Re-read the pin after discovery; concurrent selections must see the first allocation.
+        const pinnedId = options?.callId ? this.callToBackend.get(options.callId)?.backendId : undefined;
+        if (pinnedId && options?.backendId && pinnedId !== options.backendId)
+            throw new MediaBackendUnavailableError('Call is pinned to a different backend');
+        const backend = this.selectBackend(backends, pinnedId ?? options?.backendId);
+        if (options?.callId) this.pinCall(options.callId, backend.id);
+        return backend;
     }
 
     private selectBackend(backends: RtpbridgeBackend[], preferredId?: string): RtpbridgeBackend {
-        if (!backends.length) {
-            const host = this.requireHost();
-            return backendFromHost(host, this.config.RTPBRIDGE_PORT, this.config.RTPBRIDGE_TLS);
-        }
-
         if (preferredId) {
             const preferred = backends.find(backend => backend.id === preferredId);
-            if (preferred) return preferred;
-            this.logger.warn({ preferredId }, 'Preferred rtpbridge backend not found, using round-robin');
+            if (!preferred) throw new MediaBackendNotFoundError('Pinned rtpbridge backend ' + preferredId + ' not found');
+            if (preferred.acceptNew === false) throw new MediaBackendUnavailableError('Pinned rtpbridge backend is not admitting sessions');
+            return preferred;
         }
 
-        const backend = backends[this.nextBackendIndex % backends.length];
-        this.nextBackendIndex = (this.nextBackendIndex + 1) % backends.length;
+        const accepting = backends.filter(backend => backend.acceptNew !== false);
+        if (!accepting.length) throw new MediaBackendUnavailableError('No rtpbridge backend accepts new sessions');
+        const backend = accepting[this.nextBackendIndex % accepting.length];
+        this.nextBackendIndex = (this.nextBackendIndex + 1) % accepting.length;
         return backend;
     }
 

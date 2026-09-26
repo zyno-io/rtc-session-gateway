@@ -30,3 +30,20 @@ test('strips name-addr wrappers and URI params', () => {
     assert.equal(stripSipUri('"Sales" <sip:support@example.net;transport=udp>'), 'sip:support@example.net');
     assert.equal(getSipUser('sip:support@example.net'), 'support');
 });
+
+test('exact SIP domain admission rejects suffixes, malformed authorities and wildcard configuration', async () => {
+    const { acceptsSipHost, parseAllowedSipDomains } = await import('../src/routing');
+    const domains = parseAllowedSipDomains('["SG.SIP.example.net."]');
+    assert.equal(acceptsSipHost('sips:support@sg.sip.example.net:5061;transport=tls', domains), true);
+    for (const uri of [
+        'sip:support@sip.example.net',
+        'sip:support@evilsg.sip.example.net',
+        'sip:support@sg.sip.example.net.evil',
+        'sip:foo@bar@sg.sip.example.net',
+        'sip:support@sg..sip.example.net',
+        'sip:support@ sg.sip.example.net'
+    ])
+        assert.equal(acceptsSipHost(uri, domains), false);
+    assert.throws(() => parseAllowedSipDomains('["*.sip.example.net"]'));
+    assert.throws(() => parseAllowedSipDomains('["."]'));
+});

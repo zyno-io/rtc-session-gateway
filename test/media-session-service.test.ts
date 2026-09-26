@@ -102,9 +102,7 @@ test('media session service returns renewable ICE credentials for the coturn coh
     assert.deepEqual(session.iceConfiguration?.servers[0], { urls: ['stun:108.85.76.234:3478'] });
     assert.deepEqual(session.iceConfiguration?.servers[1]?.urls, [
         'turn:108.85.76.234:3478?transport=udp',
-        'turn:108.85.76.234:3478?transport=tcp',
-        'turns:ip-108-85-76-234.zynoinfra.net:443?transport=tcp'
-    ]);
+        'turn:108.85.76.234:3478?transport=tcp']);
 
     const turn = session.iceConfiguration!.servers[1]!;
     assert.match(turn.username!, /^\d+:rtc-session-media-session-1$/);
@@ -748,6 +746,7 @@ class FakeMediaServerManager {
 
 class FakeRtpbridgeClient extends EventEmitter {
     backendId: string;
+    iceUrls?: string[];
     destroyedSessions: string[] = [];
     iceRestartCalls = 0;
     recordingFilePath = '/var/lib/rtpbridge/recordings/call_42.pcap';
@@ -868,3 +867,30 @@ class FakeRtpbridgeClient extends EventEmitter {
         this.on('close', handler);
     }
 }
+
+test('explicit TURN URLs use configured certificates and backend URLs override the global default', async () => {
+    const client = new FakeRtpbridgeClient('external-turn', 'rtpbridge-0', ['2001:db8::1']);
+    client.iceUrls = ['stun:stun.example.net:3478', 'turns:turn.backend.example.net:443?transport=tcp'];
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any, '/recordings', undefined, 1000, {
+        authSecret: 'turn-secret',
+        credentialTtlSeconds: 3600,
+        urls: ['turns:global.example.net:443?transport=tcp']
+    });
+    const session = await service.createSession({ ownerConnectionId: 'conn-1' });
+    assert.deepEqual(session.iceConfiguration?.servers[0], { urls: ['stun:stun.example.net:3478'] });
+    assert.deepEqual(session.iceConfiguration?.servers[1].urls, ['turns:turn.backend.example.net:443?transport=tcp']);
+    const turn = session.iceConfiguration!.servers[1];
+    assert.equal(turn.credential, createHmac('sha1', 'turn-secret').update(turn.username!).digest('base64'));
+    await service.destroySession(session.sessionId);
+});
+
+test('explicit STUN URLs work without a TURN secret or advertised IPv4 address', async () => {
+    const client = new FakeRtpbridgeClient('external-stun', 'rtpbridge-0', ['2001:db8::1']);
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any, '/recordings', undefined, 1000, {
+        credentialTtlSeconds: 3600,
+        urls: ['stun:stun.example.net:3478']
+    });
+    const session = await service.createSession({ ownerConnectionId: 'conn-1' });
+    assert.deepEqual(session.iceConfiguration?.servers, [{ urls: ['stun:stun.example.net:3478'] }]);
+    await service.destroySession(session.sessionId);
+});

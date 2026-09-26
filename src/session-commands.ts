@@ -4,7 +4,7 @@ import { CallNotFoundError, type SipAuthCredentials } from './drachtio-gateway';
 import type { GatewayController } from './http-server';
 import { InvalidHttpActionError, parseOptionalHeaders } from './http-contract';
 import type { GatewayMediaController } from './media-controller';
-import { MediaBackendNotFoundError } from './media-server-manager';
+import { MediaBackendNotFoundError, MediaBackendUnavailableError } from './media-server-manager';
 import { MediaActionConflictError, MediaEndpointNotFoundError, MediaRecordingProxyError, MediaSessionNotFoundError, MediaUnavailableError } from './media-session-service';
 
 export class CommandValidationError extends Error { }
@@ -492,13 +492,22 @@ export function controlErrorForCommand(err: unknown) {
     if (err instanceof CommandNotImplementedError) return { code: 'NOT_IMPLEMENTED', message: err.message };
     if (err instanceof CommandValidationError || err instanceof InvalidHttpActionError) return { code: 'BAD_REQUEST', message: err.message };
     if (err instanceof MediaActionConflictError) return { code: 'CONFLICT', message: err.message };
-    if (err instanceof CallNotFoundError || err instanceof MediaSessionNotFoundError || err instanceof MediaEndpointNotFoundError || err instanceof MediaBackendNotFoundError) {
+    if (
+        err instanceof CallNotFoundError ||
+        err instanceof MediaSessionNotFoundError ||
+        err instanceof MediaEndpointNotFoundError ||
+        err instanceof MediaBackendNotFoundError
+    ) {
         return { code: 'NOT_FOUND', message: err.message };
     }
-    if (err instanceof MediaUnavailableError) return { code: 'MEDIA_UNAVAILABLE', message: err.message };
+    if (err instanceof MediaUnavailableError || err instanceof MediaBackendUnavailableError)
+        return { code: 'MEDIA_UNAVAILABLE', message: err.message };
     if (err instanceof MediaRecordingProxyError) {
         if (err.statusCode === 400) return { code: 'BAD_REQUEST', message: err.message };
-        return { code: err.statusCode === 404 ? 'NOT_FOUND' : 'RECORDING_PROXY_ERROR', message: err.message };
+        return {
+            code: err.statusCode === 404 ? 'NOT_FOUND' : 'RECORDING_PROXY_ERROR',
+            message: err.message
+        };
     }
     return undefined;
 }

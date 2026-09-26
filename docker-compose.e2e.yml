@@ -46,11 +46,11 @@ services:
       - --config
       - /etc/rtpbridge/rtpbridge.e2e.toml
       - --listen
-      - 0.0.0.0:9100
+      - 0.0.0.0:9101
       - --media-ip
       - 10.89.42.11
     ports:
-      - "9101:9100/tcp"
+      - "9101:9101/tcp"
     volumes:
       - ${E2E_FIXTURES_DIR:-./scripts}:/etc/rtpbridge:ro
       - rtpbridge-recordings-b:/var/lib/rtpbridge/recordings
@@ -107,11 +107,14 @@ services:
       HTTP_PORT: "3001"
       CONTROL_AUTH_MODE: none
       RTPBRIDGE_HOST: rtpbridge-e2e
+      RTPBRIDGE_ENDPOINTS_FILE: /etc/rtpbridge/endpoints.json
+      RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT: ${E2E_ALLOW_PLAINTEXT:-false}
+      RTPBRIDGE_REQUIRED: "true"
       RTPBRIDGE_PORT: "9100"
       RTPBRIDGE_TLS: ${E2E_SECURE:-false}
       RTPBRIDGE_AUTH_HMAC_SECRET_FILE: ${E2E_CONTAINER_SECRET_FILE:-}
       RTPBRIDGE_TLS_CA_FILE: ${E2E_CONTAINER_CA_FILE:-}
-      RTPBRIDGE_TLS_SERVERNAME: rtpbridge.test
+      RTPBRIDGE_TLS_SERVERNAME: unused-global-name.test
       COTURN_AUTH_SECRET: e2e-turn-secret
       RECORDINGS_PATH: /var/lib/rtpbridge/recordings
       E2E_AUDIO_HOST: gateway

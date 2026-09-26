@@ -2,7 +2,7 @@
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, renameSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import net from 'node:net';
 import process from 'node:process';
@@ -12,6 +12,7 @@ import { assertAudio, pcapRtp } from './e2e-media.mjs';
 
 const secure = process.env.E2E_SECURE !== 'false';
 process.env.E2E_SECURE = String(secure);
+process.env.E2E_ALLOW_PLAINTEXT = String(!secure);
 const backendScheme = secure ? 'https' : 'http';
 
 const composeFile = 'docker-compose.e2e.yml';
@@ -26,7 +27,7 @@ const rtpbridgeHttpUrls = (process.env.E2E_RTPBRIDGE_URLS || `${backendScheme}:/
     .split(',')
     .map(url => url.trim())
     .filter(Boolean);
-const inContainerRtpbridgeHttpUrls = process.env.E2E_CONTAINER_RTPBRIDGE_URLS || `${backendScheme}://rtpbridge:9100,${backendScheme}://rtpbridge-b:9100`;
+const inContainerRtpbridgeHttpUrls = process.env.E2E_CONTAINER_RTPBRIDGE_URLS || `${backendScheme}://rtpbridge:9100,${backendScheme}://rtpbridge-b:9101`;
 const PCAP_HEADER_BYTES = 24;
 
 const steps = [];
@@ -71,6 +72,7 @@ async function main() {
     await runOutboundCancelScenario(control);
     await runReinviteScenario(control);
     await runMultiBackendScenario();
+    await runCatalogAdmissionScenario();
     await runMediaScenario();
     await runMediaScenario({ srtp: true });
     await runWebrtcScenario();
@@ -99,9 +101,12 @@ function prepareFixtures() {
         copyFileSync('test/fixtures/rtpbridge-key.pem', `${fixturesDirectory}/key.pem`);
         chmodSync(`${fixturesDirectory}/cert.pem`, 0o644);
         chmodSync(`${fixturesDirectory}/key.pem`, 0o644);
-        writeFileSync(`${fixturesDirectory}/secret`, `${randomBytes(32).toString('hex')}\n`, { mode: 0o644 });
+        writeFileSync(`${fixturesDirectory}/secret`, `${randomBytes(32).toString('hex')}\n`, {
+            mode: 0o644
+        });
         config = config.replace(/allow_(plaintext|unauthenticated)_control = true\n/g, '');
-        config += '\nauth_hmac_secret_file = "/etc/rtpbridge/secret"\n\n[tls]\ncert_path = "/etc/rtpbridge/cert.pem"\nkey_path = "/etc/rtpbridge/key.pem"\n';
+        config +=
+            '\nauth_hmac_secret_file = "/etc/rtpbridge/secret"\n\n[tls]\ncert_path = "/etc/rtpbridge/cert.pem"\nkey_path = "/etc/rtpbridge/key.pem"\n';
         process.env.E2E_CONTAINER_SECRET_FILE = '/etc/rtpbridge/secret';
         process.env.E2E_CONTAINER_CA_FILE = '/etc/rtpbridge/cert.pem';
         process.env.RTPBRIDGE_AUTH_HMAC_SECRET_FILE = `${fixturesDirectory}/secret`;
@@ -109,6 +114,57 @@ function prepareFixtures() {
         process.env.RTPBRIDGE_TLS_SERVERNAME = 'rtpbridge.test';
     }
     writeFileSync(`${fixturesDirectory}/rtpbridge.e2e.toml`, config);
+    writeCatalog([true, true]);
+}
+
+function writeCatalog(admission) {
+    const scheme = secure ? 'wss' : 'ws';
+    const value = {
+        schemaVersion: 1,
+        revision: randomUUID(),
+        backends: ['10.89.42.10', '10.89.42.11'].map((id, index) => ({
+            id,
+            acceptNew: admission[index],
+            control: {
+                url: `${scheme}://${id}:${index === 0 ? 9100 : 9101}/`,
+                tlsServerName: 'rtpbridge.test'
+            },
+            recordings: {
+                url: `${secure ? 'https' : 'http'}://${id}:${index === 0 ? 9100 : 9101}/`,
+                tlsServerName: 'rtpbridge.test'
+            }
+        }))
+    };
+    const target = `${fixturesDirectory}/endpoints.json`;
+    writeFileSync(`${target}.tmp`, JSON.stringify(value));
+    renameSync(`${target}.tmp`, target);
+    return value.revision;
+}
+
+async function runCatalogAdmissionScenario() {
+    step('Checking atomic catalog drain keeps existing media and recording access without moving pinned calls');
+    const callId = `catalog-${randomUUID()}`;
+    const existing = await control.request('session.create', { callId });
+    const index = existing.backendId === '10.89.42.10' ? 0 : 1;
+    const admission = [true, true];
+    admission[index] = false;
+    let fresh;
+    try {
+        const revision = writeCatalog(admission);
+        await eventually(async () => {
+            const status = await getJson(`${gatewayBaseUrl}/routing/status`);
+            assertEqual(status.media.revision, revision, 'gateway must observe the atomic replacement');
+        }, 5000);
+        await assertRejected(control.request('session.create', { callId }), /MEDIA_UNAVAILABLE/);
+        fresh = await control.request('session.create', { callId: `fresh-${randomUUID()}` });
+        assert(existing.backendId !== fresh.backendId, 'new work must use the admitting backend');
+        await control.request('webrtc.createOffer', { sessionId: existing.sessionId });
+        await getJson(`${gatewayBaseUrl}/recordings`);
+    } finally {
+        writeCatalog([true, true]);
+        await control.request('session.delete', { sessionId: existing.sessionId });
+        if (fresh) await control.request('session.delete', { sessionId: fresh.sessionId });
+    }
 }
 
 async function runBackendAuthenticationScenario() {
@@ -823,32 +879,58 @@ async function runMediaScenario({ srtp = false } = {}) {
 
 async function runWebrtcScenario() {
     step('Running WebRTC media session scenario');
-    run('docker', [
-        'compose', '-f', composeFile, 'exec', '-T',
-        '-e', `E2E_RTPBRIDGE_URLS=${inContainerRtpbridgeHttpUrls}`,
-        'gateway', 'node', 'scripts/webrtc-probe.mjs'
-    ], {
-        timeout: 120_000,
-        env: {
-            ...process.env,
-            COMPOSE_PROJECT_NAME: projectName
+    run(
+        'docker',
+        [
+            'compose',
+            '-f',
+            composeFile,
+            'exec',
+            '-T',
+            '-e',
+            `E2E_RTPBRIDGE_URLS=${inContainerRtpbridgeHttpUrls}`,
+            '-e',
+            'RTPBRIDGE_TLS_SERVERNAME=rtpbridge.test',
+            'gateway',
+            'node',
+            'scripts/webrtc-probe.mjs'
+        ],
+        {
+            timeout: 120_000,
+            env: {
+                ...process.env,
+                COMPOSE_PROJECT_NAME: projectName
+            }
         }
-    });
+    );
 }
 
 async function runOutboundBridgeScenario() {
     step('Running outbound SIP to WebRTC bridge scenario');
-    run('docker', [
-        'compose', '-f', composeFile, 'exec', '-T',
-        '-e', `E2E_RTPBRIDGE_URLS=${inContainerRtpbridgeHttpUrls}`,
-        'gateway', 'node', 'scripts/outbound-bridge-probe.mjs'
-    ], {
-        timeout: 120_000,
-        env: {
-            ...process.env,
-            COMPOSE_PROJECT_NAME: projectName
+    run(
+        'docker',
+        [
+            'compose',
+            '-f',
+            composeFile,
+            'exec',
+            '-T',
+            '-e',
+            `E2E_RTPBRIDGE_URLS=${inContainerRtpbridgeHttpUrls}`,
+            '-e',
+            'RTPBRIDGE_TLS_SERVERNAME=rtpbridge.test',
+            'gateway',
+            'node',
+            'scripts/outbound-bridge-probe.mjs'
+        ],
+        {
+            timeout: 120_000,
+            env: {
+                ...process.env,
+                COMPOSE_PROJECT_NAME: projectName
+            }
         }
-    });
+    );
 }
 
 async function runRecordingScenario() {

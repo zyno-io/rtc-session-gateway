@@ -17,7 +17,7 @@ import {
 import { type GatewayHttpClient, HttpPostError } from './http-client';
 import { BaseLogger } from './logger';
 import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
-import { getSipUser, matchRoute, stripSipUri } from './routing';
+import { acceptsSipHost, getSipUser, matchRoute, stripSipUri } from './routing';
 
 export class CallNotFoundError extends Error { }
 export class InvalidCallStateError extends Error { }
@@ -186,6 +186,10 @@ export class DrachtioGateway {
 
     private async handleAdmittedInvite(req: Srf.SrfRequest, res: Srf.SrfResponse) {
         const destinationUri = stripSipUri(req.uri);
+        if (!acceptsSipHost(destinationUri, this.config.SIP_ALLOWED_DOMAINS)) {
+            res.send(404, 'No Route', {});
+            return;
+        }
         const destinationUser = getSipUser(destinationUri);
         const routeDestination = { destinationUri, destinationUser };
         const controlRoute = this.controlHub?.findRoute(routeDestination);
@@ -218,7 +222,7 @@ export class DrachtioGateway {
                 return;
             }
 
-            acceptedReceiverUrl = controlRoute ? controlRoute.route.url : action.receiverUrl ?? httpRoute!.url;
+            acceptedReceiverUrl = controlRoute ? controlRoute.route.url : (action.receiverUrl ?? httpRoute!.url);
 
             const dialog = await this.srf.createUAS(req, res, {
                 localSdp: action.sdp,
@@ -231,7 +235,7 @@ export class DrachtioGateway {
                 callId,
                 sipCallId,
                 routeUrl,
-                receiverUrl: controlRoute ? controlRoute.route.url : action.receiverUrl ?? httpRoute!.url,
+                receiverUrl: controlRoute ? controlRoute.route.url : (action.receiverUrl ?? httpRoute!.url),
                 controlConnectionId: controlRoute?.connectionId,
                 destinationUri,
                 destinationUser,

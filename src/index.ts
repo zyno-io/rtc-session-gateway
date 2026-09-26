@@ -26,7 +26,7 @@ run().catch(err => {
 async function run() {
     const registry = new CallRegistry();
     const controlHub = new ControlHub(Config.CONTROL_REQUEST_TIMEOUT_MS);
-    const mediaServers = Config.RTPBRIDGE_HOST ? new MediaServerManager(Config) : undefined;
+    const mediaServers = Config.RTPBRIDGE_HOST || Config.RTPBRIDGE_ENDPOINTS_FILE ? new MediaServerManager(Config) : undefined;
     let media: MediaSessionService | undefined;
     let gateway: DrachtioGateway;
     let httpServer: HttpServer;
@@ -47,10 +47,11 @@ async function run() {
     media = mediaServers
         ? new MediaSessionService(mediaServers, Config.RECORDINGS_PATH, controlHub, Config.RTPBRIDGE_REQUEST_TIMEOUT_MS, {
               authSecret: Config.COTURN_AUTH_SECRET,
-              credentialTtlSeconds: Config.COTURN_CREDENTIAL_TTL_SECONDS
+              credentialTtlSeconds: Config.COTURN_CREDENTIAL_TTL_SECONDS,
+              urls: Config.COTURN_URLS
           }, lifecycle)
         : undefined;
-    if (mediaServers) mediaServers.isCallActive = callId => !!registry.get(callId) || !!media?.get(callId);
+    if (mediaServers) mediaServers.isCallActive = callId => registry.hasCallOrReservation(callId) || !!media?.get(callId);
     gateway = new DrachtioGateway(Config, registry, new AxiosGatewayHttpClient(), undefined, controlHub, {}, lifecycle);
     controlHub.on('disconnect', connectionId => {
         const cleanup = async () => {
@@ -61,7 +62,10 @@ async function run() {
         if (lifecycle.isStopping) void cleanup();
         else void lifecycle.track(cleanup);
     });
-    httpServer = new HttpServer(Config, registry, gateway, controlHub, media, lifecycle);
+    httpServer = new HttpServer(Config, registry, gateway, controlHub, media, lifecycle,
+        () => !!mediaServers?.readiness.eligibleBackends,
+        () => mediaServers?.readiness
+    );
     httpServer.start();
     await gateway.start();
 }

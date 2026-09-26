@@ -83,6 +83,12 @@ export class ControlHub extends EventEmitter {
         return undefined;
     }
 
+    get routeCount() {
+        let count = 0;
+        for (const connection of this.connections.values()) count += connection.routes.length;
+        return count;
+    }
+
     async request(connectionId: string, method: string, params: unknown, timeoutMs = this.requestTimeoutMs) {
         const connection = this.requireConnection(connectionId);
         const id = randomUUID();

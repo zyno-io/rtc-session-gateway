@@ -1,4 +1,5 @@
-import { parseRoutesJson, RouteConfig } from './routing';
+import { parseRoutesJson, parseAllowedSipDomains, RouteConfig } from './routing';
+import { parseIceUrls } from './endpoint-catalog';
 
 export interface GatewayConfig {
     DRACHTIO_HOST: string;
@@ -23,6 +24,12 @@ export interface GatewayConfig {
     RTPBRIDGE_AUTH_HMAC_SECRET_FILE?: string;
     RTPBRIDGE_TLS_CA_FILE?: string;
     RTPBRIDGE_TLS_SERVERNAME?: string;
+    RTPBRIDGE_ENDPOINTS_FILE?: string;
+    RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT?: boolean;
+    RTPBRIDGE_REQUIRED?: boolean;
+    ROUTES_REQUIRED?: boolean;
+    SIP_ALLOWED_DOMAINS?: string[];
+    COTURN_URLS?: string[];
     COTURN_AUTH_SECRET?: string;
     COTURN_CREDENTIAL_TTL_SECONDS: number;
     RECORDINGS_PATH: string;
@@ -33,6 +40,10 @@ export interface GatewayConfig {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
     const controlAuthMode = readControlAuthMode(env);
+    const mediaRequired = readBoolean(env.RTPBRIDGE_REQUIRED, false, 'RTPBRIDGE_REQUIRED');
+    if (mediaRequired && !env.RTPBRIDGE_HOST && !env.RTPBRIDGE_ENDPOINTS_FILE) throw new Error('Required media needs RTPBRIDGE_HOST or RTPBRIDGE_ENDPOINTS_FILE');
+    const iceUrls = env.COTURN_URLS_JSON ? parseIceUrls(JSON.parse(env.COTURN_URLS_JSON)) : undefined;
+    if (iceUrls?.some(url => url.startsWith('turn')) && !env.COTURN_AUTH_SECRET) throw new Error('TURN URLs require COTURN_AUTH_SECRET');
     return {
         DRACHTIO_HOST: env.DRACHTIO_HOST || '127.0.0.1',
         DRACHTIO_PORT: readPositiveInteger(env.DRACHTIO_PORT, 9022, 'DRACHTIO_PORT'),
@@ -56,6 +67,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         RTPBRIDGE_AUTH_HMAC_SECRET_FILE: env.RTPBRIDGE_AUTH_HMAC_SECRET_FILE || undefined,
         RTPBRIDGE_TLS_CA_FILE: env.RTPBRIDGE_TLS_CA_FILE || undefined,
         RTPBRIDGE_TLS_SERVERNAME: env.RTPBRIDGE_TLS_SERVERNAME || undefined,
+        RTPBRIDGE_ENDPOINTS_FILE: env.RTPBRIDGE_ENDPOINTS_FILE || undefined,
+        RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT: readBoolean(env.RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT, false, 'RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT'),
+        ROUTES_REQUIRED: readBoolean(env.ROUTES_REQUIRED, false, 'ROUTES_REQUIRED'),
+        RTPBRIDGE_REQUIRED: mediaRequired,
+        SIP_ALLOWED_DOMAINS: parseAllowedSipDomains(env.SIP_ALLOWED_DOMAINS_JSON),
+        COTURN_URLS: iceUrls,
         COTURN_AUTH_SECRET: env.COTURN_AUTH_SECRET || undefined,
         COTURN_CREDENTIAL_TTL_SECONDS: readPositiveInteger(env.COTURN_CREDENTIAL_TTL_SECONDS, 86_400, 'COTURN_CREDENTIAL_TTL_SECONDS'),
         RECORDINGS_PATH: env.RECORDINGS_PATH || '/var/lib/rtpbridge/recordings',

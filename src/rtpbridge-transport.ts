@@ -10,6 +10,7 @@ export class RtpbridgeTransport {
     private secret?: Buffer;
     private ca?: Buffer;
     private agent?: Agent;
+    private agents = new Map<string, Agent>();
 
     constructor(private options: { hmacSecretFile?: string; caFile?: string; servername?: string } = {}) {
         if (options.hmacSecretFile) {
@@ -25,18 +26,36 @@ export class RtpbridgeTransport {
         }
     }
 
-    websocketOptions(url: string): ClientOptions & Pick<ConnectionOptions, 'servername'> {
-        return { headers: this.headers('GET', url), ca: this.ca, servername: this.options.servername };
+    websocketOptions(url: string, servername = this.options.servername): ClientOptions & Pick<ConnectionOptions, 'servername'> {
+        return { headers: this.headers('GET', url), ca: this.ca, servername };
     }
 
-    httpOptions(method: string, url: string): AxiosRequestConfig {
+    httpOptions(method: string, url: string, servername = this.options.servername): AxiosRequestConfig {
         // Sign the exact target sent to the selected backend. A redirect needs
         // a new signature and must not inherit administrative authorization.
-        return { headers: this.headers(method, url), httpsAgent: this.agent, maxRedirects: 0, proxy: false };
+        let agent = this.agent;
+        if (servername && servername !== this.options.servername) {
+            agent = this.agents.get(servername);
+            if (!agent) {
+                if (this.agents.size >= 256) {
+                    const idle = [...this.agents.entries()].find(([, candidate]) =>
+                        Object.values(candidate.sockets).every(sockets => !sockets?.length)
+                    );
+                    if (!idle) throw new Error('All backend TLS profiles are busy');
+                    idle[1].destroy();
+                    this.agents.delete(idle[0]);
+                }
+                agent = new Agent({ ca: this.ca, servername });
+                this.agents.set(servername, agent);
+            }
+        }
+        return { headers: this.headers(method, url), httpsAgent: agent, maxRedirects: 0, proxy: false };
     }
 
     destroy() {
         this.agent?.destroy();
+        for (const agent of this.agents.values()) agent.destroy();
+        this.agents.clear();
     }
 
     private headers(method: string, url: string): Record<string, string> {

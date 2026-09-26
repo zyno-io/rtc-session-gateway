@@ -62,3 +62,18 @@ Static HTTP routes are useful for simple webhooks:
 ```
 
 Dynamic WebSocket route registration is preferred for applications that need connection ownership, session cleanup, and pre-media decisioning.
+
+## Cross-cluster admission and discovery
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `RTPBRIDGE_ENDPOINTS_FILE` | Unset | Authoritative, atomically replaced endpoint catalog; overrides DNS. |
+| `RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT` | `false` | Permit WS/HTTP catalog endpoints for development. |
+| `RTPBRIDGE_REQUIRED` | `false` | Require admitting media capacity for readiness and new-call routing. |
+| `ROUTES_REQUIRED` | `false` | Require a registered/static application route before readiness. |
+| `SIP_ALLOWED_DOMAINS_JSON` | Unset | Exact inbound Request-URI hosts admitted before user matching. |
+| `COTURN_URLS_JSON` | Unset | Explicit deployment-wide ICE URLs; backend catalog URLs take precedence. |
+
+See [cross-cluster deployment](./cross-cluster.md) for the schema, lifecycle and
+protected transport boundary. TLS TURN needs an explicit URL matching its
+certificate; the gateway no longer derives an infrastructure-specific hostname.

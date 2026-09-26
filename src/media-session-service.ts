@@ -92,7 +92,7 @@ export class MediaSessionService implements GatewayMediaController {
         private recordingsPath = '/var/lib/rtpbridge/recordings',
         private eventPublisher?: MediaEventPublisher,
         private recordingHttpTimeoutMs = 10_000,
-        private turnConfig?: { authSecret?: string; credentialTtlSeconds: number },
+        private turnConfig?: { authSecret?: string; credentialTtlSeconds: number; urls?: string[] },
         private lifecycle?: GatewayLifecycle
     ) { }
 
@@ -209,35 +209,30 @@ export class MediaSessionService implements GatewayMediaController {
 
     private async createIceConfiguration(client: RtpbridgeClient, sessionId: string): Promise<RtcIceConfiguration | undefined> {
         const secret = this.turnConfig?.authSecret;
-        if (!secret) return undefined;
+        const configuredUrls = client.iceUrls ?? this.turnConfig?.urls;
+        if (!secret && !configuredUrls) return undefined;
 
         const serverInfo = await client.getServerInfo();
         const mediaIp = selectCoturnIpv4(serverInfo.mediaIp);
-        if (!mediaIp) {
+        if (!mediaIp && !configuredUrls)
             throw new MediaUnavailableError('rtpbridge server.info returned no usable IPv4 media_ip for cohosted coturn');
-        }
-
-        const backendId = client.backendId ?? client.backendHost ?? mediaIp;
-        const expiresAtSeconds = Math.floor(Date.now() / 1000) + this.turnConfig!.credentialTtlSeconds;
-        const username = `${expiresAtSeconds}:rtc-session-${sessionId}`;
-        const credential = createHmac('sha1', secret).update(username).digest('base64');
-        const tlsHostname = `ip-${mediaIp.replaceAll('.', '-')}.zynoinfra.net`;
+        const backendId = client.backendId ?? client.backendHost ?? mediaIp ?? '';
+        const expiresAtSeconds = Math.floor(Date.now() / 1000) + (this.turnConfig?.credentialTtlSeconds ?? 86400);
+        const username = String(expiresAtSeconds) + ':rtc-session-' + sessionId;
+        const urls = configuredUrls ?? [
+            'stun:' + mediaIp + ':3478',
+            'turn:' + mediaIp + ':3478?transport=udp',
+            'turn:' + mediaIp + ':3478?transport=tcp'
+        ];
+        const stun = urls.filter(url => url.startsWith('stun:'));
+        const turn = urls.filter(url => !url.startsWith('stun:'));
+        if (turn.length && !secret) throw new MediaUnavailableError('TURN URLs require COTURN_AUTH_SECRET');
+        const credential = secret ? createHmac('sha1', secret).update(username).digest('base64') : undefined;
         return {
             backendId,
-            mediaIp,
+            mediaIp: mediaIp ?? '',
             expiresAt: new Date(expiresAtSeconds * 1000).toISOString(),
-            servers: [
-                { urls: [`stun:${mediaIp}:3478`] },
-                {
-                    urls: [
-                        `turn:${mediaIp}:3478?transport=udp`,
-                        `turn:${mediaIp}:3478?transport=tcp`,
-                        `turns:${tlsHostname}:443?transport=tcp`
-                    ],
-                    username,
-                    credential
-                }
-            ]
+            servers: [...(stun.length ? [{ urls: stun }] : []), ...(turn.length ? [{ urls: turn, username, credential }] : [])]
         };
     }
 
@@ -490,7 +485,7 @@ export class MediaSessionService implements GatewayMediaController {
         try {
             const url = this.recordingUrl(backend, recordingPath);
             const response = await axios.get(url, {
-                ...this.mediaServers.getHttpRequestOptions('GET', url),
+                ...this.mediaServers.getHttpRequestOptions('GET', url, backend),
                 responseType: 'stream',
                 timeout: this.recordingHttpTimeoutMs,
                 validateStatus: () => true
@@ -549,7 +544,7 @@ export class MediaSessionService implements GatewayMediaController {
         try {
             const url = this.recordingUrl(backend, recordingPath);
             const response = await axios.delete(url, {
-                ...this.mediaServers.getHttpRequestOptions('DELETE', url),
+                ...this.mediaServers.getHttpRequestOptions('DELETE', url, backend),
                 timeout: this.recordingHttpTimeoutMs,
                 validateStatus: () => true
             });
@@ -934,15 +929,17 @@ export class MediaSessionService implements GatewayMediaController {
 
             try {
                 const response = await axios.get<{ recordings?: string[]; total?: number }>(url.toString(), {
-                    ...this.mediaServers.getHttpRequestOptions('GET', url.toString()),
+                    ...this.mediaServers.getHttpRequestOptions('GET', url.toString(), backend),
                     timeout: this.recordingHttpTimeoutMs
                 });
                 const page = response.data.recordings ?? [];
                 total = typeof response.data.total === 'number' ? response.data.total : undefined;
-                recordings.push(...page.map(recordingPath => ({
-                    backendId: backend.id,
-                    path: recordingPath
-                })));
+                recordings.push(
+                    ...page.map(recordingPath => ({
+                        backendId: backend.id,
+                        path: recordingPath
+                    }))
+                );
                 if (page.length === 0 || page.length < pageLimit) break;
                 skip += page.length;
             } catch (err) {
@@ -962,7 +959,7 @@ export class MediaSessionService implements GatewayMediaController {
         try {
             const url = this.recordingUrl(backend, recordingPath);
             response = await axios.get(url, {
-                ...this.mediaServers.getHttpRequestOptions('GET', url),
+                ...this.mediaServers.getHttpRequestOptions('GET', url, backend),
                 responseType: 'stream',
                 timeout: this.recordingHttpTimeoutMs,
                 validateStatus: () => true

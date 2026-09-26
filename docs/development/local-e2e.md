@@ -76,3 +76,9 @@ If port `3001` is already occupied, select another host port for both the compos
 ```sh
 E2E_GATEWAY_PORT=13001 yarn e2e:compose
 ```
+
+The stack uses an authoritative file catalog with two backend IDs on distinct
+control ports. Both CI transport modes validate atomic admission removal,
+strict call affinity and recording access while a backend is non-admitting. Secure
+mode uses endpoint TLS names even when the global default differs. Docker Desktop
+file propagation is synchronized through the observed catalog revision.

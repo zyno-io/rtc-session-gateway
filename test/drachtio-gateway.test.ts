@@ -496,3 +496,16 @@ function config(routes: GatewayConfig['ROUTES']): GatewayConfig {
         ROUTES: routes
     };
 }
+
+test('INVITE domain admission runs before application user route matching', async () => {
+    const cfg = config([{ match: 'exact', value: 'support', url: 'https://route.example.com/sip' }]);
+    cfg.SIP_ALLOWED_DOMAINS = ['sg.sip.example.net'];
+    const http = new FakeHttpClient([]);
+    const registry = new CallRegistry();
+    const gateway = new DrachtioGateway(cfg, registry, http, new FakeSrf() as any);
+    const response = new FakeResponse();
+    await gateway.handleInvite(fakeInvite(), response as any);
+    assert.equal(response.sent?.status, 404);
+    assert.equal(http.posts.length, 0);
+    assert.equal(registry.size, 0);
+});

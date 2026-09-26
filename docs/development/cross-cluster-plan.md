@@ -1,6 +1,10 @@
 # Cross-Cluster Implementation Plan
 
-Status: proposed implementation, based on gateway revision `4cbf2ec` and rtpbridge revision `130f090`. Graceful gateway drain is already implemented; its default natural deadline is 30 minutes. The interfaces described below are proposals until their implementation and acceptance tests ship.
+Status: public interfaces implemented and covered by unit/Compose CI. The deployed
+platform still needs its own protected adapter, identity/router configuration and
+network acceptance. See [the maintained configuration and schema](../guide/cross-cluster.md).
+Graceful gateway drain defaults to 30 minutes. This page records implementation
+scope; deployment acceptance remains outstanding.
 
 ## Recommendation
 
@@ -38,7 +42,7 @@ See the [deployment map](../guide/cross-cluster.md) for the current paths. Creat
 
 ## Phase 1: Endpoint Catalog and Backend Affinity
 
-### Proposed Catalog Contract
+### Catalog Contract
 
 Add `RTPBRIDGE_ENDPOINTS_FILE`. When set, the catalog is authoritative: an empty catalog, expired catalog, or missing backend must never trigger DNS or hostname fallback. When unset, retain the existing DNS discovery mode.
 

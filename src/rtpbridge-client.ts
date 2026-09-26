@@ -13,6 +13,7 @@ export interface RtpbridgeClientOptions {
     timeoutMs?: number;
     connectionTimeoutMs?: number;
     websocketOptions?: ClientOptions;
+    iceUrls?: string[];
 }
 
 export interface FileEndpointParams {
@@ -57,6 +58,9 @@ interface PendingRequest {
 }
 
 export class RtpbridgeClient extends EventEmitter {
+    get iceUrls() {
+        return this.options.iceUrls;
+    }
     private logger = BaseLogger.child({ ns: 'RtpbridgeClient' });
     private ws: WebSocket;
     private ready: Promise<void>;
