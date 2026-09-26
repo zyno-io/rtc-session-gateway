@@ -1,0 +1,136 @@
+services:
+  drachtio:
+    image: drachtio/drachtio-server:latest
+    command:
+      - drachtio
+      - --contact
+      - sip:*:5060;transport=tcp,udp
+      - --port
+      - "9022"
+      - --secret
+      - cymru
+      - --http-handler
+      - http://gateway:3001/drachtio/route
+      - --http-method
+      - GET
+      - --loglevel
+      - info
+    ports:
+      - "5060:5060/tcp"
+      - "5060:5060/udp"
+      - "9022:9022/tcp"
+
+  rtpbridge:
+    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:main}
+    command:
+      - --config
+      - /etc/rtpbridge/rtpbridge.e2e.toml
+      - --listen
+      - 0.0.0.0:9100
+      - --media-ip
+      - 10.89.42.10
+    ports:
+      - "9100:9100/tcp"
+    volumes:
+      - ${E2E_FIXTURES_DIR:-./scripts}:/etc/rtpbridge:ro
+      - rtpbridge-recordings:/var/lib/rtpbridge/recordings
+    networks:
+      default:
+        ipv4_address: 10.89.42.10
+        aliases:
+          - rtpbridge-e2e
+
+  rtpbridge-b:
+    image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:main}
+    command:
+      - --config
+      - /etc/rtpbridge/rtpbridge.e2e.toml
+      - --listen
+      - 0.0.0.0:9100
+      - --media-ip
+      - 10.89.42.11
+    ports:
+      - "9101:9100/tcp"
+    volumes:
+      - ${E2E_FIXTURES_DIR:-./scripts}:/etc/rtpbridge:ro
+      - rtpbridge-recordings-b:/var/lib/rtpbridge/recordings
+    networks:
+      default:
+        ipv4_address: 10.89.42.11
+        aliases:
+          - rtpbridge-e2e
+
+  turn:
+    build: &e2e-build
+      context: .
+      target: e2e
+    network_mode: service:rtpbridge
+    depends_on: [rtpbridge]
+    command: &turn-command
+      - turnserver
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=e2e-turn-secret
+      - --realm=e2e
+      - --relay-threads=1
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+
+  turn-b:
+    build: *e2e-build
+    network_mode: service:rtpbridge-b
+    depends_on: [rtpbridge-b]
+    command: *turn-command
+
+  gateway:
+    stop_grace_period: 15s
+    build:
+      context: .
+      target: e2e
+    depends_on:
+      - drachtio
+      - rtpbridge
+      - rtpbridge-b
+      - turn
+      - turn-b
+    environment:
+      SHUTDOWN_MAX_WAIT_MS: ${E2E_SHUTDOWN_MAX_WAIT_MS:-10000}
+      SHUTDOWN_CLEANUP_TIMEOUT_MS: "3000"
+      DRACHTIO_HOST: drachtio
+      DRACHTIO_PORT: "9022"
+      DRACHTIO_SECRET: cymru
+      DRACHTIO_APP_TAG: rtc-session-gateway
+      HTTP_PORT: "3001"
+      CONTROL_AUTH_MODE: none
+      RTPBRIDGE_HOST: rtpbridge-e2e
+      RTPBRIDGE_PORT: "9100"
+      RTPBRIDGE_TLS: ${E2E_SECURE:-false}
+      RTPBRIDGE_AUTH_HMAC_SECRET_FILE: ${E2E_CONTAINER_SECRET_FILE:-}
+      RTPBRIDGE_TLS_CA_FILE: ${E2E_CONTAINER_CA_FILE:-}
+      RTPBRIDGE_TLS_SERVERNAME: rtpbridge.test
+      COTURN_AUTH_SECRET: e2e-turn-secret
+      RECORDINGS_PATH: /var/lib/rtpbridge/recordings
+      E2E_AUDIO_HOST: gateway
+      E2E_AUDIO_PORT: "18080"
+      ROUTES_JSON: "[]"
+    ports:
+      - "${E2E_GATEWAY_PORT:-3001}:3001/tcp"
+    volumes:
+      - ${E2E_FIXTURES_DIR:-./scripts}:/etc/rtpbridge:ro
+    networks:
+      default:
+        ipv4_address: 10.89.42.20
+
+volumes:
+  rtpbridge-recordings:
+  rtpbridge-recordings-b:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.89.42.0/24

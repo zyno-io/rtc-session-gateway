@@ -1,0 +1,8 @@
+# Development-only control listener on the isolated Compose network.
+allow_plaintext_control = true
+allow_unauthenticated_control = true
+
+# Both probes run inside gateway and serve fixtures on this fixed port.
+file_download_origins = ["http://gateway:18080"]
+file_download_networks = ["10.89.42.20/32"]
+rtp_port_range = [30000, 30100]
