@@ -566,6 +566,38 @@ test('media session service constrains recording start paths to the configured r
     assert.deepEqual(client.startRecordingPaths, ['/var/lib/rtpbridge/recordings/nested/call_42.pcap']);
 });
 
+test('shared recording prefix fences start, list, download, merge and delete to gateway-owned files', async () => {
+    const requests: string[] = [];
+    const server = http.createServer((req, res) => {
+        requests.push(`${req.method} ${req.url}`);
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ recordings: ['sg_call.pcap', 'talk_call.pcap'], total: 2 }));
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const client = new FakeRtpbridgeClient();
+    const manager = new FakeMediaServerManager(client);
+    manager.backendHttpUrl = `http://127.0.0.1:${(server.address() as any).port}`;
+    const service = new MediaSessionService(manager as any, '/var/lib/rtpbridge/recordings', undefined, 1000, undefined, undefined, 'sg_');
+
+    try {
+        await service.createSession({ callId: 'call-42' });
+        const started = await service.startRecording('media-session-1', {});
+        assert.match(started.recordingPath, /^sg_/);
+        await assert.rejects(() => service.startRecording('media-session-1', { filePath: 'talk_call.pcap' }), /outside the configured prefix/);
+        const listed = await service.listRecordings();
+        assert.deepEqual(listed.recordings, [{ backendId: 'rtpbridge-0', path: 'sg_call.pcap' }]);
+        assert.ok(requests[0]?.includes('startsWith=sg_'));
+        await assert.rejects(() => service.listRecordings({ startsWith: 'talk_' }), /outside the configured prefix/);
+        await assert.rejects(() => service.downloadRecording('rtpbridge-0', 'talk_call.pcap'), /outside the configured prefix/);
+        await assert.rejects(() => service.mergeRecordings([{ backendId: 'rtpbridge-0', path: 'talk_call.pcap' }]), /outside the configured prefix/);
+        await assert.rejects(() => service.deleteRecording('rtpbridge-0', 'talk_call.pcap'), /outside the configured prefix/);
+        assert.equal(requests.length, 1, 'rejected operations never reach shared media');
+    } finally {
+        server.close();
+    }
+});
+
 test('media session service rejects unsafe recording proxy paths before backend request', async () => {
     const service = new MediaSessionService(new FakeMediaServerManager(new FakeRtpbridgeClient()) as any);
 

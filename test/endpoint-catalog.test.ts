@@ -121,6 +121,8 @@ test('catalog selection preserves concurrent call affinity and never falls back 
 test('media and TURN configuration fail early when required dependencies are omitted', async () => {
     const { loadConfig } = await import('../src/config');
     assert.throws(() => loadConfig({ APP_ENV: 'development', RTPBRIDGE_REQUIRED: 'true' }), /Required media/);
+    assert.throws(() => loadConfig({ RECORDING_PATH_PREFIX: '../talk' }), /RECORDING_PATH_PREFIX/);
+    assert.equal(loadConfig({ RECORDING_PATH_PREFIX: 'sg_' }).RECORDING_PATH_PREFIX, 'sg_');
     assert.throws(() => loadConfig({ APP_ENV: 'development', COTURN_URLS_JSON: '["turns:turn.example.net:443?transport=tcp"]' }), /COTURN_AUTH_SECRET/);
     assert.deepEqual(loadConfig({ APP_ENV: 'development', COTURN_URLS_JSON: '["stun:stun.example.net:3478"]' }).COTURN_URLS, ['stun:stun.example.net:3478']);
 });

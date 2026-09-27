@@ -49,7 +49,7 @@ async function run() {
               authSecret: Config.COTURN_AUTH_SECRET,
               credentialTtlSeconds: Config.COTURN_CREDENTIAL_TTL_SECONDS,
               urls: Config.COTURN_URLS
-          }, lifecycle)
+          }, lifecycle, Config.RECORDING_PATH_PREFIX)
         : undefined;
     if (mediaServers) mediaServers.isCallActive = callId => registry.hasCallOrReservation(callId) || !!media?.get(callId);
     gateway = new DrachtioGateway(Config, registry, new AxiosGatewayHttpClient(), undefined, controlHub, {}, lifecycle);

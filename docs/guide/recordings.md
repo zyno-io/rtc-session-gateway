@@ -43,6 +43,8 @@ GET /recordings/rtpbridge-0/call_42__seg_0001.pcap
 
 Recording paths are constrained to `RECORDINGS_PATH` and validated before proxying to rtpbridge.
 
+When sharing rtpbridge with another application, reserve a top-level filename prefix and set `RECORDING_PATH_PREFIX` (for example, `sg_`). The gateway uses it for generated recording names and rejects an explicit start path, list filter, download, merge target, or delete path outside that prefix. Lists are also filtered before returning results. This is a gateway-side boundary; the shared media HMAC itself still grants pool-wide control access, so keep it restricted to trusted workloads. Existing installations leave the prefix unset to retain their recording behavior.
+
 `GET /recordings` queries rtpbridge recording indexes. When the gateway has multiple rtpbridge backends, an all-backend list request fans out across each configured backend and combines the results. Use it for diagnostics, operator browsing, and recovery/backfill workflows.
 
 Production call-finalization flows should avoid prefix scans. Generate deterministic segment filenames in the application. If the application chooses the `filePath`, it already knows the `recordingPath`; in multi-backend deployments it should also persist the returned `backendId`. Use those known `{ backendId, path }` targets directly for download, merge, and delete operations.

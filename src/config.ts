@@ -33,6 +33,7 @@ export interface GatewayConfig {
     COTURN_AUTH_SECRET?: string;
     COTURN_CREDENTIAL_TTL_SECONDS: number;
     RECORDINGS_PATH: string;
+    RECORDING_PATH_PREFIX?: string;
     INVITE_HTTP_TIMEOUT_MS: number;
     EVENT_HTTP_TIMEOUT_MS: number;
     ROUTES: RouteConfig[];
@@ -76,10 +77,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         COTURN_AUTH_SECRET: env.COTURN_AUTH_SECRET || undefined,
         COTURN_CREDENTIAL_TTL_SECONDS: readPositiveInteger(env.COTURN_CREDENTIAL_TTL_SECONDS, 86_400, 'COTURN_CREDENTIAL_TTL_SECONDS'),
         RECORDINGS_PATH: env.RECORDINGS_PATH || '/var/lib/rtpbridge/recordings',
+        RECORDING_PATH_PREFIX: readRecordingPathPrefix(env.RECORDING_PATH_PREFIX),
         INVITE_HTTP_TIMEOUT_MS: readPositiveInteger(env.INVITE_HTTP_TIMEOUT_MS, 15_000, 'INVITE_HTTP_TIMEOUT_MS'),
         EVENT_HTTP_TIMEOUT_MS: readPositiveInteger(env.EVENT_HTTP_TIMEOUT_MS, 15_000, 'EVENT_HTTP_TIMEOUT_MS'),
         ROUTES: parseRoutesJson(env.ROUTES_JSON)
     };
+}
+
+function readRecordingPathPrefix(value: string | undefined): string | undefined {
+    if (!value) return undefined;
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(value) || value === '.' || value === '..') {
+        throw new Error('RECORDING_PATH_PREFIX must be a simple filename prefix');
+    }
+    return value;
 }
 
 function readDrachtioAppTag(value: string | undefined) {

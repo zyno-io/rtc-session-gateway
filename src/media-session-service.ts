@@ -93,7 +93,8 @@ export class MediaSessionService implements GatewayMediaController {
         private eventPublisher?: MediaEventPublisher,
         private recordingHttpTimeoutMs = 10_000,
         private turnConfig?: { authSecret?: string; credentialTtlSeconds: number; urls?: string[] },
-        private lifecycle?: GatewayLifecycle
+        private lifecycle?: GatewayLifecycle,
+        private recordingPathPrefix?: string
     ) { }
 
     list(): MediaSessionSnapshot[] {
@@ -466,12 +467,18 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     async listRecordings(params: { backendId?: string; startsWith?: string; skip?: number; limit?: number } = {}) {
+        if (this.recordingPathPrefix && params.startsWith && !params.startsWith.startsWith(this.recordingPathPrefix)) {
+            throw new MediaRecordingProxyError(403, 'Recording path is outside the configured prefix');
+        }
         const skip = Math.max(0, params.skip ?? 0);
         const limit = Math.min(Math.max(1, params.limit ?? 100), 1000);
         const backends = params.backendId ? [await this.mediaServers.resolveBackend(params.backendId)] : await this.mediaServers.resolveBackends();
 
-        const byBackend = await Promise.all(backends.map(async backend => this.listBackendRecordings(backend, params.startsWith)));
-        const all = byBackend.flat().sort((a, b) => `${a.backendId}/${a.path}`.localeCompare(`${b.backendId}/${b.path}`));
+        const byBackend = await Promise.all(backends.map(async backend => this.listBackendRecordings(backend, params.startsWith ?? this.recordingPathPrefix)));
+        const all = byBackend
+            .flat()
+            .filter(item => !this.recordingPathPrefix || this.ownsRecordingPath(item.path))
+            .sort((a, b) => `${a.backendId}/${a.path}`.localeCompare(`${b.backendId}/${b.path}`));
         return {
             recordings: all.slice(skip, skip + limit),
             total: all.length,
@@ -481,6 +488,7 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     async downloadRecording(backendId: string, recordingPath: string) {
+        this.requireOwnedRecordingPath(recordingPath);
         const backend = await this.mediaServers.resolveBackend(backendId);
         try {
             const url = this.recordingUrl(backend, recordingPath);
@@ -508,6 +516,7 @@ export class MediaSessionService implements GatewayMediaController {
         if (targets.length > MAX_RECORDING_MERGE_TARGETS) {
             throw new MediaRecordingProxyError(400, `recording merge supports at most ${MAX_RECORDING_MERGE_TARGETS} targets`);
         }
+        for (const target of targets) this.requireOwnedRecordingPath(target.path);
 
         const tempDir = await mkdtemp(path.join(tmpdir(), 'rtc-session-gateway-recording-merge-'));
         try {
@@ -540,6 +549,7 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     async deleteRecording(backendId: string, recordingPath: string) {
+        this.requireOwnedRecordingPath(recordingPath);
         const backend = await this.mediaServers.resolveBackend(backendId);
         try {
             const url = this.recordingUrl(backend, recordingPath);
@@ -879,6 +889,7 @@ export class MediaSessionService implements GatewayMediaController {
 
     private recordingMetadata(session: MediaSessionRecord, filePath: string) {
         const recordingPath = this.relativeRecordingPath(filePath);
+        this.requireOwnedRecordingPath(recordingPath);
         return {
             backendId: session.backendId,
             filePath,
@@ -899,13 +910,25 @@ export class MediaSessionService implements GatewayMediaController {
 
     private recordingFilePath(requestedPath: string | undefined, sessionId: string) {
         const root = this.recordingsRootPath();
-        const requested = (requestedPath ?? `${sessionId}-${randomUUID()}.pcap`).replace(/\\/g, '/');
+        const requested = (requestedPath ?? `${this.recordingPathPrefix ?? ''}${sessionId}-${randomUUID()}.pcap`).replace(/\\/g, '/');
         const resolved = path.resolve(root, requested);
         const relative = path.relative(root, resolved);
         if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
             throw new MediaRecordingProxyError(400, 'recording filePath must be inside configured recordings path');
         }
+        this.requireOwnedRecordingPath(relative);
         return resolved;
+    }
+
+    private ownsRecordingPath(recordingPath: string): boolean {
+        const segments = safeRecordingPathSegments(recordingPath);
+        return segments.length === 1 && !!this.recordingPathPrefix && segments[0].startsWith(this.recordingPathPrefix) && segments[0].length > this.recordingPathPrefix.length;
+    }
+
+    private requireOwnedRecordingPath(recordingPath: string): void {
+        if (this.recordingPathPrefix && !this.ownsRecordingPath(recordingPath)) {
+            throw new MediaRecordingProxyError(403, 'Recording path is outside the configured prefix');
+        }
     }
 
     private recordingsRootPath() {
