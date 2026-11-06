@@ -43,6 +43,7 @@ export default defineConfig({
                 text: 'Development',
                 items: [
                     { text: 'Testing', link: '/development/testing' },
+                    { text: 'Native Discovery Contract', link: '/development/native-discovery-contract' },
                     { text: 'Local E2E', link: '/development/local-e2e' },
                     { text: 'Cross-Cluster Plan', link: '/development/cross-cluster-plan' },
                     { text: 'Roadmap', link: '/roadmap' },

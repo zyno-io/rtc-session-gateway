@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 2,
+  "signaling": {
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "validUntil": "2026-11-06T12:00:30.000Z",
+    "backends": [
+      {
+        "id": "sipbridge-0",
+        "acceptNew": false,
+        "control": {
+          "url": "wss://192.0.2.10:8443/v1/control",
+          "tlsServerName": "sipbridge-0.example.internal"
+        }
+      }
+    ]
+  },
+  "media": {
+    "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "validUntil": "2026-11-06T12:00:25.000Z",
+    "backends": [
+      {
+        "id": "rtpbridge-0",
+        "acceptNew": true,
+        "control": {
+          "url": "wss://192.0.2.20:9100/",
+          "tlsServerName": "rtpbridge-0.example.internal"
+        },
+        "recordings": {
+          "url": "https://192.0.2.20:9200/",
+          "tlsServerName": "rtpbridge-0.example.internal"
+        },
+        "turn": {
+          "urls": [
+            "turns:turn.example.net:443?transport=tcp"
+          ]
+        }
+      }
+    ]
+  }
+}
