@@ -1,4 +1,4 @@
-import type Srf from 'drachtio-srf';
+import type { NativeDialog } from './sipbridge-signaling';
 
 import { normalizeCallId } from './call-id';
 
@@ -15,7 +15,7 @@ export interface ActiveCall {
     remoteSdp?: string;
     createdAt: string;
     updatedAt: string;
-    dialog: Srf.Dialog;
+    dialog: NativeDialog;
 }
 
 export type ActiveCallSnapshot = Pick<

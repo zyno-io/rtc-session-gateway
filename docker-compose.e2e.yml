@@ -1,25 +1,4 @@
 services:
-  drachtio:
-    image: drachtio/drachtio-server:latest
-    command:
-      - drachtio
-      - --contact
-      - sip:*:5060;transport=tcp,udp
-      - --port
-      - "9022"
-      - --secret
-      - cymru
-      - --http-handler
-      - http://gateway:3001/drachtio/route
-      - --http-method
-      - GET
-      - --loglevel
-      - info
-    ports:
-      - "5060:5060/tcp"
-      - "5060:5060/udp"
-      - "9022:9022/tcp"
-
   rtpbridge:
     image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:main}
     command:
@@ -30,7 +9,7 @@ services:
       - --media-ip
       - 10.89.42.10
     ports:
-      - "9100:9100/tcp"
+      - 9100:9100/tcp
     volumes:
       - ${E2E_FIXTURES_DIR:-./scripts}:/etc/rtpbridge:ro
       - rtpbridge-recordings:/var/lib/rtpbridge/recordings
@@ -39,7 +18,6 @@ services:
         ipv4_address: 10.89.42.10
         aliases:
           - rtpbridge-e2e
-
   rtpbridge-b:
     image: ${RTPBRIDGE_IMAGE:-ghcr.io/zyno-io/rtpbridge:main}
     command:
@@ -50,7 +28,7 @@ services:
       - --media-ip
       - 10.89.42.11
     ports:
-      - "9101:9101/tcp"
+      - 9101:9101/tcp
     volumes:
       - ${E2E_FIXTURES_DIR:-./scripts}:/etc/rtpbridge:ro
       - rtpbridge-recordings-b:/var/lib/rtpbridge/recordings
@@ -59,14 +37,14 @@ services:
         ipv4_address: 10.89.42.11
         aliases:
           - rtpbridge-e2e
-
   turn:
-    build: &e2e-build
+    build: &id001
       context: .
       target: e2e
     network_mode: service:rtpbridge
-    depends_on: [rtpbridge]
-    command: &turn-command
+    depends_on:
+      - rtpbridge
+    command: &id002
       - turnserver
       - --no-cli
       - --no-tls
@@ -79,38 +57,32 @@ services:
       - --listening-port=3478
       - --min-port=49160
       - --max-port=49200
-
   turn-b:
-    build: *e2e-build
+    build: *id001
     network_mode: service:rtpbridge-b
-    depends_on: [rtpbridge-b]
-    command: *turn-command
-
+    depends_on:
+      - rtpbridge-b
+    command: *id002
   gateway:
     stop_grace_period: 15s
     build:
       context: .
       target: e2e
     depends_on:
-      - drachtio
       - rtpbridge
       - rtpbridge-b
       - turn
       - turn-b
+      - sipbridge
     environment:
       SHUTDOWN_MAX_WAIT_MS: ${E2E_SHUTDOWN_MAX_WAIT_MS:-10000}
-      SHUTDOWN_CLEANUP_TIMEOUT_MS: "3000"
-      DRACHTIO_HOST: drachtio
-      DRACHTIO_PORT: "9022"
-      DRACHTIO_SECRET: cymru
-      DRACHTIO_APP_TAG: rtc-session-gateway
-      HTTP_PORT: "3001"
+      SHUTDOWN_CLEANUP_TIMEOUT_MS: '3000'
+      HTTP_PORT: '3001'
       CONTROL_AUTH_MODE: none
       RTPBRIDGE_HOST: rtpbridge-e2e
-      RTPBRIDGE_ENDPOINTS_FILE: /etc/rtpbridge/endpoints.json
       RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT: ${E2E_ALLOW_PLAINTEXT:-false}
-      RTPBRIDGE_REQUIRED: "true"
-      RTPBRIDGE_PORT: "9100"
+      RTPBRIDGE_REQUIRED: 'true'
+      RTPBRIDGE_PORT: '9100'
       RTPBRIDGE_TLS: ${E2E_SECURE:-false}
       RTPBRIDGE_AUTH_HMAC_SECRET_FILE: ${E2E_CONTAINER_SECRET_FILE:-}
       RTPBRIDGE_TLS_CA_FILE: ${E2E_CONTAINER_CA_FILE:-}
@@ -118,20 +90,67 @@ services:
       COTURN_AUTH_SECRET: e2e-turn-secret
       RECORDINGS_PATH: /var/lib/rtpbridge/recordings
       E2E_AUDIO_HOST: gateway
-      E2E_AUDIO_PORT: "18080"
-      ROUTES_JSON: "[]"
+      E2E_AUDIO_PORT: '18080'
+      ROUTES_JSON: '[]'
+      RTC_ENDPOINTS_FILE: /etc/rtpbridge/endpoints.json
+      SIPBRIDGE_TLS_CERT_FILE: /etc/rtpbridge/native-client.crt
+      SIPBRIDGE_TLS_KEY_FILE: /etc/rtpbridge/native-client.key
+      SIPBRIDGE_TLS_CA_FILE: /etc/rtpbridge/native-ca.crt
+      ROUTES_REQUIRED: 'true'
     ports:
-      - "${E2E_GATEWAY_PORT:-3001}:3001/tcp"
+      - ${E2E_GATEWAY_PORT:-3001}:3001/tcp
     volumes:
       - ${E2E_FIXTURES_DIR:-./scripts}:/etc/rtpbridge:ro
     networks:
       default:
         ipv4_address: 10.89.42.20
-
+  sipbridge:
+    image: ${SIPBRIDGE_IMAGE:?Set SIPBRIDGE_IMAGE to the qualified native runtime}
+    environment:
+      SIPBRIDGE_STATE_BACKEND: memory
+    command:
+      - --instance
+      - sipbridge-e2e
+      - --control-listen
+      - 0.0.0.0:8443
+      - --admin-listen
+      - 0.0.0.0:8800
+      - --sip-listen
+      - 0.0.0.0:5061
+      - --sip-plain-listen
+      - 0.0.0.0:5060
+      - --advertise
+      - 10.89.42.30:5061
+      - --advertise-plain
+      - 10.89.42.30:5060
+      - --contact
+      - sip:sipbridge@10.89.42.30:5060;transport=tcp
+      - --control-cert
+      - /fixtures/native-server.crt
+      - --control-key
+      - /fixtures/native-server.key
+      - --sip-cert
+      - /fixtures/native-server.crt
+      - --sip-key
+      - /fixtures/native-server.key
+      - --client-ca
+      - /fixtures/native-ca.crt
+      - --allowed-client-uri
+      - spiffe://rtc/e2e/controller
+      - --allow-register=false
+      - --allow-subscribe=false
+    ports:
+      - ${E2E_SIP_PORT:-5060}:5060/tcp
+      - ${E2E_SIP_PORT:-5060}:5060/udp
+      - ${E2E_SIP_ADMIN_PORT:-18800}:8800/tcp
+    volumes:
+      - ${E2E_FIXTURES_DIR:-./scripts}:/fixtures:ro
+    networks:
+      default:
+        ipv4_address: 10.89.42.30
 volumes:
-  rtpbridge-recordings:
-  rtpbridge-recordings-b:
-
+  rtpbridge-recordings: null
+  rtpbridge-recordings-b: null
 networks:
   default:
     ipam:

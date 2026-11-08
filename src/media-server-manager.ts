@@ -16,8 +16,8 @@ export interface MediaServerResolver {
 
 const CALL_BACKEND_TTL_MS = 4 * 60 * 60 * 1000;
 
-export class MediaBackendNotFoundError extends Error { }
-export class MediaBackendUnavailableError extends Error { }
+export class MediaBackendNotFoundError extends Error {}
+export class MediaBackendUnavailableError extends Error {}
 
 export class MediaServerManager {
     private logger = BaseLogger.child({ ns: 'MediaServerManager' });
@@ -32,11 +32,18 @@ export class MediaServerManager {
         private config: Pick<
             GatewayConfig,
             'RTPBRIDGE_HOST' | 'RTPBRIDGE_PORT' | 'RTPBRIDGE_SRV_PORT_NAME' | 'RTPBRIDGE_REQUEST_TIMEOUT_MS' | 'RTPBRIDGE_CONNECTION_TIMEOUT_MS'
-        > & Partial<Pick<
-            GatewayConfig,
-            'RTPBRIDGE_TLS' | 'RTPBRIDGE_AUTH_HMAC_SECRET_FILE' | 'RTPBRIDGE_TLS_CA_FILE' | 'RTPBRIDGE_TLS_SERVERNAME' |
-            'RTPBRIDGE_ENDPOINTS_FILE' | 'RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT'
-        >>,
+        > &
+            Partial<
+                Pick<
+                    GatewayConfig,
+                    | 'RTPBRIDGE_TLS'
+                    | 'RTPBRIDGE_AUTH_HMAC_SECRET_FILE'
+                    | 'RTPBRIDGE_TLS_CA_FILE'
+                    | 'RTPBRIDGE_TLS_SERVERNAME'
+                    | 'RTC_ENDPOINTS_FILE'
+                    | 'RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT'
+                >
+            >,
         private resolver: MediaServerResolver = dns
     ) {
         const dnsHostname = config.RTPBRIDGE_HOST && !isIP(config.RTPBRIDGE_HOST) ? config.RTPBRIDGE_HOST : undefined;
@@ -45,8 +52,7 @@ export class MediaServerManager {
             caFile: config.RTPBRIDGE_TLS_CA_FILE,
             servername: config.RTPBRIDGE_TLS_SERVERNAME ?? (config.RTPBRIDGE_TLS ? dnsHostname : undefined)
         });
-        if (config.RTPBRIDGE_ENDPOINTS_FILE)
-            this.catalog = new FileEndpointCatalog(config.RTPBRIDGE_ENDPOINTS_FILE, config.RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT);
+        if (config.RTC_ENDPOINTS_FILE) this.catalog = new FileEndpointCatalog(config.RTC_ENDPOINTS_FILE, config.RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT);
         this.sweepTimer = setInterval(() => this.sweepStaleEntries(), 10 * 60 * 1000);
     }
 

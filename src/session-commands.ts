@@ -1,14 +1,21 @@
 import { CallRegistry } from './call-registry';
 import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
-import { CallNotFoundError, type SipAuthCredentials } from './drachtio-gateway';
+import { NativeOperationError } from './sipbridge-signaling';
+import { CallNotFoundError, type SipAuthCredentials } from './sip-gateway';
 import type { GatewayController } from './http-server';
 import { InvalidHttpActionError, parseOptionalHeaders } from './http-contract';
 import type { GatewayMediaController } from './media-controller';
 import { MediaBackendNotFoundError, MediaBackendUnavailableError } from './media-server-manager';
-import { MediaActionConflictError, MediaEndpointNotFoundError, MediaRecordingProxyError, MediaSessionNotFoundError, MediaUnavailableError } from './media-session-service';
+import {
+    MediaActionConflictError,
+    MediaEndpointNotFoundError,
+    MediaRecordingProxyError,
+    MediaSessionNotFoundError,
+    MediaUnavailableError
+} from './media-session-service';
 
-export class CommandValidationError extends Error { }
-export class CommandNotImplementedError extends Error { }
+export class CommandValidationError extends Error {}
+export class CommandNotImplementedError extends Error {}
 
 export interface CommandContext {
     controlConnectionId?: string;
@@ -20,7 +27,7 @@ export class SessionCommandHandler {
         private gateway: GatewayController,
         private media?: GatewayMediaController,
         private lifecycle?: GatewayLifecycle
-    ) { }
+    ) {}
 
     async execute(method: string, params: unknown, context: CommandContext = {}) {
         switch (method) {
@@ -125,11 +132,7 @@ export class SessionCommandHandler {
             await this.media.destroySession(sessionId);
             return { ok: true };
         }
-        await this.gateway.bye(
-            sessionId,
-            typeof reason === 'string' ? reason : undefined,
-            parseOptionalHeaders(headers)
-        );
+        await this.gateway.bye(sessionId, typeof reason === 'string' ? reason : undefined, parseOptionalHeaders(headers));
         return { ok: true };
     }
 
@@ -137,7 +140,10 @@ export class SessionCommandHandler {
         const body = optionalObject(params);
         const callId = optionalString(body.callId, 'callId');
         if (!callId || !this.registry.hasCallOrReservation(callId)) this.lifecycle?.assertAccepting();
-        return this.requireMedia().createSession({ callId, ownerConnectionId: context.controlConnectionId });
+        return this.requireMedia().createSession({
+            callId,
+            ownerConnectionId: context.controlConnectionId
+        });
     }
 
     private async createOutbound(params: unknown, context: CommandContext) {
@@ -182,11 +188,7 @@ export class SessionCommandHandler {
         const { sessionId, callId, reason, headers } = requireObject(params);
         const id = typeof sessionId === 'string' ? sessionId : callId;
         if (typeof id !== 'string' || !id.trim()) throw new CommandValidationError('sessionId is required');
-        await this.gateway.bye(
-            id,
-            typeof reason === 'string' ? reason : undefined,
-            parseOptionalHeaders(headers)
-        );
+        await this.gateway.bye(id, typeof reason === 'string' ? reason : undefined, parseOptionalHeaders(headers));
         return { ok: true };
     }
 
@@ -294,10 +296,7 @@ export class SessionCommandHandler {
     private async updateDirection(params: unknown) {
         const body = requireObject(params);
         const direction = requiredDirection(body.direction);
-        return this.requireMedia().updateDirection(
-            requiredString(body.endpointId, 'endpointId'),
-            direction
-        );
+        return this.requireMedia().updateDirection(requiredString(body.endpointId, 'endpointId'), direction);
     }
 
     private async bridge(params: unknown) {
@@ -359,10 +358,7 @@ export class SessionCommandHandler {
 
     private async injectDtmf(params: unknown) {
         const body = requireObject(params);
-        return this.requireMedia().injectDtmf(
-            requiredString(body.endpointId, 'endpointId'),
-            requiredString(body.digit, 'digit')
-        );
+        return this.requireMedia().injectDtmf(requiredString(body.endpointId, 'endpointId'), requiredString(body.digit, 'digit'));
     }
 
     private async startRecording(params: unknown) {
@@ -393,10 +389,7 @@ export class SessionCommandHandler {
 
     private async deleteRecording(params: unknown) {
         const body = requireObject(params);
-        return this.requireMedia().deleteRecording(
-            requiredString(body.backendId, 'backendId'),
-            requiredString(body.path, 'path')
-        );
+        return this.requireMedia().deleteRecording(requiredString(body.backendId, 'backendId'), requiredString(body.path, 'path'));
     }
 
     private requireMedia() {
@@ -488,6 +481,11 @@ function optionalDirection(value: unknown) {
 }
 
 export function controlErrorForCommand(err: unknown) {
+    if (err instanceof NativeOperationError && (err.uncertain || err.unavailable))
+        return {
+            code: err.uncertain ? 'SIGNALING_UNKNOWN' : 'SIGNALING_UNAVAILABLE',
+            message: err.uncertain ? 'Native signaling outcome unknown; do not replay the operation' : 'Native signaling unavailable'
+        };
     if (err instanceof GatewayDrainingError) return { code: 'SHUTTING_DOWN', message: err.message };
     if (err instanceof CommandNotImplementedError) return { code: 'NOT_IMPLEMENTED', message: err.message };
     if (err instanceof CommandValidationError || err instanceof InvalidHttpActionError) return { code: 'BAD_REQUEST', message: err.message };

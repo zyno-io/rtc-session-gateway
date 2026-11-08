@@ -16,18 +16,30 @@ function backend(id: string, acceptNew = true) {
     };
 }
 function catalog(backends = [backend('a')], validUntil?: string) {
-    return { schemaVersion: 1, revision: 'r1', validUntil, backends };
+    return {
+        schemaVersion: 2,
+        signaling: {
+            revision: 'a'.repeat(64),
+            validUntil: validUntil ?? new Date(Date.now() + 30000).toISOString(),
+            backends: []
+        },
+        media: {
+            revision: 'b'.repeat(64),
+            validUntil: validUntil ?? new Date(Date.now() + 30000).toISOString(),
+            backends
+        }
+    };
 }
 
 test('catalog validates explicit addresses, separate recording ports, TLS identities and ICE URLs', () => {
     const view = parseEndpointCatalog(catalog());
-    assert.equal(view.backends[0].recordingServerName, 'recordings.a.test');
-    assert.equal(view.backends[0].httpUrl, 'https://10.0.0.1:9200/');
-    assert.deepEqual(view.backends[0].turnUrls, ['turns:turn.example.net:443?transport=tcp']);
+    assert.equal(view.media.backends[0].recordingServerName, 'recordings.a.test');
+    assert.equal(view.media.backends[0].httpUrl, 'https://10.0.0.1:9200/');
+    assert.deepEqual(view.media.backends[0].turnUrls, ['turns:turn.example.net:443?transport=tcp']);
     for (const invalid of [
         catalog([backend('a'), backend('a')]),
-        { ...catalog(), schemaVersion: 2 },
-        { ...catalog(), validUntil: 'yesterday' },
+        { ...catalog(), schemaVersion: 1 },
+        { ...catalog(), media: { ...catalog().media, validUntil: 'yesterday' } },
         catalog([{ ...backend('a'), acceptNew: undefined } as any]),
         catalog([{ ...backend('a'), control: { url: 'ws://localhost:9100' } } as any]),
         catalog([{ ...backend('a'), control: { url: 'wss://user:pass@localhost/path' } } as any])
@@ -60,7 +72,8 @@ test('atomic replacements retain last valid view without extending expiry on bro
         assert.equal(reader.status.valid, true);
         assert.deepEqual(reader.backends, []);
         writeFileSync(path, JSON.stringify(catalog(undefined, new Date(now - 1).toISOString())));
-        assert.deepEqual(reader.backends, []);
+        assert.equal(reader.status.valid, false);
+        assert.equal(reader.backends[0].id, 'a');
     } finally {
         reader.destroy();
         rmSync(directory, { recursive: true, force: true });
@@ -82,7 +95,7 @@ test('catalog selection preserves concurrent call affinity and never falls back 
             RTPBRIDGE_SRV_PORT_NAME: 'ws',
             RTPBRIDGE_REQUEST_TIMEOUT_MS: 1000,
             RTPBRIDGE_CONNECTION_TIMEOUT_MS: 1000,
-            RTPBRIDGE_ENDPOINTS_FILE: path
+            RTC_ENDPOINTS_FILE: path
         },
         {
             resolveSrv: async () => {
@@ -123,6 +136,59 @@ test('media and TURN configuration fail early when required dependencies are omi
     assert.throws(() => loadConfig({ APP_ENV: 'development', RTPBRIDGE_REQUIRED: 'true' }), /Required media/);
     assert.throws(() => loadConfig({ RECORDING_PATH_PREFIX: '../talk' }), /RECORDING_PATH_PREFIX/);
     assert.equal(loadConfig({ RECORDING_PATH_PREFIX: 'sg_' }).RECORDING_PATH_PREFIX, 'sg_');
-    assert.throws(() => loadConfig({ APP_ENV: 'development', COTURN_URLS_JSON: '["turns:turn.example.net:443?transport=tcp"]' }), /COTURN_AUTH_SECRET/);
-    assert.deepEqual(loadConfig({ APP_ENV: 'development', COTURN_URLS_JSON: '["stun:stun.example.net:3478"]' }).COTURN_URLS, ['stun:stun.example.net:3478']);
+    assert.throws(
+        () =>
+            loadConfig({
+                APP_ENV: 'development',
+                COTURN_URLS_JSON: '["turns:turn.example.net:443?transport=tcp"]'
+            }),
+        /COTURN_AUTH_SECRET/
+    );
+    assert.deepEqual(loadConfig({ APP_ENV: 'development', COTURN_URLS_JSON: '["stun:stun.example.net:3478"]' }).COTURN_URLS, [
+        'stun:stun.example.net:3478'
+    ]);
+});
+
+test('catalog v2 independently expires signaling and media and rejects insecure native metadata', async () => {
+    const { FileRtcEndpointCatalog } = await import('../src/endpoint-catalog');
+    const directory = mkdtempSync(join(tmpdir(), 'rtc-sections-'));
+    const path = join(directory, 'endpoints.json');
+    let now = Date.now();
+    const value = catalog();
+    value.signaling.backends = [
+        {
+            id: 'sip-core',
+            acceptNew: false,
+            control: { url: 'wss://10.0.0.2:8443/v1/control', tlsServerName: 'sip.test' }
+        }
+    ] as never;
+    value.signaling.validUntil = new Date(now + 1000).toISOString();
+    value.media.validUntil = new Date(now + 5000).toISOString();
+    writeFileSync(path, JSON.stringify(value));
+    const reader = new FileRtcEndpointCatalog(path, false, () => now);
+    try {
+        assert.equal(reader.snapshot.signaling.valid, true);
+        assert.equal(reader.snapshot.signaling.backends[0].acceptNew, false);
+        now += 1001;
+        assert.equal(reader.snapshot.signaling.valid, false);
+        assert.equal(reader.snapshot.media.valid, true);
+        value.signaling.validUntil = new Date(now + 5000).toISOString();
+        value.media.validUntil = new Date(now - 1).toISOString();
+        writeFileSync(path, JSON.stringify(value));
+        assert.equal(reader.snapshot.signaling.valid, true);
+        assert.equal(reader.snapshot.media.valid, false);
+        for (const control of [
+            { url: 'ws://sip.test/v1/control', tlsServerName: 'sip.test' },
+            { url: 'wss://sip.test/wrong', tlsServerName: 'sip.test' },
+            { url: 'wss://sip.test/v1/control' },
+            { url: 'wss://sip.test/v1/control?token=secret', tlsServerName: 'sip.test' }
+        ]) {
+            const invalid = structuredClone(value);
+            (invalid.signaling.backends as any[])[0].control = control;
+            assert.throws(() => parseEndpointCatalog(invalid, true));
+        }
+    } finally {
+        reader.destroy();
+        rmSync(directory, { recursive: true, force: true });
+    }
 });

@@ -1,0 +1,6 @@
+{
+    "repository": "https://git.s24.dev/signal24/oss/sipbridge",
+    "revision": "81b868e6bc9917ce2aa1ad2e27d7d5aa04f69b1b",
+    "image": "gcr.s24.dev/signal24/oss/sipbridge:81b868e6bc9917ce2aa1ad2e27d7d5aa04f69b1b@sha256:b1a4583b7aedf42f54c9e355e4f231fd095632687c9aca0ab86d671e5fdfe5b3",
+    "schema_sha256": "8f9e6843aee6a74a932a597d8589abb52845452c7d500950332c0fd5b568ccca"
+}

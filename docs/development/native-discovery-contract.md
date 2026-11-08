@@ -1,8 +1,8 @@
 # Direct native discovery contract v2
 
-This is the platform integration handoff for a separate RTC native SIP client change.
-The current application still consumes media-only v1 and uses SRF. Publishing this
-contract does not make the existing application compatible or authorize deployment.
+This is the implemented application/platform boundary for the native RTC client.
+The gateway consumes v2 and native sipbridge control. Source implementation and
+local acceptance do not authorize a deployment or establish production qualification.
 
 Download the [JSON Schema](/contracts/endpoint-catalog-v2.schema.json) and
 [synthetic example](/contracts/endpoint-catalog-v2.example.json).
@@ -44,7 +44,7 @@ continues existing work, and waits up to 7200 seconds before bounded shutdown.
 
 ## Application acceptance gate
 
-Before selecting an immutable native RTC image, implement and test v2 parsing,
+Before activating an immutable native RTC image, verify v2 parsing,
 independent section expiry, invalid replacement retention, verified native TLS/SNI,
 hello/lease/heartbeat/reconnect, non-admitting bootstrap, route status/decisions,
 media HMAC and recordings, stale-discovery admission, authority changes and drain.

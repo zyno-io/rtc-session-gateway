@@ -24,6 +24,14 @@ Response:
 { "ok": true, "calls": 0 }
 ```
 
+`GET /readyz` reports new-work admission independently of process liveness.
+Native connection loss, expired metadata, required media/route loss and drain
+return 503. Owner registration remains possible while unready.
+
+Native mutations whose replies are lost return HTTP 503 with
+`SIGNALING_UNKNOWN`; do not replay them. A known unavailable native session
+returns `SIGNALING_UNAVAILABLE`. Control WebSocket responses use the same codes.
+
 ## Calls And Sessions
 
 - `GET /calls`

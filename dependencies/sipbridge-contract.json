@@ -1,0 +1,35 @@
+{
+    "repository": "https://git.s24.dev/signal24/products/zyno/zynotalk-cluster-backends",
+    "source": "proto/sipbridge-control.proto",
+    "schema_sha256": "8f9e6843aee6a74a932a597d8589abb52845452c7d500950332c0fd5b568ccca",
+    "protoc": "3.21.12",
+    "protoc_gen_go": "1.36.12",
+    "ts_proto": "2.18.3",
+    "generated_go_sha256": "3edfbabd7c6df2fdb4b955854b59d833c1015ee46bdd4e4e27e4e367986c8a08",
+    "generated_ts_sha256": "9b798424c6b36677e172f5e91f7a76f7cd55864bbd2c73bbb355de64884ad35c",
+    "generated_json_validation_sha256": "555d030c83700967c8b6cdea891425a8d68bc97c31c6d149698d877afbf7a818",
+    "json_cases_sha256": "9cd2526ab826a7d03271d372f73c84a7e130c25bd561369af64b91389b8f4fc9",
+    "digest_challenge_case_sha256": "01647794997aa864eab906cccfdacb010673b25d1c2ea6922a3a733878c26004",
+    "wire_encoding": "json",
+    "subprotocol": "sipbridge.control.json.v1",
+    "sipbridgeRevision": "bdd6a6f38ed585cbd048b10ee202616d2d4cc34b",
+    "canonicalRevision": "51512739448ff5c9264a0410405593bcd2d543a2",
+    "files": {
+        "schema": {
+            "path": "dependencies/sipbridge-control.proto",
+            "sha256": "8f9e6843aee6a74a932a597d8589abb52845452c7d500950332c0fd5b568ccca"
+        },
+        "sipbridge-control.ts": {
+            "path": "src/sipbridge/generated/sipbridge-control.ts",
+            "sha256": "9b798424c6b36677e172f5e91f7a76f7cd55864bbd2c73bbb355de64884ad35c"
+        },
+        "sipbridge-json.ts": {
+            "path": "src/sipbridge/generated/sipbridge-json.ts",
+            "sha256": "555d030c83700967c8b6cdea891425a8d68bc97c31c6d149698d877afbf7a818"
+        },
+        "json-cases": {
+            "path": "dependencies/sipbridge-json-cases.json",
+            "sha256": "9cd2526ab826a7d03271d372f73c84a7e130c25bd561369af64b91389b8f4fc9"
+        }
+    }
+}

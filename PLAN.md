@@ -6,7 +6,7 @@ This plan tracks the reusable gateway as a standalone Zyno Consulting project. I
 
 `rtc-session-gateway` is responsible for:
 
-- SIP ingress and egress through Drachtio.
+- SIP ingress and egress through native sipbridge.
 - Destination-URI route ownership through WebSocket registrations or static HTTP route tables.
 - Pre-media inbound call decisioning before rtpbridge allocation.
 - SIP-less WebRTC session creation, teardown, ICE restart, and failure notification.
@@ -28,7 +28,7 @@ It is not responsible for:
 Current source layout is intentionally compact:
 
 - `src/config.ts`: environment parsing and defaults.
-- `src/drachtio-gateway.ts`: SIP ingress, outbound origination, re-INVITE, BYE, and follow-up events.
+- `src/sip-gateway.ts` and `src/sipbridge-signaling.ts`: SIP ingress, outbound origination, re-INVITE, BYE, and follow-up events.
 - `src/control-*`: WebSocket protocol, connection ownership, route registration, and gateway-initiated requests.
 - `src/http-*`: HTTP webhook contract, HTTP client, and management API.
 - `src/media-*` and `src/rtpbridge-client.ts`: rtpbridge backend selection, sessions, endpoints, playback, gather, leave-message, recording, and merge behavior.
