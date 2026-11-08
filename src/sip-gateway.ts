@@ -1,6 +1,12 @@
-import Srf = require('drachtio-srf');
+import {
+    NativeOperationError,
+    SipbridgeSignaling,
+    type IncomingSipRequest,
+    type NativeDialog,
+    type OutboundAttempt,
+    type SipResponse
+} from './sipbridge-signaling';
 import { randomUUID } from 'node:crypto';
-import { createConnection } from 'node:net';
 
 import type { ActiveCall } from './call-registry';
 import { CallRegistry } from './call-registry';
@@ -19,8 +25,8 @@ import { BaseLogger } from './logger';
 import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
 import { acceptsSipHost, getSipUser, matchRoute, stripSipUri } from './routing';
 
-export class CallNotFoundError extends Error { }
-export class InvalidCallStateError extends Error { }
+export class CallNotFoundError extends Error {}
+export class InvalidCallStateError extends Error {}
 
 export interface SipAuthCredentials {
     username: string;
@@ -46,148 +52,60 @@ export interface OutboundSipCallResult {
     sdp: string;
 }
 
-export interface DrachtioEndpoint {
-    host: string;
-    port: number;
-    timeoutMs: number;
-}
-
-export type DrachtioEndpointProbe = (endpoint: DrachtioEndpoint) => Promise<void>;
-export type DrachtioRetryDelay = (delayMs: number) => Promise<void>;
-
-export interface DrachtioConnectionOptions {
-    endpointProbe?: DrachtioEndpointProbe;
-    retryDelay?: DrachtioRetryDelay;
-    initialRetryDelayMs?: number;
-    maxRetryDelayMs?: number;
-    endpointTimeoutMs?: number;
-}
-
-interface ResolvedDrachtioConnectionOptions {
-    endpointProbe: DrachtioEndpointProbe;
-    retryDelay: DrachtioRetryDelay;
-    initialRetryDelayMs: number;
-    maxRetryDelayMs: number;
-    endpointTimeoutMs: number;
-}
-
-interface DrachtioReconnectOptions {
-    retryMaxDelay: number;
-}
-
 interface PendingOutboundSipCall {
     controlConnectionId?: string;
     cancelRequested: boolean;
-    request?: Srf.SrfRequest;
+    cancelError?: NativeOperationError;
+    attempt?: OutboundAttempt;
     completed: Promise<void>;
     finish: () => void;
 }
 
-type DrachtioSrfConfig = Srf.SrfConfig & { reconnect: DrachtioReconnectOptions };
-
-const DefaultInitialRetryDelayMs = 250;
-const DefaultMaxRetryDelayMs = 5_000;
-const DefaultEndpointTimeoutMs = 1_000;
-
-export class DrachtioGateway {
-    private logger = BaseLogger.child({ ns: 'DrachtioGateway' });
-    private srf: Srf;
-    private connected = false;
-    private connectionOptions: ResolvedDrachtioConnectionOptions;
+export class SipGateway {
+    private logger = BaseLogger.child({ ns: 'SipGateway' });
+    private signaling: SipbridgeSignaling;
     private pendingOutboundCalls = new Map<string, PendingOutboundSipCall>();
-    private pendingInboundCalls = new Map<string, Srf.SrfResponse>();
-
+    private pendingInboundCalls = new Map<string, SipResponse>();
     constructor(
         private config: GatewayConfig,
         private registry: CallRegistry,
         private httpClient: GatewayHttpClient,
-        srf?: Srf,
+        signaling?: SipbridgeSignaling,
         private controlHub?: ControlHub,
-        connectionOptions: DrachtioConnectionOptions = {},
-        private lifecycle?: GatewayLifecycle
+        private lifecycle?: GatewayLifecycle,
+        mediaReady: () => boolean = () => true
     ) {
-        this.srf = srf ?? (config.DRACHTIO_APP_TAG ? new Srf(config.DRACHTIO_APP_TAG) : new Srf());
-        this.connectionOptions = {
-            endpointProbe: connectionOptions.endpointProbe ?? probeTcpEndpoint,
-            retryDelay: connectionOptions.retryDelay ?? delay,
-            initialRetryDelayMs: connectionOptions.initialRetryDelayMs ?? DefaultInitialRetryDelayMs,
-            maxRetryDelayMs: connectionOptions.maxRetryDelayMs ?? DefaultMaxRetryDelayMs,
-            endpointTimeoutMs: connectionOptions.endpointTimeoutMs ?? DefaultEndpointTimeoutMs
-        };
+        this.signaling = signaling ?? new SipbridgeSignaling(config);
+        this.signaling.applicationReady = () =>
+            (!config.ROUTES_REQUIRED || config.ROUTES.length + (controlHub?.routeCount ?? 0) > 0) && (!config.RTPBRIDGE_REQUIRED || mediaReady());
+        this.signaling.isDraining = () => lifecycle?.isDraining ?? false;
     }
-
     get isConnected() {
-        return this.connected;
+        return this.signaling.isConnected;
     }
-
     async start() {
-        this.srf.on('connect', (_err, hostPort) => {
-            this.connected = true;
-            this.logger.info({ hostPort }, 'Connected to drachtio-server');
-        });
-        this.srf.on('disconnect', () => {
-            this.connected = false;
-            this.logger.warn('Disconnected from drachtio-server');
-        });
-        this.srf.on('error', err => {
-            this.logger.error({ err }, 'Drachtio error');
-        });
-        this.srf.invite((req, res) => {
-            this.handleInvite(req, res).catch(err => {
-                this.logger.error({ err }, 'Unhandled INVITE error');
-                if (!res.finalResponseSent) res.send(500, 'Internal Server Error', {});
-            });
-        });
-
-        await this.waitForDrachtioEndpoint();
-        const connectConfig: DrachtioSrfConfig = {
-            host: this.config.DRACHTIO_HOST,
-            port: this.config.DRACHTIO_PORT,
-            secret: this.config.DRACHTIO_SECRET,
-            reconnect: { retryMaxDelay: this.connectionOptions.maxRetryDelayMs }
-        };
-        await this.srf.connect(connectConfig);
-    }
-
-    private async waitForDrachtioEndpoint() {
-        let attempt = 1;
-        let retryDelayMs = this.connectionOptions.initialRetryDelayMs;
-        const endpoint: DrachtioEndpoint = {
-            host: this.config.DRACHTIO_HOST,
-            port: this.config.DRACHTIO_PORT,
-            timeoutMs: this.connectionOptions.endpointTimeoutMs
-        };
-
-        while (true) {
-            this.lifecycle?.assertRunning();
+        this.signaling.onInvite = async (req, res) => {
             try {
-                await this.connectionOptions.endpointProbe(endpoint);
-                if (attempt > 1) {
-                    this.logger.info({ attempt, host: endpoint.host, port: endpoint.port }, 'Drachtio endpoint is available');
-                }
-                return;
-            } catch (err) {
-                this.logger.warn({ err, attempt, retryDelayMs, host: endpoint.host, port: endpoint.port }, 'Drachtio endpoint unavailable; retrying');
-                await this.connectionOptions.retryDelay(retryDelayMs);
-                retryDelayMs = Math.min(retryDelayMs * 2, this.connectionOptions.maxRetryDelayMs);
-                attempt++;
+                await this.handleInvite(req, res);
+            } catch {
+                if (!res.finalResponseSent) await res.respond(500).catch(() => undefined);
             }
-        }
+        };
+        await this.signaling.start();
     }
-
-    async handleInvite(req: Srf.SrfRequest, res: Srf.SrfResponse) {
+    async handleInvite(req: IncomingSipRequest, res: SipResponse) {
         if (this.lifecycle?.isDraining) {
-            res.send(503, 'Service Unavailable', { headers: { 'Retry-After': '1' } });
+            await res.respond(503, { headers: { 'Retry-After': '1' } });
             return;
         }
         if (this.lifecycle) return this.lifecycle.track(() => this.handleAdmittedInvite(req, res));
         return this.handleAdmittedInvite(req, res);
     }
 
-    private async handleAdmittedInvite(req: Srf.SrfRequest, res: Srf.SrfResponse) {
+    private async handleAdmittedInvite(req: IncomingSipRequest, res: SipResponse) {
         const destinationUri = stripSipUri(req.uri);
         if (!acceptsSipHost(destinationUri, this.config.SIP_ALLOWED_DOMAINS)) {
-            res.send(404, 'No Route', {});
+            await res.respond(404);
             return;
         }
         const destinationUser = getSipUser(destinationUri);
@@ -197,7 +115,7 @@ export class DrachtioGateway {
 
         if (!controlRoute && !httpRoute) {
             this.logger.info({ destinationUri, destinationUser }, 'No route for INVITE');
-            res.send(404, 'No Route', {});
+            await res.respond(404);
             return;
         }
 
@@ -207,7 +125,7 @@ export class DrachtioGateway {
         const routeUrl = controlRoute?.route.url ?? httpRoute!.url;
 
         let acceptedReceiverUrl: string | undefined;
-        let answeredDialog: Srf.Dialog | undefined;
+        let answeredDialog: NativeDialog | undefined;
         this.pendingInboundCalls.set(callId, res);
         try {
             const action = controlRoute
@@ -217,17 +135,14 @@ export class DrachtioGateway {
 
             if (action.action === 'reject') {
                 this.logger.info({ callId, status: action.status }, 'Backend rejected INVITE');
-                res.send(action.status, action.reason ?? 'Rejected', { headers: action.headers });
+                await res.respond(action.status, { headers: action.headers });
                 this.registry.releaseReservation(callId);
                 return;
             }
 
             acceptedReceiverUrl = controlRoute ? controlRoute.route.url : (action.receiverUrl ?? httpRoute!.url);
 
-            const dialog = await this.srf.createUAS(req, res, {
-                localSdp: action.sdp,
-                headers: action.headers
-            });
+            const dialog = await res.answer(action.sdp, action.headers);
             answeredDialog = dialog;
             this.lifecycle?.assertRunning();
             const now = new Date().toISOString();
@@ -241,7 +156,7 @@ export class DrachtioGateway {
                 destinationUser,
                 sourceUri: inviteRequest.sourceUri,
                 localSdp: action.sdp,
-                remoteSdp: req.body || req.sdp,
+                remoteSdp: req.body,
                 createdAt: now,
                 updatedAt: now,
                 dialog
@@ -263,7 +178,7 @@ export class DrachtioGateway {
             this.registry.remove(callId);
             this.registry.releaseReservation(callId);
             if (answeredDialog) await this.destroyFailedInviteDialog(answeredDialog, callId);
-            this.logger.warn({ err, callId, routeUrl }, 'Failed to route INVITE');
+            this.logger.warn({ failure: 'signaling-or-owner-operation-failed', callId, routeUrl }, 'Failed to route INVITE');
             if (acceptedReceiverUrl) {
                 void this.sendFailedInviteEvent(controlRoute?.connectionId, acceptedReceiverUrl, {
                     event: 'terminated',
@@ -275,20 +190,18 @@ export class DrachtioGateway {
             }
             if (!res.finalResponseSent) {
                 const status = sipStatusForError(err);
-                res.send(status, status === 503 ? 'Service Unavailable' : status === 504 ? 'Gateway Timeout' : 'Bad Gateway', {});
+                await res.respond(status);
             }
         } finally {
             this.pendingInboundCalls.delete(callId);
         }
     }
 
-    private async destroyFailedInviteDialog(dialog: Srf.Dialog, callId: string) {
+    private async destroyFailedInviteDialog(dialog: NativeDialog, callId: string) {
         try {
-            await new Promise<void>((resolve, reject) => {
-                dialog.destroy({ headers: {} }, err => (err ? reject(err) : resolve()));
-            });
+            await dialog.bye();
         } catch (err) {
-            this.logger.warn({ err, callId }, 'Failed to destroy SIP dialog after INVITE setup failure');
+            this.logger.warn({ failure: 'signaling-or-owner-operation-failed', callId }, 'Failed to destroy SIP dialog after INVITE setup failure');
         }
     }
 
@@ -297,10 +210,11 @@ export class DrachtioGateway {
         if (!call) throw new CallNotFoundError(`Call ${callId} not found`);
 
         try {
-            const remoteSdp = await call.dialog.modify(sdp, { headers } as any);
+            const remoteSdp = await call.dialog.reinvite(sdp, headers);
             this.registry.updateSdp(callId, { localSdp: sdp, remoteSdp });
             return { sdp: remoteSdp };
         } catch (err) {
+            if (err instanceof NativeOperationError && (err.uncertain || err.unavailable)) throw err;
             throw new InvalidCallStateError(errorMessage(err));
         }
     }
@@ -321,37 +235,16 @@ export class DrachtioGateway {
         const logContext = outboundSipLogContext(params);
         this.logger.info(logContext, 'Creating outbound SIP dialog');
         try {
-            const dialog = await this.srf.createUAC(
-                params.requestUri,
-                {
-                    localSdp: params.sdp,
-                    headers: params.headers,
-                    callingNumber: params.callingNumber,
-                    callingName: params.callingName,
-                    proxy: params.proxy,
-                    auth: params.auth
-                } as Srf.CreateUACOptions & { callingNumber?: string; callingName?: string },
-                {
-                    cbRequest: ((errOrRequest: Error | Srf.SrfRequest | null, request?: Srf.SrfRequest) => {
-                        if (errOrRequest instanceof Error) return;
-                        const sentRequest = request ?? errOrRequest;
-                        if (!sentRequest) return;
-                        pending.request = sentRequest;
-                        if (pending.cancelRequested) {
-                            void cancelSipRequest(sentRequest).catch(err => {
-                                this.logger.warn({ err, ...logContext }, 'Failed to send deferred outbound SIP CANCEL');
-                            });
-                        }
-                    }) as unknown as (request: Srf.SrfRequest) => void
-                }
-            );
+            pending.attempt = this.signaling.openDialog(params);
+            if (pending.cancelRequested) await pending.attempt.cancel();
+            const dialog = await pending.attempt.completed;
 
-            if (pending.cancelRequested || this.lifecycle?.isStopping) {
+            if (pending.cancelRequested || dialog.isEnded || this.lifecycle?.isStopping) {
                 await destroyDialog(dialog);
                 throw new InvalidCallStateError('Outbound SIP call was cancelled');
             }
 
-            const sipCallId = dialog.sip.callId;
+            const sipCallId = dialog.sipCallId;
             const callId = this.registry.reserveCallId(sipCallId);
             const now = new Date().toISOString();
             const destinationUri = stripSipUri(params.requestUri);
@@ -364,8 +257,8 @@ export class DrachtioGateway {
                 destinationUri,
                 destinationUser: getSipUser(destinationUri),
                 sourceUri: getSourceUri(params.headers),
-                localSdp: dialog.local.sdp || params.sdp,
-                remoteSdp: dialog.remote.sdp,
+                localSdp: dialog.localSdp || params.sdp,
+                remoteSdp: dialog.remoteSdp,
                 createdAt: now,
                 updatedAt: now,
                 dialog
@@ -373,10 +266,11 @@ export class DrachtioGateway {
 
             this.bindDialog(call);
             this.logger.info({ call: sipCallLogContext(call) }, 'Outbound SIP dialog answered');
-            return { sessionId: callId, sipCallId, sdp: dialog.remote.sdp };
+            return { sessionId: callId, sipCallId, sdp: dialog.remoteSdp };
         } catch (err) {
             if (pending.cancelRequested) this.logger.info(logContext, 'Outbound SIP dialog cancelled');
-            else this.logger.warn({ err, ...logContext }, 'Outbound SIP dialog failed');
+            else this.logger.warn({ failure: 'signaling-or-owner-operation-failed', ...logContext }, 'Outbound SIP dialog failed');
+            if (err instanceof NativeOperationError && (err.uncertain || err.unavailable)) throw err;
             throw new InvalidCallStateError(errorMessage(err));
         } finally {
             pending.finish();
@@ -392,12 +286,24 @@ export class DrachtioGateway {
         if (pending.controlConnectionId !== controlConnectionId) {
             throw new InvalidCallStateError('Outbound SIP attempt belongs to another control connection');
         }
-        if (pending.cancelRequested) return { ok: true as const };
+        if (pending.cancelRequested) {
+            if (pending.cancelError) throw pending.cancelError;
+            return { ok: true as const };
+        }
 
         pending.cancelRequested = true;
-        if (pending.request) {
-            await cancelSipRequest(pending.request).catch(err => {
-                this.logger.warn({ err, outboundAttemptId, controlConnectionId }, 'Failed to send outbound SIP CANCEL');
+        if (pending.attempt) {
+            await pending.attempt.cancel().catch(err => {
+                this.logger.warn(
+                    {
+                        failure: 'signaling-or-owner-operation-failed',
+                        outboundAttemptId,
+                        controlConnectionId
+                    },
+                    'Failed to send outbound SIP CANCEL'
+                );
+                pending.cancelError = err instanceof NativeOperationError ? err : new NativeOperationError('Native CANCEL outcome unknown', true);
+                throw pending.cancelError;
             });
         }
         this.logger.info({ outboundAttemptId, controlConnectionId }, 'Cancelled pending outbound SIP dialog');
@@ -406,7 +312,7 @@ export class DrachtioGateway {
 
     async shutdown() {
         for (const [callId, res] of this.pendingInboundCalls) {
-            if (!res.finalResponseSent) res.send(503, 'Service Unavailable', { headers: { 'Retry-After': '1' } });
+            if (!res.finalResponseSent) await res.respond(503, { headers: { 'Retry-After': '1' } }).catch(() => undefined);
             this.registry.releaseReservation(callId);
         }
         await Promise.allSettled([
@@ -416,8 +322,7 @@ export class DrachtioGateway {
             }),
             ...this.registry.list().map(call => this.bye(call.callId, 'gateway-shutdown'))
         ]);
-        this.srf.disconnect();
-        this.connected = false;
+        await this.signaling.stop();
     }
 
     async bye(callId: string, reason?: string, headers?: SipHeaders) {
@@ -426,9 +331,8 @@ export class DrachtioGateway {
 
         const byeHeaders = { ...(headers ?? {}) };
 
-        await new Promise<void>((resolve, reject) => {
-            call.dialog.destroy({ headers: byeHeaders }, err => (err ? reject(err) : resolve()));
-        }).catch(err => {
+        await call.dialog.bye(byeHeaders).catch(err => {
+            if (err instanceof NativeOperationError && (err.uncertain || err.unavailable)) throw err;
             throw new InvalidCallStateError(errorMessage(err));
         });
 
@@ -458,9 +362,7 @@ export class DrachtioGateway {
             ...pendingCancellations,
             ...calls.map(async call => {
                 try {
-                    await new Promise<void>((resolve, reject) => {
-                        call.dialog.destroy({ headers: {} }, err => (err ? reject(err) : resolve()));
-                    });
+                    await call.dialog.bye();
                     void this.sendFollowUpEvent(call, {
                         event: 'terminated',
                         callId: call.callId,
@@ -470,72 +372,76 @@ export class DrachtioGateway {
                         receivedAt: new Date().toISOString()
                     });
                 } catch (err) {
-                    this.logger.warn({ err, callId: call.callId, connectionId }, 'Failed to terminate control-owned SIP call');
+                    this.logger.warn(
+                        { failure: 'signaling-or-owner-operation-failed', callId: call.callId, connectionId },
+                        'Failed to terminate control-owned SIP call'
+                    );
                 }
             })
         ]);
     }
 
     private bindDialog(call: ActiveCall) {
-        call.dialog.on('modify', (req, res) => {
+        call.dialog.on('request', (req, res) => {
             this.handleRemoteModify(call.callId, req, res).catch(err => {
-                this.logger.error({ err, callId: call.callId }, 'Unhandled remote re-INVITE error');
-                if (!res.finalResponseSent) res.send(500, 'Internal Server Error', {});
+                this.logger.error({ failure: 'signaling-or-owner-operation-failed', callId: call.callId }, 'Unhandled remote re-INVITE error');
+                if (!res.finalResponseSent) void res.respond(500).catch(() => undefined);
             });
         });
 
-        call.dialog.on('destroy', msg => {
+        call.dialog.on('ended', reason => {
             const removed = this.registry.remove(call.callId);
             if (!removed) return;
 
-            const event = msg?.method === 'BYE' ? 'bye' : 'terminated';
+            const event = reason === 'bye' ? 'bye' : 'terminated';
             void this.sendFollowUpEvent(removed, {
                 event,
                 callId: removed.callId,
                 sipCallId: removed.sipCallId,
-                headers: msg ? readHeaders(msg) : undefined,
+
                 receivedAt: new Date().toISOString()
             });
         });
+        call.dialog.activate();
     }
 
-    private async handleRemoteModify(callId: string, req: Srf.SrfRequest, res: Srf.SrfResponse) {
+    private async handleRemoteModify(callId: string, req: IncomingSipRequest, res: SipResponse) {
         const call = this.registry.get(callId);
         if (!call) {
-            res.send(481, 'Call Does Not Exist', {});
+            await res.respond(481);
             return;
         }
 
         try {
-            const action = await this.sendFollowUpEvent(call, {
-                event: 'reinvite',
-                callId,
-                sipCallId: call.sipCallId,
-                headers: readHeaders(req),
-                sdp: req.body || req.sdp,
-                receivedAt: new Date().toISOString()
-            }, true);
+            const action = await this.sendFollowUpEvent(
+                call,
+                {
+                    event: 'reinvite',
+                    callId,
+                    sipCallId: call.sipCallId,
+                    headers: readHeaders(req),
+                    sdp: req.body,
+                    receivedAt: new Date().toISOString()
+                },
+                true
+            );
 
             if (action.action === 'reject') {
-                res.send(action.status, action.reason ?? 'Rejected', { headers: action.headers });
+                await res.respond(action.status, { headers: action.headers });
                 return;
             }
 
-            res.send(action.status ?? 200, { body: action.sdp, headers: action.headers });
-            this.registry.updateSdp(callId, { localSdp: action.sdp, remoteSdp: req.body || req.sdp });
+            await res.respond(action.status ?? 200, { body: action.sdp, headers: action.headers });
+            this.registry.updateSdp(callId, { localSdp: action.sdp, remoteSdp: req.body });
         } catch (err) {
-            this.logger.warn({ err, callId }, 'Receiver failed to handle remote re-INVITE');
-            res.send(sipStatusForError(err), 'Bad Gateway', {});
+            this.logger.warn({ failure: 'signaling-or-owner-operation-failed', callId }, 'Receiver failed to handle remote re-INVITE');
+            await res.respond(sipStatusForError(err));
         }
     }
 
     private sendFollowUpEvent(call: ActiveCall, event: FollowUpHttpEvent, expectAction: true): Promise<SipAction>;
     private sendFollowUpEvent(call: ActiveCall, event: FollowUpHttpEvent, expectAction?: false): Promise<void>;
-    private async sendFollowUpEvent(
-        call: ActiveCall,
-        event: FollowUpHttpEvent,
-        expectAction?: boolean
-    ): Promise<SipAction | void> {
+    private async sendFollowUpEvent(call: ActiveCall, event: FollowUpHttpEvent, expectAction?: boolean): Promise<SipAction | void> {
         if (this.lifecycle && !this.lifecycle.isStopping) {
             return this.lifecycle.track(() => this.deliverFollowUpEvent(call, event, expectAction));
         }
@@ -577,35 +483,32 @@ export class DrachtioGateway {
             if (expectAction) {
                 throw new HttpPostError('Control request failed', { cause: err, code: 'ECONNABORTED' });
             }
-            this.logger.warn({ err, callId: call.callId, event: event.event }, 'Dropping control-owned follow-up event');
+            this.logger.warn(
+                { failure: 'signaling-or-owner-operation-failed', callId: call.callId, event: event.event },
+                'Dropping control-owned follow-up event'
+            );
             return;
         }
 
         if (expectAction) {
-            const response = await this.httpClient.postJson<unknown>(
-                call.receiverUrl,
-                event,
-                this.config.EVENT_HTTP_TIMEOUT_MS
-            );
+            const response = await this.httpClient.postJson<unknown>(call.receiverUrl, event, this.config.EVENT_HTTP_TIMEOUT_MS);
             return parseSipActionResponse(response, { allowReceiverUrl: false });
         }
 
         try {
             await this.httpClient.postJson<unknown>(call.receiverUrl, event, this.config.EVENT_HTTP_TIMEOUT_MS);
         } catch (err) {
-            this.logger.warn({ err, callId: call.callId, event: event.event }, 'Failed to deliver follow-up event');
+            this.logger.warn(
+                { failure: 'signaling-or-owner-operation-failed', callId: call.callId, event: event.event },
+                'Failed to deliver follow-up event'
+            );
         }
     }
 
     private async requestInviteActionFromControl(connectionId: string, inviteRequest: InviteHttpRequest) {
         this.logger.info({ callId: inviteRequest.callId, connectionId }, 'Routing INVITE to control connection');
         try {
-            const response = await this.controlHub!.request(
-                connectionId,
-                'sip.invite',
-                inviteRequest,
-                this.config.INVITE_HTTP_TIMEOUT_MS
-            );
+            const response = await this.controlHub!.request(connectionId, 'sip.invite', inviteRequest, this.config.INVITE_HTTP_TIMEOUT_MS);
             return parseSipActionResponse(response, { allowReceiverUrl: false });
         } catch (err) {
             if (err instanceof ControlConnectionUnavailableError) {
@@ -617,11 +520,7 @@ export class DrachtioGateway {
 
     private async requestInviteActionFromHttp(routeUrl: string, inviteRequest: InviteHttpRequest) {
         this.logger.info({ callId: inviteRequest.callId, destinationUri: inviteRequest.destinationUri, routeUrl }, 'Routing INVITE to HTTP');
-        const response = await this.httpClient.postJson<unknown>(
-            routeUrl,
-            inviteRequest,
-            this.config.INVITE_HTTP_TIMEOUT_MS
-        );
+        const response = await this.httpClient.postJson<unknown>(routeUrl, inviteRequest, this.config.INVITE_HTTP_TIMEOUT_MS);
         return parseSipActionResponse(response, { allowReceiverUrl: true });
     }
 
@@ -646,7 +545,10 @@ export class DrachtioGateway {
         try {
             await this.httpClient.postJson(receiverUrl, event, this.config.EVENT_HTTP_TIMEOUT_MS);
         } catch (err) {
-            this.logger.warn({ err, callId: event.callId }, 'Failed to deliver failed INVITE termination event');
+            this.logger.warn(
+                { failure: 'signaling-or-owner-operation-failed', callId: event.callId },
+                'Failed to deliver failed INVITE termination event'
+            );
         }
     }
 
@@ -655,22 +557,19 @@ export class DrachtioGateway {
             throw new InvalidCallStateError(`Outbound SIP attempt ${outboundAttemptId} already exists`);
         }
         const completion = Promise.withResolvers<void>();
-        const pending: PendingOutboundSipCall = { controlConnectionId, cancelRequested: false, completed: completion.promise, finish: completion.resolve };
+        const pending: PendingOutboundSipCall = {
+            controlConnectionId,
+            cancelRequested: false,
+            completed: completion.promise,
+            finish: completion.resolve
+        };
         this.pendingOutboundCalls.set(outboundAttemptId, pending);
         return pending;
     }
 }
 
-async function cancelSipRequest(request: Srf.SrfRequest) {
-    await new Promise<void>((resolve, reject) => {
-        request.cancel(err => (err ? reject(err) : resolve()));
-    });
-}
-
-async function destroyDialog(dialog: Srf.Dialog) {
-    await new Promise<void>((resolve, reject) => {
-        dialog.destroy({ headers: {} }, err => (err ? reject(err) : resolve()));
-    });
+async function destroyDialog(dialog: NativeDialog) {
+    await dialog.bye();
 }
 
 function outboundSipLogContext(params: OutboundSipCallParams) {
@@ -702,14 +601,14 @@ function sipCallLogContext(call: ActiveCall) {
 }
 
 function buildInviteRequest(
-    req: Srf.SrfRequest,
+    req: IncomingSipRequest,
     callId: string,
     sipCallId: string,
     destinationUri: string,
     destinationUser?: string
 ): InviteHttpRequest {
-    const from = readHeader(req, 'from') || req.from;
-    const to = readHeader(req, 'to') || req.to;
+    const from = readHeader(req, 'from');
+    const to = readHeader(req, 'to');
     const contact = readHeader(req, 'contact');
 
     return {
@@ -723,12 +622,12 @@ function buildInviteRequest(
         to,
         contact,
         headers: readHeaders(req),
-        sdp: req.body || req.sdp,
+        sdp: req.body,
         receivedAt: new Date().toISOString()
     };
 }
 
-function readHeaders(req: Srf.SrfRequest) {
+function readHeaders(req: IncomingSipRequest) {
     const headers: SipHeaders = {};
     for (const [key, value] of Object.entries(req.headers ?? {})) {
         if (typeof value === 'string') headers[key] = value;
@@ -736,7 +635,7 @@ function readHeaders(req: Srf.SrfRequest) {
     return headers;
 }
 
-function readHeader(req: Pick<Srf.SrfRequest, 'get' | 'headers'>, name: string) {
+function readHeader(req: Pick<IncomingSipRequest, 'get' | 'headers'>, name: string) {
     try {
         return req.get(name) || req.headers?.[name.toLowerCase()];
     } catch {
@@ -761,30 +660,6 @@ function isControlUrl(url: string) {
 
 function controlUrl(connectionId: string) {
     return `control://${connectionId}`;
-}
-
-async function probeTcpEndpoint(endpoint: DrachtioEndpoint) {
-    await new Promise<void>((resolve, reject) => {
-        const socket = createConnection({ host: endpoint.host, port: endpoint.port });
-        let settled = false;
-
-        const finish = (err?: Error) => {
-            if (settled) return;
-            settled = true;
-            socket.destroy();
-            if (err) reject(err);
-            else resolve();
-        };
-
-        socket.setTimeout(endpoint.timeoutMs);
-        socket.once('connect', () => finish());
-        socket.once('error', err => finish(err));
-        socket.once('timeout', () => finish(new Error(`Timed out connecting to ${endpoint.host}:${endpoint.port}`)));
-    });
-}
-
-async function delay(delayMs: number) {
-    await new Promise<void>(resolve => setTimeout(resolve, delayMs));
 }
 
 function getSourceUri(headers?: SipHeaders) {

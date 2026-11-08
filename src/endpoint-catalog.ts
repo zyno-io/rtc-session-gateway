@@ -11,6 +11,12 @@ export interface MediaBackend {
     recordingServerName?: string;
     turnUrls?: string[];
 }
+export interface SignalingBackend {
+    id: string;
+    url: string;
+    serverName: string;
+    acceptNew: boolean;
+}
 export interface EndpointCatalogStatus {
     valid: boolean;
     eligibleBackends: number;
@@ -18,14 +24,19 @@ export interface EndpointCatalogStatus {
     validUntil?: string;
     error?: string;
 }
-export interface EndpointCatalog {
-    schemaVersion: 1;
+export interface CatalogSection<T> {
     revision: string;
-    validUntil?: string;
-    backends: MediaBackend[];
+    validUntil: string;
+    backends: T[];
 }
-function object(value: unknown, label: string): Record<string, unknown> {
+export interface EndpointCatalog {
+    schemaVersion: 2;
+    signaling: CatalogSection<SignalingBackend>;
+    media: CatalogSection<MediaBackend>;
+}
+function object(value: unknown, label: string, fields?: string[]): Record<string, unknown> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(label + ' must be an object');
+    if (fields && Object.keys(value).some(key => !fields.includes(key))) throw new Error(label + ' has unknown fields');
     return value as Record<string, unknown>;
 }
 function boundedString(value: unknown, label: string, max = 253): string {
@@ -36,12 +47,14 @@ function boundedString(value: unknown, label: string, max = 253): string {
 function validHost(value: string): boolean {
     return !!isIP(value) || (value.length <= 253 && value.split('.').every(label => /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label)));
 }
-function endpoint(value: unknown, label: string, scheme: 'ws' | 'http', allowPlaintext: boolean) {
-    const entry = object(value, label);
+function endpoint(value: unknown, label: string, scheme: 'ws' | 'http', allowPlaintext: boolean, path = '/') {
+    const entry = object(value, label, ['url', 'tlsServerName']);
     const url = new URL(boundedString(entry.url, label + '.url', 2048));
     if (url.protocol !== scheme + 's:' && !(allowPlaintext && url.protocol === scheme + ':')) throw new Error(label + ' requires a secure URL');
-    if (url.pathname !== '/' || url.search || url.hash || url.username || url.password)
-        throw new Error(label + ' requires a root URL without credentials');
+    if (url.pathname !== path || url.search || url.hash || url.username || url.password)
+        throw new Error(label + ' requires the canonical path without credentials');
+    const host = url.hostname.replace(/^\[|\]$/g, '');
+    if (!validHost(host)) throw new Error('Invalid endpoint host');
     const serverName = entry.tlsServerName === undefined ? undefined : boundedString(entry.tlsServerName, label + '.tlsServerName');
     if (serverName && !validHost(serverName)) throw new Error(label + ' has an invalid TLS name');
     return { url: url.toString(), serverName };
@@ -52,45 +65,64 @@ export function parseIceUrls(value: unknown): string[] {
         const url = boundedString(candidate, 'TURN URL', 1024);
         const match = /^(stun|turn|turns):(\[[a-fA-F0-9:]+\]|[a-zA-Z0-9.-]+)(?::(\d+))?(?:\?transport=(udp|tcp))?$/.exec(url);
         if (!match || (match[3] && (Number(match[3]) < 1 || Number(match[3]) > 65535))) throw new Error('Invalid ICE server URL');
-        const host = match[2].startsWith('[') ? match[2].slice(1, -1) : match[2];
-        if (!validHost(host)) throw new Error('Invalid ICE hostname or address');
+        if (!validHost(match[2].replace(/^\[|\]$/g, ''))) throw new Error('Invalid ICE hostname or address');
         return url;
     });
 }
 export function parseEndpointCatalog(value: unknown, allowPlaintext = false): EndpointCatalog {
-    const source = object(value, 'catalog');
-    if (source.schemaVersion !== 1) throw new Error('Unsupported endpoint catalog schema version');
-    const revision = boundedString(source.revision, 'revision', 127);
-    const validUntil = source.validUntil === undefined ? undefined : boundedString(source.validUntil, 'validUntil');
-    if (validUntil && !Number.isFinite(Date.parse(validUntil))) throw new Error('Invalid catalog expiry');
-    if (!Array.isArray(source.backends) || source.backends.length > 128) throw new Error('Catalog must contain at most 128 backends');
-    const ids = new Set<string>();
-    const backends = source.backends.map((value, index): MediaBackend => {
-        const entry = object(value, 'backend ' + index);
-        const id = boundedString(entry.id, 'backend ID', 127);
-        if (!/^[a-zA-Z0-9._:-]+$/.test(id) || ids.has(id)) throw new Error('Invalid or duplicate backend ID');
-        ids.add(id);
-        if (typeof entry.acceptNew !== 'boolean') throw new Error('Backend acceptNew must be boolean');
-        const control = endpoint(entry.control, 'control', 'ws', allowPlaintext);
-        const recordings =
-            entry.recordings === undefined
-                ? { url: control.url.replace(/^ws/, 'http'), serverName: control.serverName }
-                : endpoint(entry.recordings, 'recordings', 'http', allowPlaintext);
-        const turn = entry.turn === undefined ? undefined : object(entry.turn, 'turn');
-        return {
-            id,
-            url: control.url,
-            httpUrl: recordings.url,
-            acceptNew: entry.acceptNew,
-            serverName: control.serverName,
-            recordingServerName: recordings.serverName,
-            turnUrls: turn ? parseIceUrls(turn.urls) : undefined
-        };
-    });
-    return { schemaVersion: 1, revision, validUntil, backends };
+    const source = object(value, 'catalog', ['schemaVersion', 'signaling', 'media']);
+    if (source.schemaVersion !== 2) throw new Error('Unsupported endpoint catalog schema version');
+    function section<T>(value: unknown, limit: number, project: (entry: Record<string, unknown>, id: string) => T): CatalogSection<T> {
+        const source = object(value, 'section', ['revision', 'validUntil', 'backends']);
+        const revision = boundedString(source.revision, 'revision', 64);
+        if (!/^[a-f0-9]{64}$/.test(revision)) throw new Error('Invalid section revision');
+        const validUntil = boundedString(source.validUntil, 'validUntil');
+        if (!/^\d{4}-\d\d-\d\dT/.test(validUntil) || !Number.isFinite(Date.parse(validUntil))) throw new Error('Invalid section expiry');
+        if (!Array.isArray(source.backends) || source.backends.length > limit) throw new Error('Invalid backend count');
+        const ids = new Set<string>();
+        const backends = source.backends.map(value => {
+            const entry = object(value, 'backend', ['id', 'acceptNew', 'control', ...(limit === 1 ? [] : ['recordings', 'turn'])]);
+            const id = boundedString(entry.id, 'backend ID', 127);
+            if (!/^[a-zA-Z0-9._:-]+$/.test(id) || ids.has(id)) throw new Error('Invalid or duplicate backend ID');
+            ids.add(id);
+            if (typeof entry.acceptNew !== 'boolean') throw new Error('Backend acceptNew must be boolean');
+            return project(entry, id);
+        });
+        return { revision, validUntil, backends };
+    }
+    return {
+        schemaVersion: 2,
+        signaling: section(source.signaling, 1, (entry, id) => {
+            const control = endpoint(entry.control, 'signaling control', 'ws', false, '/v1/control');
+            if (!control.serverName) throw new Error('Signaling requires tlsServerName');
+            return {
+                id,
+                url: control.url,
+                serverName: control.serverName,
+                acceptNew: entry.acceptNew as boolean
+            };
+        }),
+        media: section(source.media, 128, (entry, id) => {
+            const control = endpoint(entry.control, 'media control', 'ws', allowPlaintext);
+            const recordings =
+                entry.recordings === undefined
+                    ? { url: control.url.replace(/^ws/, 'http'), serverName: control.serverName }
+                    : endpoint(entry.recordings, 'recordings', 'http', allowPlaintext);
+            const turn = entry.turn === undefined ? undefined : object(entry.turn, 'turn', ['urls']);
+            return {
+                id,
+                url: control.url,
+                httpUrl: recordings.url,
+                acceptNew: entry.acceptNew as boolean,
+                serverName: control.serverName,
+                recordingServerName: recordings.serverName,
+                turnUrls: turn ? parseIceUrls(turn.urls) : undefined
+            };
+        })
+    };
 }
-/** Rejected replacements never extend the last accepted view's original expiry. */
-export class FileEndpointCatalog {
+/** Bad replacements cannot renew either section. Expired sections are valid withdrawal documents. */
+export class FileRtcEndpointCatalog {
     private view?: EndpointCatalog;
     private error?: string;
     private signature?: string;
@@ -107,22 +139,17 @@ export class FileEndpointCatalog {
     }
     get snapshot() {
         this.refresh();
-        const valid = !!this.view && (!this.view.validUntil || Date.parse(this.view.validUntil) > this.now());
-        return {
-            valid,
-            revision: this.view?.revision,
-            validUntil: this.view?.validUntil,
-            eligibleBackends: valid ? this.view!.backends.filter(backend => backend.acceptNew).length : 0,
-            error: this.error,
-            backends: this.view?.backends ?? []
+        const section = <T>(view?: CatalogSection<T>) => {
+            const valid = !!view && Date.parse(view.validUntil) > this.now();
+            return {
+                valid,
+                revision: view?.revision,
+                validUntil: view?.validUntil,
+                error: this.error,
+                backends: view?.backends ?? []
+            };
         };
-    }
-    get status(): EndpointCatalogStatus {
-        const { backends: _backends, ...status } = this.snapshot;
-        return status;
-    }
-    get backends(): MediaBackend[] {
-        return this.snapshot.backends;
+        return { signaling: section(this.view?.signaling), media: section(this.view?.media) };
     }
     destroy() {
         clearInterval(this.timer);
@@ -138,17 +165,38 @@ export class FileEndpointCatalog {
             const raw = readFileSync(fd);
             if (raw.length > 256 * 1024) throw new Error('Endpoint catalog exceeds size bound');
             const candidate = parseEndpointCatalog(JSON.parse(raw.toString('utf8')), this.allowPlaintext);
-            if (candidate.validUntil && Date.parse(candidate.validUntil) <= this.now()) throw new Error('Endpoint catalog replacement has expired');
             this.view = candidate;
             this.signature = signature;
             this.error = undefined;
-            this.logger.info({ revision: candidate.revision, count: candidate.backends.length }, 'Accepted endpoint catalog');
-        } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            if (message !== this.error) this.logger.warn({ error: message }, 'Rejected endpoint catalog update');
-            this.error = message;
+        } catch {
+            if (!this.error) this.logger.warn('Rejected endpoint catalog update');
+            this.error = 'Endpoint catalog unavailable or invalid';
         } finally {
             if (fd !== undefined) closeSync(fd);
         }
+    }
+}
+/** Media-facing view; signaling expiry cannot accidentally withdraw healthy media. */
+export class FileEndpointCatalog {
+    private catalog: FileRtcEndpointCatalog;
+    constructor(path: string, allowPlaintext = false, now: () => number = Date.now) {
+        this.catalog = new FileRtcEndpointCatalog(path, allowPlaintext, now);
+    }
+    get snapshot() {
+        const view = this.catalog.snapshot.media;
+        return {
+            ...view,
+            eligibleBackends: view.valid ? view.backends.filter(backend => backend.acceptNew).length : 0
+        };
+    }
+    get status(): EndpointCatalogStatus {
+        const { backends: _, ...status } = this.snapshot;
+        return status;
+    }
+    get backends(): MediaBackend[] {
+        return this.snapshot.backends;
+    }
+    destroy() {
+        this.catalog.destroy();
     }
 }

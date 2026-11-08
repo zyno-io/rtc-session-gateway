@@ -3,7 +3,7 @@ name: Release Image
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
   contents: read
@@ -13,6 +13,7 @@ jobs:
   checks:
     name: Validate Release
     uses: ./.github/workflows/ci.yml
+    secrets: inherit
 
   publish:
     name: Build And Publish Image

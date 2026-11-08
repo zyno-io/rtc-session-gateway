@@ -1,4 +1,3 @@
-import axios from 'axios';
 import express from 'express';
 import http from 'node:http';
 
@@ -8,19 +7,20 @@ import { CallRegistry } from './call-registry';
 import { GatewayConfig } from './config';
 import { ControlHub } from './control-hub';
 import { ControlServer } from './control-server';
-import {
-    CallNotFoundError,
-    DrachtioGateway,
-    InvalidCallStateError,
-    type OutboundSipCallParams,
-    type OutboundSipCallResult
-} from './drachtio-gateway';
+import { CallNotFoundError, SipGateway, InvalidCallStateError, type OutboundSipCallParams, type OutboundSipCallResult } from './sip-gateway';
 import { InvalidHttpActionError, parseOptionalHeaders } from './http-contract';
 import { BaseLogger } from './logger';
+import { NativeOperationError } from './sipbridge-signaling';
 import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
 import type { GatewayMediaController } from './media-controller';
 import { MediaBackendNotFoundError, MediaBackendUnavailableError } from './media-server-manager';
-import { MediaActionConflictError, MediaEndpointNotFoundError, MediaRecordingProxyError, MediaSessionNotFoundError, MediaUnavailableError } from './media-session-service';
+import {
+    MediaActionConflictError,
+    MediaEndpointNotFoundError,
+    MediaRecordingProxyError,
+    MediaSessionNotFoundError,
+    MediaUnavailableError
+} from './media-session-service';
 import { acceptsSipHost, getSipUser, matchRoute } from './routing';
 import { CommandNotImplementedError, CommandValidationError, SessionCommandHandler } from './session-commands';
 
@@ -43,17 +43,12 @@ type CallRouteParams = {
 
 export type HttpAuthConfig = Pick<GatewayConfig, 'CONTROL_AUTH_MODE' | 'CONTROL_AUTH_TOKEN'>;
 
-export type DrachtioHttpRouteConfig = Pick<
+export type SipHttpRouteConfig = Pick<
     GatewayConfig,
-    | 'DRACHTIO_APP_TAG' | 'DRACHTIO_ROUTE_FALLBACK_URL' | 'INVITE_HTTP_TIMEOUT_MS' | 'ROUTES'
-    | 'SIP_ALLOWED_DOMAINS'
-    | 'RTPBRIDGE_REQUIRED'
-    | 'ROUTES_REQUIRED'
+    'INVITE_HTTP_TIMEOUT_MS' | 'ROUTES' | 'SIP_ALLOWED_DOMAINS' | 'RTPBRIDGE_REQUIRED' | 'ROUTES_REQUIRED'
 >;
 
-type HttpServerConfig = Pick<GatewayConfig, 'HTTP_PORT' | 'CONTROL_WS_PATH' | 'CONTROL_MAX_PAYLOAD_BYTES'> &
-    HttpAuthConfig &
-    DrachtioHttpRouteConfig;
+type HttpServerConfig = Pick<GatewayConfig, 'HTTP_PORT' | 'CONTROL_WS_PATH' | 'CONTROL_MAX_PAYLOAD_BYTES'> & HttpAuthConfig & SipHttpRouteConfig;
 
 export class HttpServer {
     private logger = BaseLogger.child({ ns: 'HttpServer' });
@@ -69,10 +64,17 @@ export class HttpServer {
         private lifecycle?: GatewayLifecycle,
         private mediaReady: () => boolean = () => true,
         private mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined
-    ) { }
+    ) {}
 
     start() {
-        const app = createHttpApp(this.registry, this.gateway, this.media, this.config, this.config, this.controlHub, this.lifecycle,
+        const app = createHttpApp(
+            this.registry,
+            this.gateway,
+            this.media,
+            this.config,
+            this.config,
+            this.controlHub,
+            this.lifecycle,
             this.mediaReady,
             this.mediaStatus
         );
@@ -113,7 +115,7 @@ export function createHttpApp(
     gateway: GatewayController,
     media?: GatewayMediaController,
     authConfig?: HttpAuthConfig,
-    drachtioRouteConfig?: DrachtioHttpRouteConfig,
+    sipRouteConfig?: SipHttpRouteConfig,
     controlHub?: ControlHub,
     lifecycle?: GatewayLifecycle,
     mediaReady: () => boolean = () => true,
@@ -122,24 +124,12 @@ export function createHttpApp(
     const logger = BaseLogger.child({ ns: 'Http' });
     const app = express();
     const commands = new SessionCommandHandler(registry, gateway, media, lifecycle);
-    const routeCount = () => (controlHub?.routeCount ?? 0) + (drachtioRouteConfig?.ROUTES.length ?? 0);
-    const admitting = () => gateway.isConnected && !lifecycle?.isDraining && (!drachtioRouteConfig?.RTPBRIDGE_REQUIRED || mediaReady()) &&
-        (!drachtioRouteConfig?.ROUTES_REQUIRED || routeCount() > 0);
-    const lookup = (destinationUri: string, destinationUser = getSipUser(destinationUri)) => {
-        const destination = { destinationUri, destinationUser };
-        const matched =
-            acceptsSipHost(destinationUri, drachtioRouteConfig?.SIP_ALLOWED_DOMAINS) &&
-            (!!controlHub?.findRoute(destination) || !!matchRoute(drachtioRouteConfig?.ROUTES ?? [], destination));
-        const acceptNew = matched && admitting() && !!drachtioRouteConfig?.DRACHTIO_APP_TAG;
-        return {
-            matched,
-            acceptNew,
-            ...(acceptNew ? { tag: drachtioRouteConfig!.DRACHTIO_APP_TAG } : {})
-        };
-    };
-
-    app.use('/routing', express.json({ limit: '16kb' }));
-
+    const routeCount = () => (controlHub?.routeCount ?? 0) + (sipRouteConfig?.ROUTES.length ?? 0);
+    const admitting = () =>
+        gateway.isConnected &&
+        !lifecycle?.isDraining &&
+        (!sipRouteConfig?.RTPBRIDGE_REQUIRED || mediaReady()) &&
+        (!sipRouteConfig?.ROUTES_REQUIRED || routeCount() > 0);
     app.use(express.json({ limit: '2mb' }));
     app.use((req, _res, next) => {
         if (req.url !== '/healthz') logger.info({ method: req.method, url: req.url }, 'Request');
@@ -147,7 +137,7 @@ export function createHttpApp(
     });
 
     app.get('/healthz', (_req, res) => {
-        res.status(gateway.isConnected ? 200 : 503).send({ ok: gateway.isConnected, calls: registry.size });
+        res.status(200).send({ ok: true, calls: registry.size });
     });
 
     app.get('/readyz', (_req, res) => {
@@ -166,81 +156,16 @@ export function createHttpApp(
         }
     });
 
-    if (drachtioRouteConfig?.DRACHTIO_APP_TAG) {
-        app.get('/drachtio/route', asyncHandler(async (req, res) => {
-            const destinationUri = queryString(req.query.uri) ?? buildSipUri(req.query);
-            const destinationUser = queryString(req.query.uriUser) ?? getSipUser(destinationUri);
-            const hasGatewayRoute = lookup(destinationUri, destinationUser).matched;
-            if (!acceptsSipHost(destinationUri, drachtioRouteConfig.SIP_ALLOWED_DOMAINS)) {
-                res.send(drachtioReject(404, 'No Route'));
-                return;
-            }
-
-            if (hasGatewayRoute) {
-                if (!admitting()) {
-                    res.send(drachtioReject(503, 'Service Unavailable'));
-                    return;
-                }
-                res.send({
-                    action: 'route',
-                    data: { tag: drachtioRouteConfig.DRACHTIO_APP_TAG }
-                });
-                return;
-            }
-
-            if (!drachtioRouteConfig.DRACHTIO_ROUTE_FALLBACK_URL) {
-                res.send(drachtioReject(404, 'No Route'));
-                return;
-            }
-
-            try {
-                const response = await axios.get(drachtioRouteConfig.DRACHTIO_ROUTE_FALLBACK_URL, {
-                    params: req.query,
-                    timeout: drachtioRouteConfig.INVITE_HTTP_TIMEOUT_MS,
-                    responseType: 'text',
-                    transformResponse: [data => data],
-                    validateStatus: () => true
-                });
-                const contentType = response.headers['content-type'];
-                if (typeof contentType === 'string') res.type(contentType);
-                res.status(response.status).send(response.data);
-            } catch (err) {
-                logger.error({ err }, 'Drachtio fallback route lookup failed');
-                res.send(drachtioReject(502, 'Route Lookup Failed'));
-            }
-        }));
-    }
-
     app.use(httpBearerAuth(authConfig));
 
     app.get('/routing/status', (_req, res) => {
         res.send({
-            acceptNew: admitting() && !!drachtioRouteConfig?.DRACHTIO_APP_TAG,
+            acceptNew: admitting(),
             draining: lifecycle?.isDraining ?? false,
-            tag: drachtioRouteConfig?.DRACHTIO_APP_TAG,
             media: mediaStatus(),
             routeCount: routeCount()
         });
     });
-    app.post('/routing/lookup', (req, res, next) => {
-        try {
-            const body: unknown = req.body;
-            if (!body || typeof body !== 'object' || Array.isArray(body)) throw new CommandValidationError('Lookup requires a JSON object');
-            const source = body as Record<string, unknown>;
-            if (
-                typeof source.destinationUri !== 'string' ||
-                !/^sips?:/i.test(source.destinationUri) ||
-                source.destinationUri.length > 2048 ||
-                (source.destinationUser !== undefined && (typeof source.destinationUser !== 'string' || source.destinationUser.length > 256))
-            ) {
-                throw new CommandValidationError('Invalid SIP lookup destination');
-            }
-            res.send(lookup(source.destinationUri, source.destinationUser as string | undefined));
-        } catch (err) {
-            next(err);
-        }
-    });
-
     app.get('/calls', (_req, res) => {
         res.send({ calls: registry.list() });
     });
@@ -274,157 +199,347 @@ export function createHttpApp(
         res.status(404).send({ error: 'Session not found' });
     });
 
-    app.post('/sessions', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('session.create', req.body ?? {}));
-    }));
+    app.post(
+        '/sessions',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('session.create', req.body ?? {}));
+        })
+    );
 
-    app.post('/calls', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('sip.createOutbound', req.body ?? {}));
-    }));
+    app.post(
+        '/calls',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('sip.createOutbound', req.body ?? {}));
+        })
+    );
 
-    app.delete('/sessions/:sessionId', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('session.delete', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.delete(
+        '/sessions/:sessionId',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('session.delete', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/webrtc/offers', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('webrtc.createOffer', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/webrtc/offers',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('webrtc.createOffer', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/webrtc/from-offer', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('webrtc.createFromOffer', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/webrtc/from-offer',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('webrtc.createFromOffer', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/endpoints/:endpointId/webrtc/answer', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('webrtc.acceptAnswer', { ...(req.body ?? {}), endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/endpoints/:endpointId/webrtc/answer',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('webrtc.acceptAnswer', {
+                    ...(req.body ?? {}),
+                    endpointId: req.params.endpointId
+                })
+            );
+        })
+    );
 
-    app.post('/endpoints/:endpointId/webrtc/offer-answer', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('webrtc.acceptOffer', { ...(req.body ?? {}), endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/endpoints/:endpointId/webrtc/offer-answer',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('webrtc.acceptOffer', {
+                    ...(req.body ?? {}),
+                    endpointId: req.params.endpointId
+                })
+            );
+        })
+    );
 
-    app.post('/endpoints/:endpointId/webrtc/ice-restart', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('webrtc.restartIce', { endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/endpoints/:endpointId/webrtc/ice-restart',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('webrtc.restartIce', { endpointId: req.params.endpointId }));
+        })
+    );
 
-    app.post('/sessions/:sessionId/rtp/offers', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('rtp.createOffer', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/rtp/offers',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('rtp.createOffer', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/rtp/from-offer', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('rtp.createFromOffer', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/rtp/from-offer',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('rtp.createFromOffer', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/endpoints/:endpointId/rtp/answer', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('rtp.acceptAnswer', { ...(req.body ?? {}), endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/endpoints/:endpointId/rtp/answer',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('rtp.acceptAnswer', {
+                    ...(req.body ?? {}),
+                    endpointId: req.params.endpointId
+                })
+            );
+        })
+    );
 
-    app.post('/endpoints/:endpointId/rtp/reinvite', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('rtp.reinvite', { ...(req.body ?? {}), endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/endpoints/:endpointId/rtp/reinvite',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('rtp.reinvite', {
+                    ...(req.body ?? {}),
+                    endpointId: req.params.endpointId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/media/play', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.play', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/media/play',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('media.play', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/media/play-and-wait', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.playAndWait', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/media/play-and-wait',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('media.playAndWait', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/media/bridge', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.bridge', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/media/bridge',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('media.bridge', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/media/bridges/:endpointId/unbridge', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.unbridge', { endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/media/bridges/:endpointId/unbridge',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('media.unbridge', { endpointId: req.params.endpointId }));
+        })
+    );
 
-    app.delete('/media/bridges/:endpointId', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.unbridge', { endpointId: req.params.endpointId }));
-    }));
+    app.delete(
+        '/media/bridges/:endpointId',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('media.unbridge', { endpointId: req.params.endpointId }));
+        })
+    );
 
-    app.post('/sessions/:sessionId/media/gather', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.gather', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/media/gather',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('media.gather', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/media/play-and-gather', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.playAndGather', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/media/play-and-gather',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('media.playAndGather', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/sessions/:sessionId/media/leave-message', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.leaveMessage', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/media/leave-message',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('media.leaveMessage', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/media/endpoints/:endpointId/dtmf', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('dtmf.inject', { ...(req.body ?? {}), endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/media/endpoints/:endpointId/dtmf',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('dtmf.inject', {
+                    ...(req.body ?? {}),
+                    endpointId: req.params.endpointId
+                })
+            );
+        })
+    );
 
-    app.post('/media/endpoints/:endpointId/direction', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('endpoint.updateDirection', { ...(req.body ?? {}), endpointId: req.params.endpointId }));
-    }));
+    app.post(
+        '/media/endpoints/:endpointId/direction',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('endpoint.updateDirection', {
+                    ...(req.body ?? {}),
+                    endpointId: req.params.endpointId
+                })
+            );
+        })
+    );
 
-    app.delete('/media/endpoints/:endpointId', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('media.stop', { endpointId: req.params.endpointId }));
-    }));
+    app.delete(
+        '/media/endpoints/:endpointId',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('media.stop', { endpointId: req.params.endpointId }));
+        })
+    );
 
-    app.post('/sessions/:sessionId/recordings', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('recording.start', { ...(req.body ?? {}), sessionId: req.params.sessionId }));
-    }));
+    app.post(
+        '/sessions/:sessionId/recordings',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('recording.start', {
+                    ...(req.body ?? {}),
+                    sessionId: req.params.sessionId
+                })
+            );
+        })
+    );
 
-    app.post('/recordings/:recordingId/stop', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('recording.stop', { recordingId: req.params.recordingId }));
-    }));
+    app.post(
+        '/recordings/:recordingId/stop',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('recording.stop', { recordingId: req.params.recordingId }));
+        })
+    );
 
-    app.get('/recordings', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('recording.list', recordingListQuery(req.query)));
-    }));
+    app.get(
+        '/recordings',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('recording.list', recordingListQuery(req.query)));
+        })
+    );
 
-    app.get('/recordings/:backendId', asyncHandler(async (req, res) => {
-        res.send(await commands.execute('recording.list', {
-            ...recordingListQuery(req.query),
-            backendId: req.params.backendId
-        }));
-    }));
+    app.get(
+        '/recordings/:backendId',
+        asyncHandler(async (req, res) => {
+            res.send(
+                await commands.execute('recording.list', {
+                    ...recordingListQuery(req.query),
+                    backendId: req.params.backendId
+                })
+            );
+        })
+    );
 
-    app.post('/recordings/merge', asyncHandler(async (req, res) => {
-        if (!media) throw new MediaUnavailableError('Media commands require RTPBRIDGE_HOST');
-        const result = await media.mergeRecordings(recordingMergeTargets(req.body?.targets));
-        res.status(result.status);
-        copyRecordingHeaders(result.headers, res);
-        pipeRecordingStream(result.stream, res);
-    }));
+    app.post(
+        '/recordings/merge',
+        asyncHandler(async (req, res) => {
+            if (!media) throw new MediaUnavailableError('Media commands require RTPBRIDGE_HOST');
+            const result = await media.mergeRecordings(recordingMergeTargets(req.body?.targets));
+            res.status(result.status);
+            copyRecordingHeaders(result.headers, res);
+            pipeRecordingStream(result.stream, res);
+        })
+    );
 
-    app.get('/recordings/:backendId/*recordingPath', asyncHandler<RecordingPathRouteParams>(async (req, res) => {
-        if (!media) throw new MediaUnavailableError('Media commands require RTPBRIDGE_HOST');
-        const result = await media.downloadRecording(req.params.backendId, req.params.recordingPath.join('/'));
-        res.status(result.status);
-        copyRecordingHeaders(result.headers, res);
-        pipeRecordingStream(result.stream, res);
-    }));
+    app.get(
+        '/recordings/:backendId/*recordingPath',
+        asyncHandler<RecordingPathRouteParams>(async (req, res) => {
+            if (!media) throw new MediaUnavailableError('Media commands require RTPBRIDGE_HOST');
+            const result = await media.downloadRecording(req.params.backendId, req.params.recordingPath.join('/'));
+            res.status(result.status);
+            copyRecordingHeaders(result.headers, res);
+            pipeRecordingStream(result.stream, res);
+        })
+    );
 
-    app.delete('/recordings/:backendId/*recordingPath', asyncHandler<RecordingPathRouteParams>(async (req, res) => {
-        res.send(await commands.execute('recording.delete', {
-            backendId: req.params.backendId,
-            path: req.params.recordingPath.join('/')
-        }));
-    }));
+    app.delete(
+        '/recordings/:backendId/*recordingPath',
+        asyncHandler<RecordingPathRouteParams>(async (req, res) => {
+            res.send(
+                await commands.execute('recording.delete', {
+                    backendId: req.params.backendId,
+                    path: req.params.recordingPath.join('/')
+                })
+            );
+        })
+    );
 
-    app.post('/calls/:callId/reinvite', asyncHandler<CallRouteParams>(async (req, res) => {
-        if (typeof req.body?.sdp !== 'string' || !req.body.sdp.trim()) {
-            res.status(400).send({ error: 'Missing sdp' });
-            return;
-        }
+    app.post(
+        '/calls/:callId/reinvite',
+        asyncHandler<CallRouteParams>(async (req, res) => {
+            if (typeof req.body?.sdp !== 'string' || !req.body.sdp.trim()) {
+                res.status(400).send({ error: 'Missing sdp' });
+                return;
+            }
 
-        const headers = parseOptionalHeaders(req.body.headers);
-        const result = await gateway.reinvite(req.params.callId, req.body.sdp, headers);
-        res.send(result);
-    }));
+            const headers = parseOptionalHeaders(req.body.headers);
+            const result = await gateway.reinvite(req.params.callId, req.body.sdp, headers);
+            res.send(result);
+        })
+    );
 
-    app.post('/calls/:callId/bye', asyncHandler<CallRouteParams>(async (req, res) => {
-        const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
-        const headers = parseOptionalHeaders(req.body?.headers);
-        await gateway.bye(req.params.callId, reason, headers);
-        res.send({ ok: true });
-    }));
+    app.post(
+        '/calls/:callId/bye',
+        asyncHandler<CallRouteParams>(async (req, res) => {
+            const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+            const headers = parseOptionalHeaders(req.body?.headers);
+            await gateway.bye(req.params.callId, reason, headers);
+            res.send({ ok: true });
+        })
+    );
 
     app.post(['/drain', '/terminate'], (_req, res) => {
         if (!lifecycle) {
@@ -450,6 +565,13 @@ export function createHttpApp(
             return;
         }
 
+        if (err instanceof NativeOperationError && (err.uncertain || err.unavailable)) {
+            res.status(503).send({
+                error: err.uncertain ? 'Native signaling outcome unknown; do not replay the operation' : 'Native signaling unavailable',
+                code: err.uncertain ? 'SIGNALING_UNKNOWN' : 'SIGNALING_UNAVAILABLE'
+            });
+            return;
+        }
         if (err instanceof CallNotFoundError) {
             res.status(404).send({ error: 'Call not found' });
             return;
@@ -509,23 +631,6 @@ function httpBearerAuth(authConfig?: HttpAuthConfig) {
         }
 
         next();
-    };
-}
-
-function queryString(value: unknown) {
-    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function buildSipUri(query: express.Request['query']) {
-    const user = queryString(query.uriUser) ?? queryString(query.toUser) ?? '';
-    const domain = queryString(query.domain);
-    return `sip:${user}${domain ? `@${domain}` : ''}`;
-}
-
-function drachtioReject(status: number, reason: string) {
-    return {
-        action: 'reject',
-        data: { status, reason }
     };
 }
 

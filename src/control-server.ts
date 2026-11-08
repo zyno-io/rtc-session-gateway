@@ -13,7 +13,7 @@ import {
     parseControlMessage,
     parseRouteRegistrations
 } from './control-protocol';
-import { CallNotFoundError, InvalidCallStateError } from './drachtio-gateway';
+import { CallNotFoundError, InvalidCallStateError } from './sip-gateway';
 import { BaseLogger } from './logger';
 import { GatewayLifecycle } from './gateway-lifecycle';
 import { controlErrorForCommand, SessionCommandHandler } from './session-commands';
@@ -142,7 +142,12 @@ export class ControlServer {
         } catch (err) {
             const error = errorForCommand(err);
             this.logger.warn(
-                { error: scrubControlError(err), ...logContext, code: error.code, durationMs: Date.now() - startedAt },
+                {
+                    error: scrubControlError(err),
+                    ...logContext,
+                    code: error.code,
+                    durationMs: Date.now() - startedAt
+                },
                 'Control request failed'
             );
             this.sendResponse(connectionId, request, false, undefined, error);

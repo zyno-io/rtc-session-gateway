@@ -20,23 +20,30 @@ const projectName = process.env.COMPOSE_PROJECT_NAME || `rtc-session-gateway-e2e
 const gatewayPort = process.env.E2E_GATEWAY_PORT || '3001';
 const gatewayBaseUrl = process.env.E2E_GATEWAY_URL || `http://127.0.0.1:${gatewayPort}`;
 const controlUrl = process.env.E2E_CONTROL_URL || `ws://127.0.0.1:${gatewayPort}/control`;
-const drachtioHost = process.env.E2E_SIP_HOST || '127.0.0.1';
-const drachtioPort = Number(process.env.E2E_SIP_PORT || 5060);
+const sipHost = process.env.E2E_SIP_HOST || '127.0.0.1';
+const sipPort = Number(process.env.E2E_SIP_PORT || 5060);
 const rtpbridgeMediaHost = process.env.E2E_RTPBRIDGE_MEDIA_HOST;
 const rtpbridgeHttpUrls = (process.env.E2E_RTPBRIDGE_URLS || `${backendScheme}://127.0.0.1:9100,${backendScheme}://127.0.0.1:9101`)
     .split(',')
     .map(url => url.trim())
     .filter(Boolean);
-const inContainerRtpbridgeHttpUrls = process.env.E2E_CONTAINER_RTPBRIDGE_URLS || `${backendScheme}://rtpbridge:9100,${backendScheme}://rtpbridge-b:9101`;
+const inContainerRtpbridgeHttpUrls =
+    process.env.E2E_CONTAINER_RTPBRIDGE_URLS || `${backendScheme}://rtpbridge:9100,${backendScheme}://rtpbridge-b:9101`;
 const PCAP_HEADER_BYTES = 24;
 
 const steps = [];
 let control;
 let fixturesDirectory;
 let cleaningUp = false;
+let catalogHeartbeat;
+let catalogAdmission = [true, true];
+let mediaRevision = randomBytes(32).toString('hex');
 const startedAt = new Date().toISOString();
 
-for (const [signal, exitCode] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+for (const [signal, exitCode] of [
+    ['SIGINT', 130],
+    ['SIGTERM', 143]
+]) {
     process.on(signal, () => {
         void closeControl().then(() => cleanup(exitCode));
     });
@@ -49,6 +56,11 @@ async function main() {
         COMPOSE_PROJECT_NAME: projectName,
         RTPBRIDGE_IMAGE: process.env.RTPBRIDGE_IMAGE || pickRtpbridgeImage()
     };
+
+    if (!env.SIPBRIDGE_IMAGE) throw new Error('SIPBRIDGE_IMAGE is required; use the qualified runtime from dependencies/sipbridge-runtime.json');
+    step(`Using native sipbridge ${env.SIPBRIDGE_IMAGE}`);
+    catalogHeartbeat = setInterval(() => writeCatalog(catalogAdmission, false), 5000);
+    catalogHeartbeat.unref();
 
     step(`Using compose project ${projectName}`);
     step(`Using rtpbridge image ${env.RTPBRIDGE_IMAGE}`);
@@ -65,6 +77,11 @@ async function main() {
 
     control = await connectControl(controlUrl);
     await control.request('route.register', { routes: [{ match: 'exact', value: 'e2e' }] });
+    await waitForHttp(`${gatewayBaseUrl}/readyz`, body => body?.ok === true, 15000);
+    await eventually(async () => {
+        const response = await fetch(`http://127.0.0.1:${process.env.E2E_SIP_ADMIN_PORT || '18800'}/sip-readyz`);
+        assertEqual(response.status, 200, 'native controller must admit calls');
+    }, 15000);
 
     await runRejectScenario(control);
     await runAnswerAndHangupScenario(control);
@@ -95,6 +112,7 @@ function prepareFixtures() {
     // These are public test identities and an ephemeral E2E-only HMAC key.
     chmodSync(fixturesDirectory, 0o755);
     process.env.E2E_FIXTURES_DIR = fixturesDirectory;
+    prepareNativeCertificates();
     let config = readFileSync('scripts/rtpbridge.e2e.toml', 'utf8');
     if (secure) {
         copyFileSync('test/fixtures/rtpbridge-cert.pem', `${fixturesDirectory}/cert.pem`);
@@ -104,6 +122,7 @@ function prepareFixtures() {
         writeFileSync(`${fixturesDirectory}/secret`, `${randomBytes(32).toString('hex')}\n`, {
             mode: 0o644
         });
+        chmodSync(`${fixturesDirectory}/secret`, 0o644);
         config = config.replace(/allow_(plaintext|unauthenticated)_control = true\n/g, '');
         config +=
             '\nauth_hmac_secret_file = "/etc/rtpbridge/secret"\n\n[tls]\ncert_path = "/etc/rtpbridge/cert.pem"\nkey_path = "/etc/rtpbridge/key.pem"\n';
@@ -113,32 +132,98 @@ function prepareFixtures() {
         process.env.RTPBRIDGE_TLS_CA_FILE = `${fixturesDirectory}/cert.pem`;
         process.env.RTPBRIDGE_TLS_SERVERNAME = 'rtpbridge.test';
     }
-    writeFileSync(`${fixturesDirectory}/rtpbridge.e2e.toml`, config);
+    writeFileSync(`${fixturesDirectory}/rtpbridge.e2e.toml`, config, { mode: 0o644 });
+    chmodSync(`${fixturesDirectory}/rtpbridge.e2e.toml`, 0o644);
     writeCatalog([true, true]);
 }
 
-function writeCatalog(admission) {
+function prepareNativeCertificates() {
+    const openssl = args => execFileSync('openssl', args, { cwd: fixturesDirectory, stdio: 'ignore' });
+    openssl([
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        'native-ca.key',
+        '-out',
+        'native-ca.crt',
+        '-days',
+        '2',
+        '-subj',
+        '/CN=RTC native E2E CA'
+    ]);
+    for (const kind of ['server', 'client']) {
+        openssl(['req', '-newkey', 'rsa:2048', '-nodes', '-keyout', `native-${kind}.key`, '-out', `native-${kind}.csr`, '-subj', '/CN=RTC E2E']);
+        writeFileSync(
+            `${fixturesDirectory}/native-${kind}.ext`,
+            kind === 'server'
+                ? 'subjectAltName=DNS:sipbridge-e2e,IP:10.89.42.30\nextendedKeyUsage=serverAuth\n'
+                : 'subjectAltName=URI:spiffe://rtc/e2e/controller\nextendedKeyUsage=clientAuth\n'
+        );
+        openssl([
+            'x509',
+            '-req',
+            '-in',
+            `native-${kind}.csr`,
+            '-CA',
+            'native-ca.crt',
+            '-CAkey',
+            'native-ca.key',
+            '-CAcreateserial',
+            '-out',
+            `native-${kind}.crt`,
+            '-days',
+            '2',
+            '-extfile',
+            `native-${kind}.ext`
+        ]);
+        chmodSync(`${fixturesDirectory}/native-${kind}.key`, 0o644);
+        chmodSync(`${fixturesDirectory}/native-${kind}.crt`, 0o644);
+    }
+    chmodSync(`${fixturesDirectory}/native-ca.crt`, 0o644);
+}
+function writeCatalog(admission, changed = true) {
+    catalogAdmission = [...admission];
+    if (changed) mediaRevision = randomBytes(32).toString('hex');
     const scheme = secure ? 'wss' : 'ws';
+    const validUntil = new Date(Date.now() + 30000).toISOString();
     const value = {
-        schemaVersion: 1,
-        revision: randomUUID(),
-        backends: ['10.89.42.10', '10.89.42.11'].map((id, index) => ({
-            id,
-            acceptNew: admission[index],
-            control: {
-                url: `${scheme}://${id}:${index === 0 ? 9100 : 9101}/`,
-                tlsServerName: 'rtpbridge.test'
-            },
-            recordings: {
-                url: `${secure ? 'https' : 'http'}://${id}:${index === 0 ? 9100 : 9101}/`,
-                tlsServerName: 'rtpbridge.test'
-            }
-        }))
+        schemaVersion: 2,
+        signaling: {
+            revision: 'a'.repeat(64),
+            validUntil,
+            backends: [
+                {
+                    id: 'sipbridge-e2e',
+                    acceptNew: true,
+                    control: { url: 'wss://10.89.42.30:8443/v1/control', tlsServerName: 'sipbridge-e2e' }
+                }
+            ]
+        },
+        media: {
+            revision: mediaRevision,
+            validUntil,
+            backends: ['10.89.42.10', '10.89.42.11'].map((id, index) => ({
+                id,
+                acceptNew: admission[index],
+                control: {
+                    url: `${scheme}://${id}:${index === 0 ? 9100 : 9101}/`,
+                    tlsServerName: 'rtpbridge.test'
+                },
+                recordings: {
+                    url: `${secure ? 'https' : 'http'}://${id}:${index === 0 ? 9100 : 9101}/`,
+                    tlsServerName: 'rtpbridge.test'
+                }
+            }))
+        }
     };
     const target = `${fixturesDirectory}/endpoints.json`;
-    writeFileSync(`${target}.tmp`, JSON.stringify(value));
+    writeFileSync(`${target}.tmp`, JSON.stringify(value), { mode: 0o644 });
+    chmodSync(`${target}.tmp`, 0o644);
     renameSync(`${target}.tmp`, target);
-    return value.revision;
+    return value.media.revision;
 }
 
 async function runCatalogAdmissionScenario() {
@@ -173,25 +258,39 @@ async function runBackendAuthenticationScenario() {
         for (const path of ['/sessions', '/recordings']) {
             const unsigned = await e2eFetch(`${base}${path}`, { headers: {} });
             assertEqual(unsigned.status, 401, 'backend should reject unsigned HTTP');
-            const invalid = await e2eFetch(`${base}${path}`, { headers: backendHeaders('GET', `${base}${path}`, 'wrong-secret') });
+            const invalid = await e2eFetch(`${base}${path}`, {
+                headers: backendHeaders('GET', `${base}${path}`, 'wrong-secret')
+            });
             assertEqual(invalid.status, 401, 'backend should reject invalid HTTP HMAC');
         }
         const url = `${base.replace('https:', 'wss:')}/`;
-        for (const headers of [{}, backendHeaders('GET', url, 'wrong-secret')]) await new Promise((resolve, reject) => {
-            const ws = new WebSocket(url, { ...backendTlsOptions(), headers, handshakeTimeout: 5_000 });
-            ws.on('error', () => {});
-            ws.on('unexpected-response', (_request, response) => {
-                response.resume();
-                ws.terminate();
-                if (response.statusCode === 401) resolve();
-                else reject(new Error(`unsigned WSS returned ${response.statusCode}`));
+        for (const headers of [{}, backendHeaders('GET', url, 'wrong-secret')])
+            await new Promise((resolve, reject) => {
+                const ws = new WebSocket(url, { ...backendTlsOptions(), headers, handshakeTimeout: 5_000 });
+                ws.on('error', () => {});
+                ws.on('unexpected-response', (_request, response) => {
+                    response.resume();
+                    ws.terminate();
+                    if (response.statusCode === 401) resolve();
+                    else reject(new Error(`unsigned WSS returned ${response.statusCode}`));
+                });
+                ws.on('open', () => {
+                    ws.terminate();
+                    reject(new Error('unsigned WSS was accepted'));
+                });
+                ws.on('error', reject);
             });
-            ws.on('open', () => { ws.terminate(); reject(new Error('unsigned WSS was accepted')); });
-            ws.on('error', reject);
-        });
         await new Promise((resolve, reject) => {
-            const ws = new WebSocket(url, { ...backendTlsOptions(), servername: 'wrong-hostname.test', headers: backendHeaders('GET', url), handshakeTimeout: 5_000 });
-            ws.on('open', () => { ws.terminate(); reject(new Error('TLS accepted the wrong hostname')); });
+            const ws = new WebSocket(url, {
+                ...backendTlsOptions(),
+                servername: 'wrong-hostname.test',
+                headers: backendHeaders('GET', url),
+                handshakeTimeout: 5_000
+            });
+            ws.on('open', () => {
+                ws.terminate();
+                reject(new Error('TLS accepted the wrong hostname'));
+            });
             ws.on('error', error => {
                 if (error.code === 'ERR_TLS_CERT_ALTNAME_INVALID') resolve();
                 else reject(error);
@@ -292,16 +391,20 @@ async function runOutboundSipScenario(controlClient) {
     let sessionId;
     try {
         const invitePromise = responder.waitForEvent('invite', 10_000);
-        const outbound = await controlClient.request('sip.createOutbound', {
-            requestUri: `sip:e2e@gateway:${responder.port};transport=tcp`,
-            sdp: localSdp(42000),
-            headers: {
-                From: '"E2E Agent" <sip:agent@rtc-session-gateway-e2e>',
-                'X-E2E': 'outbound'
+        const outbound = await controlClient.request(
+            'sip.createOutbound',
+            {
+                requestUri: `sip:e2e@gateway:${responder.port};transport=tcp`,
+                sdp: localSdp(42000),
+                headers: {
+                    From: '"E2E Agent" <sip:agent@rtc-session-gateway-e2e>',
+                    'X-E2E': 'outbound'
+                },
+                callingNumber: '18005551212',
+                callingName: 'Zyno E2E'
             },
-            callingNumber: '18005551212',
-            callingName: 'Zyno E2E'
-        }, 15_000);
+            15_000
+        );
         sessionId = outbound.sessionId;
         assert(sessionId, 'outbound SIP should return sessionId');
         assert(outbound.sdp?.includes('m=audio'), 'outbound SIP should return remote SDP answer');
@@ -337,11 +440,20 @@ async function runOutboundCancelScenario(controlClient) {
     try {
         await responder.request('configure', { autoAnswer: false });
         const attemptId = randomUUID();
-        const outboundResult = controlClient.request('sip.createOutbound', {
-            outboundAttemptId: attemptId,
-            requestUri: `sip:e2e@gateway:${responder.port};transport=tcp`,
-            sdp: localSdp(42000)
-        }, 15_000).then(result => ({ result }), error => ({ error }));
+        const outboundResult = controlClient
+            .request(
+                'sip.createOutbound',
+                {
+                    outboundAttemptId: attemptId,
+                    requestUri: `sip:e2e@gateway:${responder.port};transport=tcp`,
+                    sdp: localSdp(42000)
+                },
+                15_000
+            )
+            .then(
+                result => ({ result }),
+                error => ({ error })
+            );
         await responder.waitForEvent('invite', 10_000);
         await controlClient.request('sip.cancelOutbound', { outboundAttemptId: attemptId });
         await responder.waitForEvent('cancel', 10_000);
@@ -371,7 +483,10 @@ async function runReinviteScenario(controlClient) {
         const answeredEvent = controlClient.waitForEvent('sip.answered', 10_000);
         sip.send(invite.message);
         const request = await inviteRequest;
-        const endpoint = await controlClient.request('rtp.createFromOffer', { sessionId: media.sessionId, sdp: request.params.sdp });
+        const endpoint = await controlClient.request('rtp.createFromOffer', {
+            sessionId: media.sessionId,
+            sdp: request.params.sdp
+        });
         controlClient.respond(request.id, { action: 'answer', sdp: endpoint.sdpAnswer });
         const answer = await sip.waitForFinalResponse(invite.callId, 10_000);
         assertEqual(answer.status, 200, 'initial INVITE status');
@@ -394,13 +509,19 @@ async function runReinviteScenario(controlClient) {
         sip.send(reinvite.message);
         const modify = await modifyRequest;
         assertEqual(modify.params.sdp, newSdp, 'control should receive changed remote SDP');
-        const renegotiated = await controlClient.request('rtp.reinvite', { endpointId: endpoint.endpointId, sdp: modify.params.sdp });
+        const renegotiated = await controlClient.request('rtp.reinvite', {
+            endpointId: endpoint.endpointId,
+            sdp: modify.params.sdp
+        });
         controlClient.respond(modify.id, { action: 'answer', sdp: renegotiated.sdpAnswer });
         const final = await sip.waitForFinalResponse(invite.callId, 10_000, '2 INVITE');
         assertEqual(final.status, 200, 're-INVITE final status');
         sip.send(sip.buildAck(reinvite, final));
-        const call = await getJson(`${gatewayBaseUrl}/calls/${encodeURIComponent(callId)}`);
-        assertEqual(call.remoteSdp, newSdp, 'call should track renegotiated remote SDP');
+        // SIP delivery and the native command-result notification use independent transports.
+        await eventually(async () => {
+            const call = await getJson(`${gatewayBaseUrl}/calls/${encodeURIComponent(callId)}`);
+            assertEqual(call.remoteSdp, newSdp, 'call should track committed renegotiated remote SDP');
+        }, 3000);
         await probe.sendPackets(newPeer.peerId, parseRtpTarget(final.body), 3);
         await sleep(200);
         await probe.request('peer.reset', { peerId: newPeer.peerId });
@@ -437,13 +558,17 @@ async function assertGatewayEmpty(message) {
 
 async function startPendingGather(sessionId, endpointId) {
     const pending = postJson(`${gatewayBaseUrl}/sessions/${encodeURIComponent(sessionId)}/media/gather`, {
-        endpointId, numDigits: 2, timeoutMs: 12_000, sensitive: true
+        endpointId,
+        numDigits: 2,
+        timeoutMs: 12_000,
+        sensitive: true
     });
     // Attach immediately so teardown failures cannot become unhandled rejections.
     pending.catch(() => undefined);
     await sleep(300);
     const conflict = await e2eFetch(`${gatewayBaseUrl}/sessions/${encodeURIComponent(sessionId)}/media/gather`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ endpointId, numDigits: 1, timeoutMs: 100, sensitive: true })
     });
     assertEqual(conflict.status, 409, 'pending gather must be active before teardown');
@@ -524,7 +649,9 @@ async function runBackendFailureScenario() {
         const peer = await probe.createPeer();
         const endpoint = await createAnsweredRtpEndpoint(failed.sessionId, peer);
         const gather = await startPendingGather(failed.sessionId, endpoint.endpointId);
-        run('docker', ['compose', '-f', composeFile, 'kill', '-s', 'SIGKILL', service], { env: { ...process.env, COMPOSE_PROJECT_NAME: projectName } });
+        run('docker', ['compose', '-f', composeFile, 'kill', '-s', 'SIGKILL', service], {
+            env: { ...process.env, COMPOSE_PROJECT_NAME: projectName }
+        });
         const result = await gather.pending;
         assertEqual(result.reason, 'cancelled', 'backend death should cancel pending gather');
         await eventually(async () => {
@@ -536,14 +663,20 @@ async function runBackendFailureScenario() {
         const working = await createAnsweredRtpEndpoint(healthy.sessionId, peer);
         assert(working.endpointId, 'healthy backend should still accept commands');
     } finally {
-        run('docker', ['compose', '-f', composeFile, 'up', '-d', '--no-deps', service], { env: { ...process.env, COMPOSE_PROJECT_NAME: projectName } });
+        run('docker', ['compose', '-f', composeFile, 'up', '-d', '--no-deps', service], {
+            env: { ...process.env, COMPOSE_PROJECT_NAME: projectName }
+        });
         await waitForHttp(`${base}/health`, body => body?.status === 'ok', 30_000);
         await deleteJson(`${gatewayBaseUrl}/sessions/${healthy.sessionId}`, {}).catch(() => undefined);
         await probe.close();
     }
-    const recovered = await postJson(`${gatewayBaseUrl}/sessions`, { callId: 'e2e-backend-recovered' });
+    const recovered = await postJson(`${gatewayBaseUrl}/sessions`, {
+        callId: 'e2e-backend-recovered'
+    });
     assertEqual(recovered.backendId, failed.backendId, 'recovery should exercise the restarted backend');
-    await postJson(`${gatewayBaseUrl}/sessions/${recovered.sessionId}/rtp/offers`, { codecs: ['PCMU'] });
+    await postJson(`${gatewayBaseUrl}/sessions/${recovered.sessionId}/rtp/offers`, {
+        codecs: ['PCMU']
+    });
     await deleteJson(`${gatewayBaseUrl}/sessions/${recovered.sessionId}`, {});
     await assertGatewayEmpty('backend failure and recovery cleanup');
 }
@@ -560,7 +693,10 @@ async function runGatewayDrainScenario() {
         const inviteRequest = control.waitForRequest('sip.invite', 10_000);
         sip.send(invite.message);
         const request = await inviteRequest;
-        const endpoint = await control.request('rtp.createFromOffer', { sessionId: media.sessionId, sdp: request.params.sdp });
+        const endpoint = await control.request('rtp.createFromOffer', {
+            sessionId: media.sessionId,
+            sdp: request.params.sdp
+        });
         const answeredEvent = control.waitForEvent('sip.answered', 10_000);
         control.respond(request.id, { action: 'answer', sdp: endpoint.sdpAnswer });
         const answer = await sip.waitForFinalResponse(invite.callId, 10_000);
@@ -585,25 +721,42 @@ async function runGatewayDrainScenario() {
         assertEqual(readiness.status, 503, 'draining gateway should leave readiness');
         const health = await getJson(`${gatewayBaseUrl}/healthz`);
         assertEqual(health.ok, true, 'draining gateway should remain healthy');
-        const blocked = await e2eFetch(`${gatewayBaseUrl}/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+        const blocked = await e2eFetch(`${gatewayBaseUrl}/sessions`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}'
+        });
         assertEqual(blocked.status, 503, 'drain should reject new HTTP sessions');
         await assertRejected(control.request('session.create', {}), /SHUTTING_DOWN/);
-        await assertRejected(control.request('sip.createOutbound', { requestUri: 'sip:new@example.com', sdp: localSdp(41000) }), /SHUTTING_DOWN/);
+        await assertRejected(
+            control.request('sip.createOutbound', {
+                requestUri: 'sip:new@example.com',
+                sdp: localSdp(41000)
+            }),
+            /SHUTTING_DOWN/
+        );
         await new Promise((resolve, reject) => {
             const ws = new WebSocket(controlUrl);
             ws.on('error', () => {});
             ws.on('unexpected-response', (_req, response) => {
-                response.resume(); ws.terminate();
-                if (response.statusCode === 503) resolve(); else reject(new Error(`draining upgrade status ${response.statusCode}`));
+                response.resume();
+                ws.terminate();
+                if (response.statusCode === 503) resolve();
+                else reject(new Error(`draining upgrade status ${response.statusCode}`));
             });
-            ws.on('open', () => { ws.terminate(); reject(new Error('draining gateway accepted a new control owner')); });
+            ws.on('open', () => {
+                ws.terminate();
+                reject(new Error('draining gateway accepted a new control owner'));
+            });
         });
         const newInvite = sip.buildInvite({ user: 'e2e' });
         sip.send(newInvite.message);
         const rejected = await sip.waitForFinalResponse(newInvite.callId, 10_000);
         assertEqual(rejected.status, 503, 'drain should reject new inbound SIP');
 
-        const admittedMedia = await control.request('session.create', { callId: admitted.params.callId });
+        const admittedMedia = await control.request('session.create', {
+            callId: admitted.params.callId
+        });
         const pendingAnswered = control.waitForEvent('sip.answered', 10_000);
         control.respond(admitted.id, { action: 'answer', sdp: localSdp(41002) });
         const pendingAnswer = await sip.waitForFinalResponse(pendingInvite.callId, 10_000);
@@ -611,12 +764,17 @@ async function runGatewayDrainScenario() {
         sip.send(sip.buildAck(pendingInvite, pendingAnswer));
         const secondCall = await pendingAnswered;
         await probe.request('peer.reset', { peerId: observerPeer.peerId });
-        await probe.sendPackets(peer.peerId, parseRtpTarget(endpoint.sdpAnswer), 50, { payloadMode: 'tone' });
+        await probe.sendPackets(peer.peerId, parseRtpTarget(endpoint.sdpAnswer), 50, {
+            payloadMode: 'tone'
+        });
         const packets = await probe.request('peer.packets', { peerId: observerPeer.peerId });
         assertAudio(packets, { minimum: 40, label: 'live SIP/RTP media during gateway drain' });
         const existing = await control.request('session.get', { sessionId: answered.sessionId });
         assertEqual(existing.callId, answered.sessionId, 'existing control owner should retain call access');
-        for (const [callId, sipCallId] of [[answered.sessionId, invite.callId], [secondCall.sessionId, pendingInvite.callId]]) {
+        for (const [callId, sipCallId] of [
+            [answered.sessionId, invite.callId],
+            [secondCall.sessionId, pendingInvite.callId]
+        ]) {
             const byeRequest = sip.waitForRequest('BYE', sipCallId, 10_000);
             const hangup = control.request('sip.bye', { sessionId: callId });
             const bye = await byeRequest;
@@ -636,11 +794,20 @@ async function runGatewayDrainScenario() {
 
 async function runGatewayDrainDeadlineScenario() {
     step('Checking gateway drain deadline, forced SIP/media cleanup and restart');
-    const env = { ...process.env, COMPOSE_PROJECT_NAME: projectName, E2E_SHUTDOWN_MAX_WAIT_MS: '1000' };
+    const env = {
+        ...process.env,
+        COMPOSE_PROJECT_NAME: projectName,
+        E2E_SHUTDOWN_MAX_WAIT_MS: '1000'
+    };
     run('docker', ['compose', '-f', composeFile, 'up', '-d', '--no-deps', 'gateway'], { env });
-    await waitForHttp(`${gatewayBaseUrl}/readyz`, body => body?.ok === true, 30_000);
+    await waitForHttp(`${gatewayBaseUrl}/healthz`, body => body?.ok === true, 30_000);
     control = await connectControl(controlUrl);
     await control.request('route.register', { routes: [{ match: 'exact', value: 'e2e' }] });
+    await waitForHttp(`${gatewayBaseUrl}/readyz`, body => body?.ok === true, 15000);
+    await eventually(async () => {
+        const response = await fetch(`http://127.0.0.1:${process.env.E2E_SIP_ADMIN_PORT || '18800'}/sip-readyz`);
+        assertEqual(response.status, 200, 'native controller must admit replacement calls');
+    }, 15000);
     const sip = await SipTcpClient.create();
     const responder = await SipResponderClient.start();
     try {
@@ -657,9 +824,19 @@ async function runGatewayDrainDeadlineScenario() {
         sip.send(sip.buildAck(invite, answer));
         await answeredEvent;
         await responder.request('configure', { autoAnswer: false });
-        const outbound = control.request('sip.createOutbound', {
-            requestUri: `sip:e2e@gateway:${responder.port};transport=tcp`, sdp: localSdp(42000)
-        }, 10_000).then(result => ({ result }), error => ({ error }));
+        const outbound = control
+            .request(
+                'sip.createOutbound',
+                {
+                    requestUri: `sip:e2e@gateway:${responder.port};transport=tcp`,
+                    sdp: localSdp(42000)
+                },
+                10_000
+            )
+            .then(
+                result => ({ result }),
+                error => ({ error })
+            );
         await responder.waitForEvent('invite', 10_000);
         const pendingInvite = sip.buildInvite({ user: 'e2e' });
         const pendingRequest = control.waitForRequest('sip.invite', 10_000);
@@ -687,12 +864,15 @@ async function runGatewayDrainDeadlineScenario() {
         await closeControl();
     }
     run('docker', ['compose', '-f', composeFile, 'up', '-d', '--no-deps', 'gateway'], { env });
-    await waitForHttp(`${gatewayBaseUrl}/readyz`, body => body?.ok === true, 30_000);
+    await waitForHttp(`${gatewayBaseUrl}/healthz`, body => body?.ok === true, 30_000);
+    assertEqual((await e2eFetch(`${gatewayBaseUrl}/readyz`)).status, 503, 'replacement without owner routes remains unready');
     await assertGatewayEmpty('gateway restart after drain');
 }
 
 async function assertRejected(promise, pattern) {
-    try { await promise; } catch (error) {
+    try {
+        await promise;
+    } catch (error) {
         assert(pattern.test(error.message), `Unexpected error: ${error.message}`);
         return;
     }
@@ -703,7 +883,11 @@ async function waitForGatewayExit() {
     const env = { ...process.env, COMPOSE_PROJECT_NAME: projectName };
     const containerId = execFileSync('docker', ['compose', '-f', composeFile, 'ps', '-a', '-q', 'gateway'], { env, encoding: 'utf8' }).trim();
     await eventually(async () => {
-        const state = JSON.parse(execFileSync('docker', ['inspect', '--format', '{{json .State}}', containerId], { encoding: 'utf8' }));
+        const state = JSON.parse(
+            execFileSync('docker', ['inspect', '--format', '{{json .State}}', containerId], {
+                encoding: 'utf8'
+            })
+        );
         assertEqual(state.Running, false, 'gateway should exit after draining');
         assertEqual(state.ExitCode, 0, 'gateway drain should exit successfully');
     }, 15_000);
@@ -794,7 +978,10 @@ async function runMediaScenario({ srtp = false } = {}) {
         const sourceRtpTarget = parseRtpTarget(sourceOffer.sdpOffer, rtpbridgeMediaHost);
         const targetRtpTarget = parseRtpTarget(targetOffer.sdpOffer, rtpbridgeMediaHost);
         if (srtp) {
-            await probe.sendPackets(peerA.peerId, sourceRtpTarget, 20, { payloadMode: 'tone', plaintext: true });
+            await probe.sendPackets(peerA.peerId, sourceRtpTarget, 20, {
+                payloadMode: 'tone',
+                plaintext: true
+            });
             await sleep(200);
             const rejected = await probe.request('peer.packets', { peerId: peerB.peerId });
             assertEqual(rejected.length, 0, 'mandatory SRTP should reject plaintext input');
@@ -805,18 +992,30 @@ async function runMediaScenario({ srtp = false } = {}) {
         await probe.request('peer.reset', { peerId: peerA.peerId });
         await probe.request('peer.reset', { peerId: peerB.peerId });
         await Promise.all([
-            probe.sendPackets(peerA.peerId, sourceRtpTarget, 100, { payloadMode: 'tone', frequency: 440 }),
-            probe.sendPackets(peerB.peerId, targetRtpTarget, 100, { payloadMode: 'tone', frequency: 660 })
+            probe.sendPackets(peerA.peerId, sourceRtpTarget, 100, {
+                payloadMode: 'tone',
+                frequency: 440
+            }),
+            probe.sendPackets(peerB.peerId, targetRtpTarget, 100, {
+                payloadMode: 'tone',
+                frequency: 660
+            })
         ]);
         await sleep(200);
         const receivedA = await probe.request('peer.packets', { peerId: peerA.peerId });
         const receivedB = await probe.request('peer.packets', { peerId: peerB.peerId });
         assertAudio(receivedA, { label: 'RTP B -> A', frequency: 660 });
         assertAudio(receivedB, { label: 'RTP A -> B', frequency: 440 });
-        if (srtp) assert([...receivedA, ...receivedB].every(packet => packet.wireLength === packet.length + 10), 'SRTP packets should carry an authentication tag and decrypt successfully');
+        if (srtp)
+            assert(
+                [...receivedA, ...receivedB].every(packet => packet.wireLength === packet.length + 10),
+                'SRTP packets should carry an authentication tag and decrypt successfully'
+            );
 
         for (const endpoint of [sourceOffer, targetOffer]) {
-            await postJson(`${gatewayBaseUrl}/media/endpoints/${endpoint.endpointId}/direction`, { direction: 'inactive' });
+            await postJson(`${gatewayBaseUrl}/media/endpoints/${endpoint.endpointId}/direction`, {
+                direction: 'inactive'
+            });
         }
         await sleep(300);
         await probe.request('peer.reset', { peerId: peerA.peerId });
@@ -830,7 +1029,9 @@ async function runMediaScenario({ srtp = false } = {}) {
         assertEqual(inactiveA.length, 0, 'inactive endpoint A should stop media');
         assertEqual(inactiveB.length, 0, 'inactive endpoint B should stop media');
         for (const endpoint of [sourceOffer, targetOffer]) {
-            await postJson(`${gatewayBaseUrl}/media/endpoints/${endpoint.endpointId}/direction`, { direction: 'sendrecv' });
+            await postJson(`${gatewayBaseUrl}/media/endpoints/${endpoint.endpointId}/direction`, {
+                direction: 'sendrecv'
+            });
         }
         await Promise.all([
             probe.sendPackets(peerA.peerId, sourceRtpTarget, 70, { payloadMode: 'tone', frequency: 440 }),
@@ -869,8 +1070,10 @@ async function runMediaScenario({ srtp = false } = {}) {
         if (peerA?.peerId) await probe.closePeer(peerA.peerId).catch(() => undefined);
         if (peerB?.peerId) await probe.closePeer(peerB.peerId).catch(() => undefined);
         await probe.close();
-        if (sourceOffer?.endpointId) await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(sourceOffer.endpointId)}`, {}).catch(() => undefined);
-        if (targetOffer?.endpointId) await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(targetOffer.endpointId)}`, {}).catch(() => undefined);
+        if (sourceOffer?.endpointId)
+            await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(sourceOffer.endpointId)}`, {}).catch(() => undefined);
+        if (targetOffer?.endpointId)
+            await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(targetOffer.endpointId)}`, {}).catch(() => undefined);
         await deleteJson(`${gatewayBaseUrl}/sessions/${encodeURIComponent(sessionId)}`, {}).catch(() => undefined);
         await deleteJson(`${gatewayBaseUrl}/sessions/${encodeURIComponent(targetSessionId)}`, {}).catch(() => undefined);
     }
@@ -978,7 +1181,10 @@ async function runRecordingScenario() {
             firstBytes.length + secondBytes.length - PCAP_HEADER_BYTES,
             'merged recording should contain one global header plus both segment bodies'
         );
-        assert(merged.body.equals(Buffer.concat([firstBytes, secondBytes.subarray(PCAP_HEADER_BYTES)])), 'merge should preserve every captured byte in order');
+        assert(
+            merged.body.equals(Buffer.concat([firstBytes, secondBytes.subarray(PCAP_HEADER_BYTES)])),
+            'merge should preserve every captured byte in order'
+        );
         const mergedPackets = pcapRtp(merged.body, offer.endpointId);
         assertEqual(mergedPackets.length, firstPackets.length + secondPackets.length, 'merged decoded packet count');
         assertAudio(mergedPackets, { minimum: 90, label: 'decoded merged recording' });
@@ -987,7 +1193,10 @@ async function runRecordingScenario() {
             writeFileSync(`${process.env.E2E_ARTIFACTS_DIR}/merged.pcap`, merged.body);
         }
         for (const recording of stoppedRecordings) {
-            await deleteJson(`${gatewayBaseUrl}/recordings/${encodeURIComponent(recording.backendId)}/${encodeRecordingPath(recording.recordingPath)}`, {});
+            await deleteJson(
+                `${gatewayBaseUrl}/recordings/${encodeURIComponent(recording.backendId)}/${encodeRecordingPath(recording.recordingPath)}`,
+                {}
+            );
             const missing = await e2eFetch(`${gatewayBaseUrl}${recording.downloadPath}`);
             assertEqual(missing.status, 404, 'deleted recording should no longer download');
         }
@@ -996,11 +1205,15 @@ async function runRecordingScenario() {
         stoppedRecordings.length = 0;
     } finally {
         for (const recording of stoppedRecordings) {
-            await deleteJson(`${gatewayBaseUrl}/recordings/${encodeURIComponent(recording.backendId)}/${encodeRecordingPath(recording.recordingPath)}`, {}).catch(() => undefined);
+            await deleteJson(
+                `${gatewayBaseUrl}/recordings/${encodeURIComponent(recording.backendId)}/${encodeRecordingPath(recording.recordingPath)}`,
+                {}
+            ).catch(() => undefined);
         }
         if (peer?.peerId) await probe.closePeer(peer.peerId).catch(() => undefined);
         await probe.close();
-        if (offer?.endpointId) await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(offer.endpointId)}`, {}).catch(() => undefined);
+        if (offer?.endpointId)
+            await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(offer.endpointId)}`, {}).catch(() => undefined);
         if (sessionId) await deleteJson(`${gatewayBaseUrl}/sessions/${encodeURIComponent(sessionId)}`, {}).catch(() => undefined);
     }
     await assertRtpbridgeSessionsEmpty('recording scenario cleanup should remove rtpbridge sessions');
@@ -1010,7 +1223,9 @@ async function runMediaActionsScenario() {
     step('Running local media action scenario');
     const probe = await RtpProbeClient.start();
     const audio = await probe.startAudioServer();
-    const session = await postJson(`${gatewayBaseUrl}/sessions`, { callId: 'e2e-media-actions-call' });
+    const session = await postJson(`${gatewayBaseUrl}/sessions`, {
+        callId: 'e2e-media-actions-call'
+    });
     const sessionId = session.sessionId;
     let peer;
     let offer;
@@ -1038,7 +1253,9 @@ async function runMediaActionsScenario() {
             timeoutMs: 5_000,
             interDigitTimeoutMs: 1_000
         });
-        await sendDtmfSequenceUntilSettled(playAndGatherPromise, probe, peer.peerId, rtpTarget, ['7'], { intervalMs: 250 });
+        await sendDtmfSequenceUntilSettled(playAndGatherPromise, probe, peer.peerId, rtpTarget, ['7'], {
+            intervalMs: 250
+        });
         const playAndGather = await playAndGatherPromise;
         assertEqual(playAndGather.digits, '7', 'media.playAndGather should collect a digit');
         assertEqual(playAndGather.reason, 'digits', 'media.playAndGather should complete by digit count');
@@ -1053,12 +1270,17 @@ async function runMediaActionsScenario() {
         });
         await sendVadPatternUntilSettled(leaveMessagePromise, probe, peer.peerId, rtpTarget);
         const leftMessage = await leaveMessagePromise;
-        assertDeepEqual(leftMessage, { terminator: 'silence', messagePlayed: true }, 'media.leaveMessage should wait for VAD silence and play message');
+        assertDeepEqual(
+            leftMessage,
+            { terminator: 'silence', messagePlayed: true },
+            'media.leaveMessage should wait for VAD silence and play message'
+        );
     } finally {
         if (peer?.peerId) await probe.closePeer(peer.peerId).catch(() => undefined);
         await probe.closeAudioServer().catch(() => undefined);
         await probe.close();
-        if (offer?.endpointId) await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(offer.endpointId)}`, {}).catch(() => undefined);
+        if (offer?.endpointId)
+            await deleteJson(`${gatewayBaseUrl}/media/endpoints/${encodeURIComponent(offer.endpointId)}`, {}).catch(() => undefined);
         if (sessionId) await deleteJson(`${gatewayBaseUrl}/sessions/${encodeURIComponent(sessionId)}`, {}).catch(() => undefined);
     }
     await assertRtpbridgeSessionsEmpty('media action cleanup should remove rtpbridge sessions');
@@ -1136,9 +1358,13 @@ async function sendVadPatternUntilSettled(actionPromise, probe, peerId, rtpTarge
     const state = observeSettlement(actionPromise);
     const deadline = Date.now() + (options.maxMs ?? 7_000);
     while (!state.settled && Date.now() < deadline) {
-        await probe.sendPackets(peerId, rtpTarget, options.noisePackets ?? 25, { payloadMode: 'noise' });
+        await probe.sendPackets(peerId, rtpTarget, options.noisePackets ?? 25, {
+            payloadMode: 'noise'
+        });
         if (state.settled) return;
-        await probe.sendPackets(peerId, rtpTarget, options.silencePackets ?? 80, { payloadMode: 'silence' });
+        await probe.sendPackets(peerId, rtpTarget, options.silencePackets ?? 80, {
+            payloadMode: 'silence'
+        });
     }
 }
 
@@ -1178,16 +1404,21 @@ function step(message) {
 }
 
 async function cleanup(exitCode) {
+    clearInterval(catalogHeartbeat);
     if (cleaningUp) return;
     cleaningUp = true;
     if (process.env.E2E_ARTIFACTS_DIR) {
         const directory = process.env.E2E_ARTIFACTS_DIR;
         mkdirSync(directory, { recursive: true });
         const logs = spawnSync('docker', ['compose', '-f', composeFile, 'logs', '--no-color'], {
-            env: { ...process.env, COMPOSE_PROJECT_NAME: projectName }, encoding: 'utf8'
+            env: { ...process.env, COMPOSE_PROJECT_NAME: projectName },
+            encoding: 'utf8'
         });
         writeFileSync(`${directory}/compose.log`, `${logs.stdout || ''}${logs.stderr || ''}`);
-        writeFileSync(`${directory}/result.json`, JSON.stringify({ startedAt, finishedAt: new Date().toISOString(), secure, exitCode, steps }, null, 2));
+        writeFileSync(
+            `${directory}/result.json`,
+            JSON.stringify({ startedAt, finishedAt: new Date().toISOString(), secure, exitCode, steps }, null, 2)
+        );
     }
     if (process.env.KEEP_E2E_STACK === '1') {
         process.exit(exitCode);
@@ -1494,23 +1725,31 @@ class RtpProbeClient {
     }
 
     sendPackets(peerId, target, count, options = {}) {
-        return this.request('peer.send', {
-            peerId,
-            host: target.host,
-            port: target.port,
-            count,
-            ...options
-        }, Math.max(10_000, count * 100));
+        return this.request(
+            'peer.send',
+            {
+                peerId,
+                host: target.host,
+                port: target.port,
+                count,
+                ...options
+            },
+            Math.max(10_000, count * 100)
+        );
     }
 
     sendDtmf(peerId, target, digit, options = {}) {
-        return this.request('peer.sendDtmf', {
-            peerId,
-            host: target.host,
-            port: target.port,
-            digit,
-            ...options
-        }, 10_000);
+        return this.request(
+            'peer.sendDtmf',
+            {
+                peerId,
+                host: target.host,
+                port: target.port,
+                digit,
+                ...options
+            },
+            10_000
+        );
     }
 
     waitForPacket(peerId, timeoutMs) {
@@ -1665,7 +1904,7 @@ class SipTcpClient {
     }
 
     static async create() {
-        const socket = net.createConnection({ host: drachtioHost, port: drachtioPort });
+        const socket = net.createConnection({ host: sipHost, port: sipPort });
         await new Promise((resolve, reject) => {
             const timer = setTimeout(() => reject(new Error('SIP TCP connect timeout')), 10_000);
             socket.once('connect', () => {
@@ -1681,7 +1920,7 @@ class SipTcpClient {
         const callId = `${randomUUID()}@rtc-session-gateway-e2e`;
         const fromTag = randomToken();
         const branch = `z9hG4bK-${randomToken()}`;
-        const uri = `sip:${user}@${drachtioHost}:${drachtioPort}`;
+        const uri = `sip:${user}@${sipHost}:${sipPort}`;
         const body = sdp || localSdp(this.localPort + 10);
         const headers = [
             `INVITE ${uri} SIP/2.0`,
@@ -1723,18 +1962,19 @@ class SipTcpClient {
 
     buildReinvite(invite, response, sdp) {
         const contact = response.headers.contact?.match(/<([^>]+)>/)?.[1] || invite.uri;
-        const message = [
-            `INVITE ${contact} SIP/2.0`,
-            `Via: SIP/2.0/TCP 127.0.0.1:${this.localPort};branch=z9hG4bK-${randomToken()};rport`,
-            'Max-Forwards: 70',
-            `From: "E2E Caller" <sip:caller@127.0.0.1>;tag=${invite.fromTag}`,
-            `To: ${response.headers.to}`,
-            `Call-ID: ${invite.callId}`,
-            'CSeq: 2 INVITE',
-            `Contact: <sip:caller@127.0.0.1:${this.localPort};transport=tcp>`,
-            'Content-Type: application/sdp',
-            `Content-Length: ${Buffer.byteLength(sdp)}`
-        ].join('\r\n') + `\r\n\r\n${sdp}`;
+        const message =
+            [
+                `INVITE ${contact} SIP/2.0`,
+                `Via: SIP/2.0/TCP 127.0.0.1:${this.localPort};branch=z9hG4bK-${randomToken()};rport`,
+                'Max-Forwards: 70',
+                `From: "E2E Caller" <sip:caller@127.0.0.1>;tag=${invite.fromTag}`,
+                `To: ${response.headers.to}`,
+                `Call-ID: ${invite.callId}`,
+                'CSeq: 2 INVITE',
+                `Contact: <sip:caller@127.0.0.1:${this.localPort};transport=tcp>`,
+                'Content-Type: application/sdp',
+                `Content-Length: ${Buffer.byteLength(sdp)}`
+            ].join('\r\n') + `\r\n\r\n${sdp}`;
         return { ...invite, cseq: 2, message };
     }
 
@@ -1772,7 +2012,10 @@ class SipTcpClient {
     }
 
     waitForFinalResponse(callId, timeoutMs, cseq = '1 INVITE') {
-        return this.waitFor(message => message.kind === 'response' && message.status >= 200 && message.headers['call-id'] === callId && message.headers.cseq === cseq, timeoutMs);
+        return this.waitFor(
+            message => message.kind === 'response' && message.status >= 200 && message.headers['call-id'] === callId && message.headers.cseq === cseq,
+            timeoutMs
+        );
     }
 
     waitForRequest(method, callId, timeoutMs) {
@@ -1823,7 +2066,15 @@ function parseSipMessage(raw) {
     }
     if (startLine.startsWith('SIP/2.0')) {
         const match = /^SIP\/2\.0\s+(\d+)/.exec(startLine);
-        return { kind: 'response', raw, startLine, status: Number(match?.[1] || 0), headers, via, body };
+        return {
+            kind: 'response',
+            raw,
+            startLine,
+            status: Number(match?.[1] || 0),
+            headers,
+            via,
+            body
+        };
     }
     const [method, uri] = startLine.split(/\s+/);
     return { kind: 'request', raw, startLine, method, uri, headers, via, body };
@@ -1880,7 +2131,10 @@ function assertPcap(buffer, message) {
 }
 
 function encodeRecordingPath(recordingPath) {
-    return recordingPath.split('/').map(segment => encodeURIComponent(segment)).join('/');
+    return recordingPath
+        .split('/')
+        .map(segment => encodeURIComponent(segment))
+        .join('/');
 }
 
 function randomToken() {
