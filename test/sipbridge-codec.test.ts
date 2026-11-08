@@ -76,3 +76,59 @@ test('an unavailable session does not consume a command sequence or mark its out
     assert.equal(state.sequence, 4n);
     assert.equal(state.uncertain, false);
 });
+
+async function retainedFixture() {
+    const { SipbridgeSignaling } = await import('../src/sipbridge-signaling');
+    const { loadConfig } = await import('../src/config');
+    const { ContextSnapshot, OperationResult_Certainty } = await import('../src/sipbridge/generated/sipbridge-control');
+    const signaling = new SipbridgeSignaling(loadConfig({}));
+    const authority = { service: 'sip', generation: 'generation', primaryId: 'core', schemaVersion: 1 };
+    const snapshot = ContextSnapshot.fromJSON({
+        context: { id: 'ctx', state: { authority, groupId: 'group', incarnation: 'incarnation' } },
+        application: signaling.process,
+        applicationLeaseTerm: 'term',
+        commandSequence: '1',
+        revision: '1',
+        answered: true
+    });
+    let result: any = { certainty: OperationResult_Certainty.COMPLETED, error: '', snapshot };
+    const client = {
+        negotiated: { stateAuthority: authority, applicationLease: { term: 'term' } },
+        async request() {
+            return { payload: { $case: 'result', result } };
+        }
+    };
+    const peer = {};
+    const state = (signaling as any).remember(peer, client, snapshot);
+    return {
+        state,
+        authority,
+        snapshot,
+        inspect: () => (signaling as any).inspectRetained(peer, client, state),
+        setResult(value: any) {
+            result = value;
+        }
+    };
+}
+test('reconnect inspection refreshes references without clearing an uncertain mutation', async () => {
+    const fixture = await retainedFixture();
+    fixture.state.uncertain = true;
+    await fixture.inspect();
+    assert.equal(fixture.state.uncertain, true);
+    assert.equal(fixture.state.ended, false);
+});
+test('reconnect retires only an ended snapshot or exact current-authority absence proof', async () => {
+    const absent = await retainedFixture();
+    absent.setResult({ certainty: 3, error: 'context not found' });
+    await absent.inspect();
+    assert.equal(absent.state.ended, false);
+    assert.equal(absent.state.uncertain, true);
+    const proof = await retainedFixture();
+    proof.setResult({ certainty: 3, error: '', retirementProof: { context: proof.snapshot.context, authority: proof.authority, reason: 1 } });
+    await proof.inspect();
+    assert.equal(proof.state.ended, true);
+    const ended = await retainedFixture();
+    ended.setResult({ certainty: 3, error: '', snapshot: { ...ended.snapshot, ended: true, revision: 2n } });
+    await ended.inspect();
+    assert.equal(ended.state.ended, true);
+});

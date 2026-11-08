@@ -15,6 +15,7 @@ import {
 import {
     Command,
     ContextSnapshot,
+    ContextRetirementProof_Reason,
     DialogEvent,
     DialogEvent_Kind,
     OperationResult_Certainty,
@@ -72,6 +73,7 @@ interface Peer {
     endpoint: SignalingBackend;
     client?: SipbridgeControlClient;
     connecting: boolean;
+    reconciled?: boolean;
     retryAt: number;
     delay: number;
 }
@@ -161,7 +163,11 @@ export class SipbridgeSignaling extends EventEmitter {
             !this.stopped &&
             !!view?.valid &&
             view.backends.some(
-                endpoint => endpoint.acceptNew && this.peers.get(endpoint.id)?.client && same(this.peers.get(endpoint.id)?.endpoint, endpoint)
+                endpoint =>
+                    endpoint.acceptNew &&
+                    this.peers.get(endpoint.id)?.client &&
+                    this.peers.get(endpoint.id)?.reconciled &&
+                    same(this.peers.get(endpoint.id)?.endpoint, endpoint)
             )
         );
     }
@@ -223,9 +229,9 @@ export class SipbridgeSignaling extends EventEmitter {
             if (client)
                 void client
                     .status({
-                        retainedReady: true,
+                        retainedReady: !!peer.reconciled,
                         bindingsReady: true,
-                        admitCalls: fresh && this.applicationReady() && !this.isDraining(),
+                        admitCalls: fresh && !!peer.reconciled && this.applicationReady() && !this.isDraining(),
                         admitSubscriptions: false,
                         draining: this.isDraining()
                     })
@@ -262,6 +268,15 @@ export class SipbridgeSignaling extends EventEmitter {
             }
             peer.client = client;
             peer.delay = 250;
+            peer.reconciled = false;
+            void client.closed.then(() => {
+                if (peer.client !== client) return;
+                peer.client = undefined;
+                peer.reconciled = false;
+                peer.retryAt = Date.now() + peer.delay;
+                peer.delay = Math.min(peer.delay * 2, 5000);
+                this.emit('disconnected');
+            });
             const ack = client.negotiated;
             for (const state of this.contexts.values())
                 if (
@@ -276,21 +291,72 @@ export class SipbridgeSignaling extends EventEmitter {
                     state.dialog?.emit('ended', 'authority-changed');
                     if (state.snapshot.context) this.contexts.delete(contextKey(state.snapshot.context));
                 }
+            const retained = [...this.contexts.values()].filter(state => state.peer === peer && !state.ended);
+            await Promise.all(
+                Array.from({ length: Math.min(8, retained.length) }, async () => {
+                    for (let state = retained.shift(); state; state = retained.shift()) await this.inspectRetained(peer, client, state);
+                })
+            );
+            if (peer.client !== client || this.stopped) return;
+            peer.reconciled = true;
             this.emit('connected');
             await this.refresh();
-            void client.closed.then(() => {
-                if (peer.client !== client) return;
-                peer.client = undefined;
-                peer.retryAt = Date.now() + peer.delay;
-                peer.delay = Math.min(peer.delay * 2, 5000);
-                this.emit('disconnected');
-            });
         } catch {
+            peer.client?.close();
+            peer.client = undefined;
+            peer.reconciled = false;
             peer.retryAt = Date.now() + peer.delay;
             peer.delay = Math.min(peer.delay * 2, 5000);
         } finally {
             peer.connecting = false;
         }
+    }
+    private async inspectRetained(peer: Peer, client: SipbridgeControlClient, state: Context) {
+        if (state.ended) return;
+        const frame = await client.request({ $case: 'inspect', inspect: { context: state.snapshot.context } });
+        if (frame.payload?.$case !== 'result') throw new Error('Invalid native inspection');
+        const result = frame.payload.result;
+        if (result.snapshot) {
+            if (!result.snapshot.context || contextKey(result.snapshot.context) !== contextKey(state.snapshot.context!))
+                throw new Error('Inspection context mismatch');
+            this.remember(peer, client, result.snapshot);
+            if (result.snapshot.ended) {
+                this.retire(state, 'terminated');
+                return;
+            }
+            if (result.certainty === OperationResult_Certainty.UNKNOWN) state.uncertain = true;
+            if (!state.uncertain && result.snapshot.answered && state.deferred) {
+                state.dialog ??= new NativeDialog(state, this);
+                state.deferred.resolve(state.dialog);
+            }
+            return;
+        }
+        const proof = result.retirementProof;
+        if (
+            !result.error &&
+            result.certainty === OperationResult_Certainty.COMPLETED &&
+            proof?.context &&
+            proof.authority &&
+            contextKey(proof.context) === contextKey(state.snapshot.context!) &&
+            same(proof.authority, client.negotiated.stateAuthority) &&
+            [
+                ContextRetirementProof_Reason.GROUP_ABSENT,
+                ContextRetirementProof_Reason.OBSOLETE_INCARNATION,
+                ContextRetirementProof_Reason.CONTEXT_ABSENT
+            ].includes(proof.reason)
+        ) {
+            this.retire(state, 'terminated');
+            return;
+        }
+        state.uncertain = true;
+    }
+    private retire(state: Context, reason: string) {
+        if (state.ended) return;
+        state.ended = true;
+        state.retiredAt = Date.now();
+        if (state.credentials) this.credentials.delete(state.credentials.id);
+        state.deferred?.reject(new NativeOperationError('Native call ended'));
+        state.dialog?.emit('ended', reason);
     }
     private remember(peer: Peer, client: SipbridgeControlClient, snapshot: ContextSnapshot): Context {
         const ref = snapshot.context;

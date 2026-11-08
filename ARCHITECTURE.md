@@ -31,7 +31,11 @@ withdraws admission without closing existing control/media sessions or calls.
 Retained work remains pinned to its original context authority and RTC process.
 A core authority change invalidates affected application contexts; never migrate
 calls or replay a command to a new authority. Lease/session failures are distinct
-from terminal native proof. No uncertain write is reported as successful.
+from terminal native proof. No uncertain write is reported as successful. Reconnect inspects retained contexts
+with at most eight concurrent reads before fresh admission. Only an owned ended
+snapshot or exact current-authority retirement proof retires an old call; a lookup
+error or absence without proof does not. Inspection never clears an uncertain
+mutation fence or replays policy/commands.
 
 Commands serialize per native context and use current sequence, lease term and
 command-time delivery admission. Incoming bytes, physical flows and native
