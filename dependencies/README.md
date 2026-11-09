@@ -6,9 +6,11 @@ validation metadata under `src/sipbridge/generated/`, and the canonical
 positive/negative wire fixtures (`sipbridge-json-cases.json`). `yarn
 check:sipbridge-contract`, which also runs as part of `yarn test`, fails on drift.
 
-Protocol changes start in sipbridge. To update, import the schema, generated files
-and receipt hashes that sipbridge publishes for one revision. Do not hand-edit or
-reformat generated files; `.oxfmtrc.json` excludes them and the JSON test vectors.
+Consume protocol updates through sipbridge's schema and receipt distribution.
+The receipt records hashes for the generated bindings; it does not ship the
+TypeScript files in the runtime image. Update the local generated files to match
+that receipt before changing the pin. Do not hand-edit or reformat generated
+files; `.oxfmtrc.json` excludes them and the JSON test vectors.
 
 `sipbridge-runtime.json` pins the immutable sipbridge image, by revision tag and
 digest, used by `yarn test:native` and the Compose E2E suite.

@@ -9,8 +9,8 @@ scopes; nothing here qualifies a deployment.
 
 ## 1. Pinned native contract
 
-RTC imports sipbridge's schema and generated TypeScript JSON types/field metadata
-at one recorded revision, with hashes in `dependencies/sipbridge-contract.json`
+RTC pins sipbridge's schema and keeps matching generated TypeScript JSON
+types/field metadata locally, with hashes in `dependencies/sipbridge-contract.json`
 (see [dependency receipts](https://github.com/zyno-io/rtc-session-gateway/blob/main/dependencies/README.md)).
 The client keeps strict canonical JSON validation, uint64 bigint handling,
 byte/base64 preservation, correlation and bounded mTLS transport within this
