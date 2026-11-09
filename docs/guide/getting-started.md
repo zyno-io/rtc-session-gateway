@@ -6,8 +6,8 @@
 - Corepack.
 - Yarn Berry, provided through the `packageManager` field.
 - Docker, for the local compose E2E stack.
-- A sipbridge native endpoint catalog and mTLS controller identity outside compose.
-- rtpbridge when media sessions are required.
+- Outside Compose: a reachable sipbridge, an endpoint catalog file naming it, and an mTLS controller certificate it trusts.
+- rtpbridge backends listed in the catalog's media section, for media sessions.
 
 ## Install
 
@@ -30,7 +30,7 @@ yarn docs:build
 CONTROL_AUTH_MODE=none yarn dev
 ```
 
-The service listens on `HTTP_PORT`, default `3001`. Configure `RTC_ENDPOINTS_FILE` and `SIPBRIDGE_TLS_CERT_FILE`, `SIPBRIDGE_TLS_KEY_FILE`, `SIPBRIDGE_TLS_CA_FILE` before startup. See [configuration](./configuration.md).
+The service listens on `HTTP_PORT`, default `3001`. It exits at startup unless `RTC_ENDPOINTS_FILE`, `SIPBRIDGE_TLS_CERT_FILE`, `SIPBRIDGE_TLS_KEY_FILE` and `SIPBRIDGE_TLS_CA_FILE` are set. See [configuration](./configuration.md).
 
 ## Minimal Dynamic Route
 
@@ -57,6 +57,6 @@ yarn test:native
 yarn e2e:compose
 ```
 
-The E2E stack starts the gateway, sipbridge, two rtpbridge backends, SIP probes, RTP probes, WebRTC probes, and recording merge checks.
+`yarn test:native` verifies the pinned sipbridge image and runs the native integration tests; `yarn test` skips them. The E2E stack starts the gateway, sipbridge, two rtpbridge backends, SIP probes, RTP probes, WebRTC probes, and recording merge checks.
 
-Authenticate Docker to the canonical sipbridge registry with a project-scoped read-only pull credential before native tests. Offline `yarn test` skips the separately required native suite.
+Log Docker in to the sipbridge registry with a read-only pull credential first. See [local E2E](../development/local-e2e.md).

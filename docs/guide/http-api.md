@@ -10,7 +10,7 @@ When bearer auth is enabled, command and recording routes require:
 Authorization: Bearer <token>
 ```
 
-`GET /healthz` remains unauthenticated.
+`GET /healthz` and `GET /readyz` remain unauthenticated.
 
 ## Health
 
@@ -24,13 +24,15 @@ Response:
 { "ok": true, "calls": 0 }
 ```
 
-`GET /readyz` reports new-work admission independently of process liveness.
-Native connection loss, expired metadata, required media/route loss and drain
-return 503. Owner registration remains possible while unready.
+`GET /readyz` reports new-work admission separately from liveness. It returns 503
+during drain, without an admitting native session, or when media or routes are
+missing while `RTPBRIDGE_REQUIRED` or `ROUTES_REQUIRED` is set. Owners can still
+register routes while it is unready. See [operations](./operations.md#health).
 
-Native mutations whose replies are lost return HTTP 503 with
-`SIGNALING_UNKNOWN`; do not replay them. A known unavailable native session
-returns `SIGNALING_UNAVAILABLE`. Control WebSocket responses use the same codes.
+A native SIP command whose outcome is unknown, such as one whose reply was lost,
+returns HTTP 503 with `code: "SIGNALING_UNKNOWN"`; do not replay it. An
+unavailable native session returns 503 with `SIGNALING_UNAVAILABLE`. Control
+WebSocket responses use the same codes.
 
 ## Calls And Sessions
 

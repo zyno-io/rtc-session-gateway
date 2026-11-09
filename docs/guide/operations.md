@@ -5,23 +5,30 @@
 A production deployment needs:
 
 - `rtc-session-gateway` HTTP/control port.
-- A dedicated sipbridge native control endpoint reachable over verified mTLS.
+- An endpoint catalog file maintained by the deployment.
+- A sipbridge native control endpoint reachable over verified mTLS.
 - SIP carriers or SBCs reachable from sipbridge.
-- rtpbridge backends reachable from the gateway when media is enabled.
+- rtpbridge backends reachable from the gateway.
 - UDP media paths between rtpbridge and remote RTP/WebRTC peers.
 
 See [cross-cluster deployment](./cross-cluster.md) for separate application/edge networks, catalog publication and deployment responsibilities.
 
 ## Health
 
-`GET /healthz` reports process liveness and active SIP count. It stays healthy
-through dependency loss and drain so existing work can finish.
+`GET /healthz` reports process liveness and the active SIP call count. It stays
+healthy through dependency loss and drain so existing work can finish.
 
-`GET /readyz` requires native admission, fresh catalog metadata, required media
-capacity, local routes and a non-draining lifecycle. Failure returns 503 and
-withdraws new work without restarting the process. Native status is published
-from local routes/media/lifecycle even when the core is not yet admitting, which
-allows replacement bootstrap without a readiness cycle.
+`GET /readyz` returns 200 only when all of these hold:
+
+- A native session is connected and reconciled to a fresh signaling entry with `acceptNew=true`.
+- The gateway is not draining.
+- With `RTPBRIDGE_REQUIRED=true`, the media catalog is fresh with at least one admitting backend.
+- With `ROUTES_REQUIRED=true`, at least one dynamic or static route exists.
+
+Otherwise it returns 503. Use it to withdraw new traffic; it should not restart a
+process with active calls. The gateway reports its admission status to sipbridge
+even before sipbridge admits it, so a replacement can bootstrap without a
+readiness deadlock.
 
 ## Security
 
@@ -52,11 +59,11 @@ Applications must delete media sessions when calls finish, including sessions cr
 
 ### Rolling Deployments
 
-Start replacement capacity before draining an old gateway. Every startup has a
-fresh native application epoch. Register owner routes on the replacement before
-admitting calls. Retain the old native session and owner connections through drain.
-A memory-core restart creates a new state authority and invalidates its old calls;
-RTC fences those contexts rather than migrating them.
+Start replacement capacity before draining an old gateway. Each startup has a
+fresh native process epoch, so old and new gateways hold separate native sessions.
+Keep the old gateway's sipbridge and rtpbridge endpoints reachable until it exits.
+A sipbridge state-authority change, such as a restart with memory state, ends the
+calls held under the old authority; RTC does not migrate them.
 
 Existing HTTP-owned calls need a stable route to their owning instance for commands during drain; a shared Service that removes that instance on readiness failure is insufficient. Persistent control WebSockets already retain that connection affinity, provided the load balancer preserves established connections when readiness changes. Application route registrations are local to each gateway, so register them on replacements before sending new calls there.
 
@@ -89,4 +96,4 @@ Choose a longer drain window for long calls. Keep media backends, SIP routing, a
 
 ## Local Compose
 
-Set `SIPBRIDGE_IMAGE` to the pin in `dependencies/sipbridge-runtime.json` (Docker login required). `yarn e2e:compose` starts the complete local simulation stack and tears it down after the run. Set `RTPBRIDGE_IMAGE` to test a specific rtpbridge image, or `RTPBRIDGE_LOCAL_CHECKOUT` to build one from a local checkout.
+Set `SIPBRIDGE_IMAGE` to the pin in `dependencies/sipbridge-runtime.json`; pulling it requires a registry login (see [local E2E](../development/local-e2e.md)). `yarn e2e:compose` starts the complete local simulation stack and tears it down after the run. Set `RTPBRIDGE_IMAGE` to test a specific rtpbridge image, or `RTPBRIDGE_LOCAL_CHECKOUT` to build one from a local checkout.

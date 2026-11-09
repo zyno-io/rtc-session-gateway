@@ -1,53 +1,56 @@
 # Direct native discovery contract v2
 
-This is the public endpoint-file contract consumed by the native RTC client.
-The gateway consumes v2 and native sipbridge control. Source implementation and
-local acceptance do not authorize a deployment or establish production qualification.
+This is the endpoint-file contract the gateway reads from `RTC_ENDPOINTS_FILE` to
+reach sipbridge native control and rtpbridge. Operator-facing setup is in
+[cross-cluster deployment](../guide/cross-cluster.md).
 
 Download the [JSON Schema](/contracts/endpoint-catalog-v2.schema.json) and
 [synthetic example](/contracts/endpoint-catalog-v2.example.json).
 
 ## Ownership and transport
 
-A deployment supplies an atomically replaced file, using its own configuration
-process or optional discovery publisher. RTC consumes `RTC_ENDPOINTS_FILE`. It
-connects directly to sipbridge and rtpbridge; the sidecar never handles SIP/control
-messages, routes, leases, tags or application tunnels. Each section has independent
-revision and required expiry. IDs are unique within a section. Missing sections,
-invalid documents and unknown versions fail admission; there is no SRF/DNS fallback.
-A bad replacement cannot extend the previous valid document's original expiry.
+The deployment supplies an atomically replaced file, through its own configuration
+process or an optional discovery publisher. RTC only reads the file and connects
+directly to sipbridge and rtpbridge. The publisher never handles SIP or control
+messages, routes, leases or tunnels. Each section has its own revision and required
+expiry, and IDs are unique within a section. Missing sections, invalid documents
+and unknown versions are rejected, with no DNS fallback. A bad or missing
+replacement cannot extend the previous valid document's expiry.
 
 Signaling uses WSS `/v1/control`, subprotocol `sipbridge.control.json.v1`, JSON text
-frames and mutual TLS. Connect to the URL address while verifying `tlsServerName`;
-never disable certificate validation. Mount `SIPBRIDGE_TLS_CERT_FILE`,
-`SIPBRIDGE_TLS_KEY_FILE`, `SIPBRIDGE_TLS_CA_FILE` separately from discovery credentials.
-Media keeps its existing endpoint entry shape and existing HMAC/CA file configuration. Catalogs
-contain only public endpoint metadata, never credentials or private registry frames.
+frames and mutual TLS. RTC connects to the URL address and verifies the server
+certificate against `tlsServerName`, and requires sipbridge's negotiated instance
+ID to equal the entry `id`. The controller identity comes from
+`SIPBRIDGE_TLS_CERT_FILE`, `SIPBRIDGE_TLS_KEY_FILE` and `SIPBRIDGE_TLS_CA_FILE`, never
+from publisher credentials. Media entries keep the existing rtpbridge
+control/recordings/TURN shape and the existing HMAC/CA file configuration.
+Catalogs contain only endpoint metadata, never credentials or registry frames.
 
 ## Lifecycle and admission
 
-Connect to a known fresh signaling entry even when `acceptNew=false`. Core admission
-can remain false until RTC establishes its native session and reports application
-status. Sending that status must depend on routes, media and application lifecycle,
-not the core's Pod readiness, which would deadlock bootstrap. New calls require a
-fresh eligible endpoint plus actual native session readiness. Expired discovery
-withdraws new admission; it does not close retained native/media sessions or calls.
-Expired metadata must never select a new backend for a new operation.
+RTC connects to a fresh signaling entry even when it has `acceptNew=false`.
+sipbridge may withhold its own admission until RTC has connected and reported
+application status. RTC derives that status from local routes, media and
+lifecycle, never from sipbridge's readiness, which avoids a bootstrap deadlock.
+New calls require a fresh entry with `acceptNew=true` and a reconciled native
+session. Expired signaling refuses new calls; sessions carrying calls stay open,
+and idle sessions close. Expired media never selects a backend for new work.
 
-RTC owns hello, process identity/epoch, monotonic connection attempts, leases,
-heartbeats, command correlation, route decisions, status and drain. The wire field
-`hello.nexus` identifies the RTC process and does not require a Nexus service.
-Use the canonical sipbridge protocol for exact frame validation and error handling.
-A memory-core authority change invalidates old contexts; never replay uncertain
-operations or migrate retained calls silently. Drain first withdraws new admission,
-continues existing work, and waits for the configured shutdown budget before bounded cleanup.
+RTC owns hello, process identity and epoch, monotonic connection attempts, lease
+use, heartbeats, command correlation, route decisions, status and drain. The wire
+field `hello.nexus` identifies the RTC process; it does not name an external
+service. Frame validation follows the pinned sipbridge contract. A sipbridge
+state-authority change ends old contexts; RTC never replays uncertain operations
+or migrates retained calls. Drain withdraws new admission, continues existing work
+until it finishes or `SHUTDOWN_MAX_WAIT_MS` expires, then runs bounded cleanup.
 
 ## Application acceptance gate
 
-Before activating an immutable native RTC image, verify v2 parsing,
-independent section expiry, invalid replacement retention, verified native TLS/SNI,
-hello/lease/heartbeat/reconnect, non-admitting bootstrap, route status/decisions,
-media HMAC and recordings, stale-discovery admission, authority changes and drain.
-Prove direct SIP/media operation against real native services; schema and registry
-fixtures alone do not qualify a deployment or production. Consuming deployments
-own their image selection, readiness, activation and acceptance gates.
+The repository tests cover v2 parsing, independent section expiry, invalid
+replacement retention, verified native TLS/SNI and client URI rejection,
+reconnect without replay, non-admitting bootstrap, stale-signaling admission,
+authority changes, media HMAC and recordings, and drain. They run against real
+sipbridge and rtpbridge processes with synthetic credentials; see
+[testing](./testing.md). These tests do not qualify a deployment. Consuming
+deployments own image selection, readiness, activation and their own acceptance
+on the target network.

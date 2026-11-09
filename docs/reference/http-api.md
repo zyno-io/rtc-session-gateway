@@ -5,17 +5,19 @@
 | Method | Path       | Description                                                                                                |
 | ------ | ---------- | ---------------------------------------------------------------------------------------------------------- |
 | `GET`  | `/healthz` | Process liveness and active SIP call count.                                                                |
-| `GET`  | `/readyz`  | Admission readiness; 503 on drain, native signaling loss or required route/media/discovery unavailability. |
+| `GET`  | `/readyz`  | Admission readiness; 503 on drain, without an admitting native session, or when required routes/media are missing. Body `{ok, draining}`. |
 
 ## Admission Status
 
+Uses the configured bearer authentication.
+
 | Method | Path              | Description                                                                                             |
 | ------ | ----------------- | ------------------------------------------------------------------------------------------------------- |
-| `GET`  | `/routing/status` | Local admission/drain state, route count and media catalog revision/expiry/eligible count/reload error. |
+| `GET`  | `/routing/status` | `{acceptNew, draining, routeCount, media}`; `media` holds catalog `valid`, `revision`, `validUntil`, `eligibleBackends` and reload `error`. |
 
-Native SIP routing uses the authenticated sipbridge control session. Application
-owners register routes through RTC's control API or configure static HTTP routes.
-The removed `/routing/lookup` and `/drachtio/route` endpoints return 404.
+sipbridge delivers inbound SIP over the authenticated native session. Application
+owners register routes through the control WebSocket or configure static HTTP
+routes. `/routing/lookup` and `/drachtio/route` are no longer served.
 
 ## Calls
 
