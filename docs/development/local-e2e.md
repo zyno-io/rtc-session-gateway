@@ -4,8 +4,12 @@ Run:
 
 ```sh
 export SIPBRIDGE_IMAGE=$(node -p 'require("./dependencies/sipbridge-runtime.json").image')
+node scripts/prepare-sipbridge-runtime.mjs
 yarn e2e:compose
 ```
+
+`prepare-sipbridge-runtime.mjs` pulls the pinned image and verifies its revision
+label and schema receipt; the Compose runner uses `SIPBRIDGE_IMAGE` as given.
 
 The runner:
 
@@ -22,12 +26,13 @@ The runner:
 - Drains a gateway on repeated SIGTERM while live SIP/RTP continues, finishes an admitted INVITE, rejects new work, and verifies successful process exit. Also checks deadline-driven SIP/media cleanup and a fresh gateway restart.
 - Tears the compose project down after success or failure.
 
-Native SIP uses the canonical private image pinned in
-`dependencies/sipbridge-runtime.json`. Docker must be authenticated to
-`gcr.s24.dev` with a project-scoped `read_registry` deploy token. `yarn test:native`
-extracts the binary from that exact image and verifies its canonical schema
-receipt before driving real SIP peers. Do not copy private Go source into CI.
-Native control remains verified mTLS in both media modes.
+Native SIP uses the image pinned in `dependencies/sipbridge-runtime.json`. Its
+registry, `gcr.s24.dev`, requires authentication; log Docker in with a read-only
+pull credential. `yarn test:native` extracts the binary from that exact image,
+verifies its schema receipt, and runs `test/sipbridge-native.test.ts` against real
+SIP peers. No sipbridge source checkout is used. Native control uses verified mTLS
+in both media modes; `E2E_SECURE` only switches rtpbridge between TLS/HMAC and
+plaintext.
 
 ## rtpbridge Image Selection
 
@@ -65,7 +70,7 @@ The configuration allows HTTP playback from `http://gateway:18080` at `10.89.42.
 
 ## Continuous Integration
 
-The `CI` workflow runs offline unit/build/docs checks on all pull requests. Native integration and both E2E transport modes run on same-repository pull requests and trusted pushes/workflow calls. Fork pull requests have no registry credentials and must receive a trusted native run before acceptance. Each E2E job checks out and builds the latest `zyno-io/rtpbridge` `main`, printing the backend commit for reproducibility. Native tests and both modes must pass before publishing the gateway's `main` image. The release workflow calls the same checks before publishing tagged images.
+The `CI` workflow runs offline unit/build/docs checks on all pull requests. Native integration and both E2E transport modes run on same-repository pull requests, pushes to `main` and workflow calls. Fork pull requests skip those jobs because they have no registry credentials; run the native and E2E suites from a trusted branch before merging. Each E2E job checks out and builds the latest `zyno-io/rtpbridge` `main`, printing the backend commit for reproducibility. Native tests and both modes must pass before publishing the gateway's `main` image. The release workflow calls the same checks before publishing tagged images.
 
 E2E jobs have a 30-minute timeout, retain runner and Compose logs, a JSON result, and the validated merged recording, and remove the Compose stack on failure as well as success. To retain those artifacts locally:
 
@@ -83,15 +88,16 @@ If port `3001` is already occupied, select another host port for both the compos
 E2E_GATEWAY_PORT=13001 yarn e2e:compose
 ```
 
-The stack uses an authoritative file catalog with two backend IDs on distinct
-control ports. Both CI transport modes validate atomic admission removal,
-strict call affinity and recording access while a backend is non-admitting. Secure
-mode uses endpoint TLS names even when the global default differs. Docker Desktop
-file propagation is synchronized through the observed catalog revision.
+The runner writes the catalog itself: one sipbridge signaling entry and two
+media backend IDs on distinct control ports, refreshed every 5 seconds with a
+30-second expiry. Both transport modes validate atomic admission removal, strict
+call affinity and recording access while a backend is non-admitting. Secure mode
+uses endpoint TLS names even when the global default differs. The runner waits
+for `/routing/status` to report the new catalog revision, which also covers
+delayed Docker Desktop file propagation.
 
-CI uses GitHub secrets `SIPBRIDGE_REGISTRY_USERNAME` and
-`SIPBRIDGE_REGISTRY_TOKEN`, from a sipbridge project deploy token with only
-`read_registry`. The current token expires 2027-11-08; rotate it in GitLab and
-replace both GitHub secrets before expiry. These credentials only pull images;
-publication remains owned by sipbridge's GitLab pipeline. Fork code must never
-run with these secrets through `pull_request_target`.
+CI pulls the sipbridge image with GitHub secrets `SIPBRIDGE_REGISTRY_USERNAME`
+and `SIPBRIDGE_REGISTRY_TOKEN`, from a sipbridge deploy token limited to
+`read_registry`. Rotate the token before it expires and update both secrets.
+These credentials only pull images. Never expose them to fork code, for example
+through `pull_request_target`.

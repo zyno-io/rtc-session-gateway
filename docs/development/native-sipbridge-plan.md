@@ -1,92 +1,95 @@
-# Native sipbridge application implementation plan
+# Native sipbridge implementation notes
 
-This plan implements the application half of the already merged discovery/platform
-work. It does not enable production. Source code, protocol integration tests and
-real media acceptance are separate evidence scopes.
+Status: implemented. This page records the design decisions behind RTC's native
+sipbridge client and how they are tested. [ARCHITECTURE.md](https://github.com/zyno-io/rtc-session-gateway/blob/main/ARCHITECTURE.md),
+the [discovery contract](./native-discovery-contract.md) and the
+[deployment guide](../guide/cross-cluster.md) own current behavior. Source,
+protocol integration tests and deployment acceptance are separate evidence
+scopes; nothing here qualifies a deployment.
 
-## 1. Pin the public native contract
+## 1. Pinned native contract
 
-Import the canonical schema and its generated TypeScript JSON types/field metadata
-at a recorded source revision matching sipbridge's schema receipt. Keep strict
-canonical JSON validation, uint64 bigint handling, byte/base64 preservation,
-correlation and bounded mTLS transport independent of private Talk packages.
-Add a local provenance/hash check; protocol changes start in the schema owner.
-Do not hand-maintain a second message catalog or modify the native Go reducers.
+RTC imports sipbridge's schema and generated TypeScript JSON types/field metadata
+at one recorded revision, with hashes in `dependencies/sipbridge-contract.json`
+(see [dependency receipts](https://github.com/zyno-io/rtc-session-gateway/blob/main/dependencies/README.md)).
+The client keeps strict canonical JSON validation, uint64 bigint handling,
+byte/base64 preservation, correlation and bounded mTLS transport within this
+repository. Protocol changes start in sipbridge; RTC does not maintain a second
+message catalog.
 
-## 2. Consume public catalog v2
+## 2. Catalog v2
 
-Validate the whole document, both independently expiring sections, unique bounded
-IDs, direct native control paths, TLS names and existing media/recording/TURN
-shapes. Missing initial data is unavailable. Preserve the last valid document only
-until its original section expiries; malformed/deleted/expired replacement data
-cannot renew it. Retain endpoint identity for established calls/recording access.
-A configured catalog has no host/DNS or v1 compatibility fallback. Keep explicit
-media-only standalone configuration where no catalog is configured.
+The whole document is validated: both independently expiring sections, unique
+bounded IDs, the native control path, TLS names and the existing
+media/recording/TURN shapes. Missing initial data means unavailable. The last
+valid document is kept only until its original section expiries; malformed,
+deleted or stale replacements cannot renew it. Endpoint identity is retained for
+established calls and recording access. A configured catalog has no DNS or v1
+fallback.
 
-## 3. Implement native session ownership
+## 3. Native session ownership
 
-RTC creates one startup process epoch and monotonically increasing connection
-attempt per signaling endpoint. Maintain bounded reconnect/backoff and re-read
-client key/certificate/CA files for new handshakes. Validate native hello version,
-capabilities, identity, state authority, lease and bounds. Bootstrap against fresh
-non-admitting endpoints. Publish status from routes/media/lifecycle, never from
-core readiness; new-call selection additionally requires native and catalog
-eligibility. Heartbeat/session loss fails pending RPCs without ending retained
-calls or replaying commands. Authority changes fence old contexts explicitly.
+Each startup creates a random process epoch; connection attempts increase
+monotonically. Reconnect backoff starts at 250 ms and is capped at 5 seconds.
+Client key, certificate and CA files are re-read for each handshake. The hello
+must negotiate the required capabilities, a matching instance ID, the state
+authority, lease and heartbeat bounds. RTC bootstraps against non-admitting
+entries and reports status from routes, media and lifecycle rather than
+sipbridge readiness. Session loss fails pending RPCs without ending retained calls
+or replaying commands; a changed state authority or lease term ends affected
+contexts.
 
-## 4. Native SIP/application boundary
+## 4. SIP/application boundary
 
-Implement typed ingress decisions, exact-context ingest, request/event receipts,
-application probes, context flow-adoption receipts and ephemeral credential lookup.
-Maintain only local context ownership/reference/sequence and policy state. Reject
-unknown retained contexts and unsupported methods without inventing authority.
-Sipbridge retains transaction/dialog/ACK/CANCEL/timer/write semantics.
+RTC implements typed ingress decisions, exact-context ingest, request and event
+receipts, application probes, flow-adoption receipts and ephemeral credential
+lookup. It keeps only local context ownership, reference, sequence and policy
+state, and rejects unknown contexts and unsupported methods. sipbridge keeps
+transaction, dialog, ACK, CANCEL, timer and write semantics.
 
-Serialize commands per context with command-time directory/delivery admission.
-Treat UNKNOWN, disconnect and timeout as uncertain; never replay a mutation.
-Native terminal proof and process authority changes drive bounded local cleanup.
-Protect event ordering/deduplication and command/event races, particularly cancelled
-INVITE while backend policy is pending and outbound CANCEL before a context exists.
+Commands serialize per context with command-time delivery admission. UNKNOWN
+results, disconnects and timeouts are uncertain and never replayed. Native
+terminal proof and authority changes drive local cleanup. Request and event
+receipts are deduplicated by fingerprint, so duplicate deliveries run owner
+policy once. A native CANCEL ends a pending inbound call even while owner policy
+is still running, and an outbound cancel requested before the native context
+exists is sent as soon as the context is returned.
 
-## 5. Preserve RTC application APIs
+## 5. Application APIs
 
-Replace `drachtio-gateway.ts` with SIP application orchestration using the native
-signaling layer. Preserve inbound owner pre-media decisions, static HTTP routing,
-outbound originate/cancel, caller identity and proxy/auth inputs, remote/local
-re-INVITE, BYE, owner events, reservations and disconnect cleanup. Use a native
-dialog reference in CallRegistry; expose no SRF types. Keep media/control commands,
-owner affinity and recording-prefix fencing unchanged. Remove drachtio-srf,
-Drachtio configuration, tagged route/fallback HTTP endpoints and SRF fixtures.
+`sip-gateway.ts` replaced the Drachtio gateway and preserves inbound pre-media
+owner decisions, static HTTP routing, outbound originate/cancel, caller identity
+and proxy/auth inputs, re-INVITE, BYE, owner events, reservations and disconnect
+cleanup. `CallRegistry` holds a native dialog reference. Media/control commands,
+owner affinity and recording-prefix fencing are unchanged. `drachtio-srf`,
+Drachtio configuration, tagged route/fallback HTTP endpoints and SRF fixtures were
+removed; see [configuration migration](../guide/configuration.md#native-protocol-and-migration).
 
 ## 6. Health, admission and shutdown
 
-Make health process-only and readiness independently require application routes,
-configured media, fresh discovery and eligible native connectivity. Publish
-non-admission immediately on drain, route withdrawal, media loss or source expiry.
-Continue retained native/media operations across discovery loss and planned drain.
-Keep the configured deployment drain and bounded forced cleanup; do not
-close native sessions before retained application work has finished.
+Health is process-only. Readiness requires an admitting native session and no
+drain, plus media and routes when `RTPBRIDGE_REQUIRED` and `ROUTES_REQUIRED` are
+set; see [operations](../guide/operations.md#health). Local admission withdraws
+when those conditions fail; native status reflects the change on the next refresh.
+Retained native and media work continues across discovery loss and planned drain.
+Planned shutdown keeps native control open for retained calls until they end or
+forced cleanup runs.
 
 ## 7. Verification
 
-- Catalog: independent expiry, invalid replacement retention, duplicate IDs,
-  malicious endpoints, no credentials/fallback, retained endpoints and recordings.
-- Sessions: real mTLS/SNI/URI authorization, strict JSON/capability/lease checks,
-  heartbeat deadlines, certificate reload, bounded reconnect and late replies.
-- Native calls: real sipbridge memory service with synthetic certificates and
-  SIP peers; inbound accept/reject, outbound answer/CANCEL/non-2xx, re-INVITE,
-  BYE, duplicate native events, uncertain operations, owner disconnect and drain.
-- Compose: replace Drachtio with independently pinned sipbridge; secure native
-  control in both media test modes. Exercise existing two-backend media/HMAC,
-  audio, TURN/WebRTC, recording and teardown scenarios against native signaling.
-- Run build, unit/integration tests, both media E2E profiles and documentation
-  build. Report actual evidence and any remaining environment constraints.
+| Area | Evidence |
+| --- | --- |
+| Catalog parsing, expiry, invalid replacement, affinity | `test/endpoint-catalog.test.ts` |
+| Canonical JSON, uncertainty fencing, reconnect inspection | `test/sipbridge-codec.test.ts` |
+| Inbound/outbound calls, CANCEL, re-INVITE, BYE, bootstrap, stale signaling, TLS name and client URI rejection, duplicate ingress, owner disconnect, reconnect, authority change, digest auth | `test/sipbridge-native.test.ts` via `yarn test:native` (pinned sipbridge, memory state, synthetic certificates) |
+| Two-backend media/HMAC, audio, TURN/WebRTC, recordings, teardown and drain over native signaling | `yarn e2e:compose`, in both media modes |
 
-## 8. Handoff and deployment
+No dedicated tests cover heartbeat deadlines or certificate reload on reconnect.
 
-Select tested RTC, sipbridge and rtpbridge images by immutable digest, configure
-application-owner routes and supply catalog v2 with the native controller identity.
-An optional catalog publisher belongs to the deployment; RTC requires no adapter
-image or private backend service. Verify native SIP/media/recording and full drain
-on the actual target network before activation. Do not treat local fixtures as
-production qualification.
+## 8. Deployment handoff
+
+A deployment selects tested RTC, sipbridge and rtpbridge images by digest,
+configures owner routes, and supplies catalog v2 and the native controller
+identity. Any catalog publisher belongs to the deployment; RTC needs no adapter
+image or private backend service. Verify native SIP, media, recordings and full
+drain on the target network before activation.

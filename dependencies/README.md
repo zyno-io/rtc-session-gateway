@@ -1,19 +1,23 @@
 # Native SIP dependency receipts
 
-`sipbridge-contract.json` records the sipbridge distribution repository/revision and
-hashes of its schema, matching generated JSON TypeScript types/validation metadata
-and canonical positive/negative wire fixtures. `yarn check:sipbridge-contract` fails
-on drift. Consume schema updates through sipbridge and import matching generated files
-and receipt hashes here. Sipbridge may coordinate upstream schema ownership with
-its other consumers; RTC does not require access to those repositories. Do not hand-edit or format generated
-files; `.oxfmtrc.json` excludes them and the canonical JSON test vectors.
+`sipbridge-contract.json` records the sipbridge repository and revision, plus hashes
+of the schema (`sipbridge-control.proto`), the generated TypeScript types and JSON
+validation metadata under `src/sipbridge/generated/`, and the canonical
+positive/negative wire fixtures (`sipbridge-json-cases.json`). `yarn
+check:sipbridge-contract`, which also runs as part of `yarn test`, fails on drift.
 
-`sipbridge-runtime.json` selects the immutable canonical GitLab image for required
-native integration and Compose tests. The preparation script verifies the image
-revision label and schema/generated-contract receipt before executing its binary.
-No private source checkout, embedded Go snapshot or image mirror is needed.
-The pinned runtime includes the memory outbound completion-capacity fix from
-sipbridge MR16. Publication stays owned by the canonical GitLab pipeline.
+Protocol changes start in sipbridge. To update, import the schema, generated files
+and receipt hashes that sipbridge publishes for one revision. Do not hand-edit or
+reformat generated files; `.oxfmtrc.json` excludes them and the JSON test vectors.
 
-CI pull credential scope, rotation and fork restrictions are documented in
-`docs/development/local-e2e.md`. Receipts and catalogs contain no credentials.
+`sipbridge-runtime.json` pins the immutable sipbridge image, by revision tag and
+digest, used by `yarn test:native` and the Compose E2E suite.
+`scripts/prepare-sipbridge-runtime.mjs` pulls that image and checks its revision
+label and embedded schema receipt against these files before the binary is used.
+`yarn test:native` and CI run this check; `yarn e2e:compose` uses `SIPBRIDGE_IMAGE`
+as given. No sipbridge source checkout is needed. sipbridge's own pipeline
+publishes the image.
+
+Registry pull credentials for CI are described in
+[local E2E](../docs/development/local-e2e.md#continuous-integration). Receipts and
+catalogs contain no credentials.

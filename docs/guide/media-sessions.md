@@ -1,6 +1,6 @@
 # Media Sessions
 
-Media sessions are backed by rtpbridge when `RTPBRIDGE_HOST` is configured.
+Media sessions are backed by the rtpbridge backends in the endpoint catalog's `media` section.
 
 ## Session Lifecycle
 
@@ -10,7 +10,7 @@ Create:
 { "type": "request", "id": "1", "method": "session.create", "params": { "callId": "call-1" } }
 ```
 
-When `COTURN_AUTH_SECRET` is configured, the response includes an `iceConfiguration` whose `backendId` and `mediaIp` come from the exact rtpbridge client selected for the session. Its STUN, TURN/UDP, TURN/TCP, and TURN-TLS URLs therefore address the coturn sidecar cohosted with that backend. Use this configuration before gathering the first browser offer.
+When `COTURN_AUTH_SECRET` or explicit ICE URLs are configured, the response includes an `iceConfiguration` for the rtpbridge backend selected for the session. Its URLs come from that backend's catalog `turn.urls`, then `COTURN_URLS_JSON`. Without either, the gateway returns STUN, TURN/UDP and TURN/TCP URLs on port 3478 of the backend's advertised IPv4 media address, for a cohosted coturn; it never invents a TLS TURN URL. TURN entries carry expiring credentials; STUN entries carry none. Use this configuration before gathering the first browser offer.
 
 TURN credentials default to a 24-hour lifetime. `expiresAt` is explicit so long-lived clients can request `webrtc.restartIce` before expiry. Every restart response carries a freshly minted `iceConfiguration` for the session's current backend; clients must replace their peer-connection ICE servers before answering the restart offer.
 

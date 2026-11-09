@@ -29,6 +29,7 @@ Current source layout is intentionally compact:
 
 - `src/config.ts`: environment parsing and defaults.
 - `src/sip-gateway.ts` and `src/sipbridge-signaling.ts`: SIP ingress, outbound origination, re-INVITE, BYE, and follow-up events.
+- `src/sipbridge/` and `src/endpoint-catalog.ts`: pinned native control client and catalog v2. See `ARCHITECTURE.md`.
 - `src/control-*`: WebSocket protocol, connection ownership, route registration, and gateway-initiated requests.
 - `src/http-*`: HTTP webhook contract, HTTP client, and management API.
 - `src/media-*` and `src/rtpbridge-client.ts`: rtpbridge backend selection, sessions, endpoints, playback, gather, leave-message, recording, and merge behavior.
@@ -64,7 +65,7 @@ Planned additions:
 
 - Sequence diagrams for inbound SIP answer/reject, outbound SIP origination, SIP-less WebRTC, bridge/unbridge, recording segment rollover, and leave-message.
 - Full JSON schema examples for every command, event, and HTTP body.
-- Compatibility matrix for Drachtio, Node, Yarn, Docker, and rtpbridge versions.
+- Compatibility matrix for sipbridge, Node, Yarn, Docker, and rtpbridge versions.
 - Security hardening guide for bearer auth, trusted networks, reverse proxies, and recording access.
 - Production deployment guide with Kubernetes examples.
 - Troubleshooting guide for SIP final responses, ICE failures, rtpbridge backend health, and recording merge failures.
@@ -76,8 +77,8 @@ See `docs/documentation-plan.md` for the detailed documentation backlog and acce
 
 GitHub Actions workflows:
 
-- `ci.yml`: on `main` push and pull request, enable Corepack, install with Yarn Berry, run tests, build TypeScript, build docs, and build the Docker image without pushing.
-- `release-image.yml`: on tag push, build and publish the Docker image to GHCR.
+- `ci.yml`: on `main` push and pull request, run offline tests, the TypeScript build and the docs build. On trusted events, also run the native sipbridge suite and both Compose E2E media modes; on `main` push, publish the `main` image to GHCR after all jobs pass.
+- `release-image.yml`: on tag push, run `ci.yml`, then build and publish the tagged Docker image to GHCR.
 - `docs.yml`: on `main` push, build VitePress and publish to GitHub Pages.
 
 The workflows use `yarn install --immutable` and the package-pinned Yarn Berry version from `packageManager`.
@@ -91,14 +92,15 @@ Keep tests close to behavior:
 - SIP gateway tests for unmatched INVITE, control-routed answer/reject, HTTP webhook fallback, outbound SIP, re-INVITE, and BYE.
 - HTTP API tests for command validation, auth, media endpoints, recording proxy, and recording merge.
 - Media service tests for rtpbridge backend pinning, endpoint lifecycle, bridge constraints, VAD-backed leave-message behavior, PCAP path safety, and merge validation.
-- Compose E2E tests for Drachtio, rtpbridge, SIP probes, RTP packet flow, WebRTC setup, recordings, merge, and media actions.
+- Native integration tests against the pinned sipbridge binary.
+- Compose E2E tests for sipbridge, rtpbridge, SIP probes, RTP packet flow, WebRTC setup, recordings, merge, and media actions.
 
 Before release:
 
 - `yarn test`
 - `yarn build`
 - `yarn docs:build`
-- `yarn e2e:compose` when Docker and the rtpbridge image are available.
+- `yarn test:native` and `yarn e2e:compose`, which need Docker and access to the pinned sipbridge image.
 
 ## Near-Term Work
 
@@ -106,5 +108,4 @@ Before release:
 - Add generated JSON schema or TypeScript declaration output for command/event payloads.
 - Add OpenAPI documentation for HTTP routes.
 - Add protocol conformance tests that run the same scenarios over WebSocket and HTTP.
-- Add CI path for optional compose E2E when Docker services are available in the runner.
 - Decide whether recording merge should support time-sorted packet merge in addition to ordered concatenation.

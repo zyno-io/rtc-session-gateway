@@ -44,6 +44,7 @@
             ],
             "properties": {
               "id": {
+                "description": "Must equal the sipbridge instance ID returned by the native hello.",
                 "type": "string",
                 "pattern": "^[a-zA-Z0-9._:-]{1,127}$"
               },

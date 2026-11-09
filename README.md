@@ -13,7 +13,7 @@ The gateway connects directly to sipbridge over verified mTLS for native SIP sig
 - HTTP management API with equivalent command routes for simple integrations and operations.
 - rtpbridge-backed media sessions with WebRTC, RTP, file playback, bridge/unbridge, DTMF injection, digit gathering, and leave-message support.
 - Recording start/stop/list/download/delete plus gateway-side ordered PCAP segment merge.
-- Docker Compose E2E tests with pinned sipbridge, two rtpbridge backends, coturn, SIP/RTP/WebRTC media, decoded recordings, and failure cleanup. CI runs both TLS/HMAC and plaintext modes before publishing images.
+- Native integration tests against the pinned sipbridge runtime, plus Docker Compose E2E tests with sipbridge, two rtpbridge backends, coturn, SIP/RTP/WebRTC media, decoded recordings, and failure cleanup. CI runs the native suite and both TLS/HMAC and plaintext media modes before publishing images.
 
 ## Documentation
 
@@ -44,7 +44,7 @@ yarn test
 yarn build
 ```
 
-Run the service locally against a configured sipbridge endpoint catalog and client certificate:
+Run the service locally with an endpoint catalog and sipbridge controller certificate configured (see [Configuration](#configuration)):
 
 ```sh
 yarn dev
@@ -58,7 +58,7 @@ yarn test:native
 yarn e2e:compose
 ```
 
-The native runtime is canonical/private; authenticate Docker with a project-scoped `read_registry` deploy token. `yarn test` runs offline tests; `yarn test:native` requires the pinned image and runs real native integration tests. See [native implementation plan](docs/development/native-sipbridge-plan.md) and [architecture](ARCHITECTURE.md).
+The pinned sipbridge image is in an authenticated registry; log Docker in with a read-only pull credential first (see [local E2E](docs/development/local-e2e.md)). `yarn test` runs offline and skips the native suite. `yarn test:native` verifies the pinned image against the contract receipt and runs the native integration tests. See [architecture](ARCHITECTURE.md) and [native implementation notes](docs/development/native-sipbridge-plan.md).
 
 The compose runner pulls the CI-published `ghcr.io/zyno-io/rtpbridge:main` image by default. To build and test a local rtpbridge checkout, set `RTPBRIDGE_LOCAL_CHECKOUT=/path/to/rtpbridge`. An explicit `RTPBRIDGE_IMAGE=registry.example.com/rtpbridge:tag` takes precedence over a local checkout. Set `E2E_GATEWAY_PORT` when host port `3001` is already in use.
 
@@ -66,21 +66,19 @@ The compose runner pulls the CI-published `ghcr.io/zyno-io/rtpbridge:main` image
 
 Core environment variables:
 
-- `RTC_ENDPOINTS_FILE`: atomically replaced public endpoint catalog v2 for native SIP and media.
-- `SIPBRIDGE_TLS_CERT_FILE`, `SIPBRIDGE_TLS_KEY_FILE`, `SIPBRIDGE_TLS_CA_FILE`: mounted native controller identity and server trust.
+- `RTC_ENDPOINTS_FILE`: required; atomically replaced endpoint catalog v2 listing the sipbridge control endpoint and rtpbridge media backends.
+- `SIPBRIDGE_TLS_CERT_FILE`, `SIPBRIDGE_TLS_KEY_FILE`, `SIPBRIDGE_TLS_CA_FILE`: required; mounted native controller identity and server trust.
 - `SIPBRIDGE_INSTANCE_ID`: optional process instance name; each startup gets a fresh epoch.
 - `HTTP_PORT`: HTTP/control port, defaults to `3001`.
 - `CONTROL_WS_PATH`: backend control WebSocket path, defaults to `/control`.
 - `CONTROL_AUTH_MODE`: `bearer` or `none`.
 - `CONTROL_AUTH_TOKEN`: bearer token for control WebSocket and protected HTTP command routes.
-- `RTPBRIDGE_HOST`: rtpbridge service DNS name or IP; enables media commands when set.
-- `RTPBRIDGE_PORT`: rtpbridge WebSocket port, defaults to `9100`.
-- `RTPBRIDGE_TLS`: set `true` for WSS control and HTTPS recording requests.
 - `RTPBRIDGE_AUTH_HMAC_SECRET_FILE`: mounted HMAC key file shared with rtpbridge.
-- `RTPBRIDGE_TLS_CA_FILE`: optional PEM CA bundle for private certificates.
-- `RTPBRIDGE_TLS_SERVERNAME`: optional TLS certificate name override.
+- `RTPBRIDGE_TLS_CA_FILE`: optional PEM CA bundle for private rtpbridge certificates.
 - `RECORDINGS_PATH`: rtpbridge recording root, defaults to `/var/lib/rtpbridge/recordings`.
 - `ROUTES_JSON`: static HTTP route table, defaults to `[]`.
+
+The service exits at startup without the catalog and all three `SIPBRIDGE_TLS_*` files. Media backends come from the catalog's `media` section. See [Configuration](docs/guide/configuration.md) for the full list.
 
 Example static routes:
 
