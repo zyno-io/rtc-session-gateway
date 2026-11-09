@@ -13,7 +13,7 @@ Coverage areas:
 - SIP call ID normalization.
 - Routing parse and match behavior.
 - Control WebSocket auth, route registration, request ownership, and timeouts.
-- Drachtio gateway inbound and outbound SIP behavior.
+- Native sipbridge inbound and outbound SIP behavior.
 - HTTP command routes.
 - rtpbridge backend selection and media session operations.
 - Recording proxy, recording path validation, and PCAP merge.

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://zyno-io.github.io/rtc-session-gateway/contracts/endpoint-catalog-v2.schema.json",
   "title": "RTC native endpoint catalog v2",
-  "description": "Platform handoff contract. Requires the separate native RTC implementation. IDs within each section must be unique. Consumers validate URL host/port and verify peer names.",
+  "description": "Public endpoint-file contract for direct sipbridge and rtpbridge connections. Any deployment-owned publisher may supply it. IDs within each section must be unique. Consumers validate URL host/port and verify peer names.",
   "type": "object",
   "additionalProperties": false,
   "required": [

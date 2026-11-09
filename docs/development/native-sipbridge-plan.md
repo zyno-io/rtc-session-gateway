@@ -64,7 +64,7 @@ Make health process-only and readiness independently require application routes,
 configured media, fresh discovery and eligible native connectivity. Publish
 non-admission immediately on drain, route withdrawal, media loss or source expiry.
 Continue retained native/media operations across discovery loss and planned drain.
-Keep the configured two-hour platform drain and bounded forced cleanup; do not
+Keep the configured deployment drain and bounded forced cleanup; do not
 close native sessions before retained application work has finished.
 
 ## 7. Verification
@@ -84,9 +84,9 @@ close native sessions before retained application work has finished.
 
 ## 8. Handoff and deployment
 
-Publish the reviewed RTC image and adapter image by immutable digest. Configure
-real application-owner routes. Select them and enable the Trusted workload in
-staging only after native acceptance. Verify delivered controller/server leaves,
-core bootstrap, native SIP/media/recording and full drain. Production activation
-remains a separate reviewed rollout. Do not treat test fixtures as production
-qualification, and do not enable a workload with the old SRF image.
+Select tested RTC, sipbridge and rtpbridge images by immutable digest, configure
+application-owner routes and supply catalog v2 with the native controller identity.
+An optional catalog publisher belongs to the deployment; RTC requires no adapter
+image or private backend service. Verify native SIP/media/recording and full drain
+on the actual target network before activation. Do not treat local fixtures as
+production qualification.

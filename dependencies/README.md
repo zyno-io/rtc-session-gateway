@@ -1,10 +1,11 @@
 # Native SIP dependency receipts
 
-`sipbridge-contract.json` records the canonical schema owner/revision and hashes
-of the copied schema, generated JSON TypeScript types/validation metadata and
-canonical positive/negative wire fixtures. `yarn check:sipbridge-contract` fails
-on drift. Update the schema in its owner first, regenerate there, then import a
-matching receipt and generated files here. Do not hand-edit or format generated
+`sipbridge-contract.json` records the sipbridge distribution repository/revision and
+hashes of its schema, matching generated JSON TypeScript types/validation metadata
+and canonical positive/negative wire fixtures. `yarn check:sipbridge-contract` fails
+on drift. Consume schema updates through sipbridge and import matching generated files
+and receipt hashes here. Sipbridge may coordinate upstream schema ownership with
+its other consumers; RTC does not require access to those repositories. Do not hand-edit or format generated
 files; `.oxfmtrc.json` excludes them and the canonical JSON test vectors.
 
 `sipbridge-runtime.json` selects the immutable canonical GitLab image for required
