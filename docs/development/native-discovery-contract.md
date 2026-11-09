@@ -1,6 +1,6 @@
 # Direct native discovery contract v2
 
-This is the implemented application/platform boundary for the native RTC client.
+This is the public endpoint-file contract consumed by the native RTC client.
 The gateway consumes v2 and native sipbridge control. Source implementation and
 local acceptance do not authorize a deployment or establish production qualification.
 
@@ -9,8 +9,8 @@ Download the [JSON Schema](/contracts/endpoint-catalog-v2.schema.json) and
 
 ## Ownership and transport
 
-A discovery sidecar watches two authenticated registries and atomically replaces one
-file. RTC consumes `RTC_ENDPOINTS_FILE`, without importing the platform SDK. It
+A deployment supplies an atomically replaced file, using its own configuration
+process or optional discovery publisher. RTC consumes `RTC_ENDPOINTS_FILE`. It
 connects directly to sipbridge and rtpbridge; the sidecar never handles SIP/control
 messages, routes, leases, tags or application tunnels. Each section has independent
 revision and required expiry. IDs are unique within a section. Missing sections,
@@ -21,7 +21,7 @@ Signaling uses WSS `/v1/control`, subprotocol `sipbridge.control.json.v1`, JSON 
 frames and mutual TLS. Connect to the URL address while verifying `tlsServerName`;
 never disable certificate validation. Mount `SIPBRIDGE_TLS_CERT_FILE`,
 `SIPBRIDGE_TLS_KEY_FILE`, `SIPBRIDGE_TLS_CA_FILE` separately from discovery credentials.
-Media keeps the v1 entry shape and existing HMAC/CA file configuration. Catalogs
+Media keeps its existing endpoint entry shape and existing HMAC/CA file configuration. Catalogs
 contain only public endpoint metadata, never credentials or private registry frames.
 
 ## Lifecycle and admission
@@ -40,7 +40,7 @@ heartbeats, command correlation, route decisions, status and drain. The wire fie
 Use the canonical sipbridge protocol for exact frame validation and error handling.
 A memory-core authority change invalidates old contexts; never replay uncertain
 operations or migrate retained calls silently. Drain first withdraws new admission,
-continues existing work, and waits up to 7200 seconds before bounded shutdown.
+continues existing work, and waits for the configured shutdown budget before bounded cleanup.
 
 ## Application acceptance gate
 
@@ -49,5 +49,5 @@ independent section expiry, invalid replacement retention, verified native TLS/S
 hello/lease/heartbeat/reconnect, non-admitting bootstrap, route status/decisions,
 media HMAC and recordings, stale-discovery admission, authority changes and drain.
 Prove direct SIP/media operation against real native services; schema and registry
-fixtures alone do not qualify the application or production. The platform chart
-keeps the workload disabled and image inputs empty until this gate is satisfied.
+fixtures alone do not qualify a deployment or production. Consuming deployments
+own their image selection, readiness, activation and acceptance gates.

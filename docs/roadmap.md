@@ -26,4 +26,4 @@
 - Add Kubernetes manifests or Helm examples.
 - Add metrics and dashboards.
 - Add optional compose E2E in CI.
-- Document recommended Drachtio and rtpbridge sizing.
+- Document recommended sipbridge and rtpbridge sizing.

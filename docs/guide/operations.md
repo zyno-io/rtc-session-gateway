@@ -10,7 +10,7 @@ A production deployment needs:
 - rtpbridge backends reachable from the gateway when media is enabled.
 - UDP media paths between rtpbridge and remote RTP/WebRTC peers.
 
-See [cross-cluster deployment](./cross-cluster.md) for separate application/edge networks, external adapter responsibilities, and current discovery limitations.
+See [cross-cluster deployment](./cross-cluster.md) for separate application/edge networks, catalog publication and deployment responsibilities.
 
 ## Health
 

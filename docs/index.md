@@ -1,6 +1,6 @@
 # rtc-session-gateway
 
-`rtc-session-gateway` is a standalone service for backend-controlled real-time communication. It accepts SIP through Drachtio, exposes a generic WebSocket and HTTP control surface, and uses rtpbridge for WebRTC, RTP, media actions, and raw PCAP recordings.
+`rtc-session-gateway` is a standalone service for backend-controlled real-time communication. It accepts SIP through native sipbridge, exposes a generic WebSocket and HTTP control surface, and uses rtpbridge for WebRTC, RTP, media actions, and raw PCAP recordings.
 
 ## What It Does
 

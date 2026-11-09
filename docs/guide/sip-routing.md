@@ -33,7 +33,7 @@ Static routes are loaded from `ROUTES_JSON` and post INVITE payloads to a config
 
 ## Outbound SIP
 
-Applications create outbound SIP calls with `sip.createOutbound` on the control WebSocket or `POST /calls` over HTTP. The application supplies the request URI and local SDP offer. The gateway creates a Drachtio UAC dialog and returns the remote SDP answer.
+Applications create outbound SIP calls with `sip.createOutbound` on the control WebSocket or `POST /calls` over HTTP. The application supplies the request URI and local SDP offer. The gateway creates a native sipbridge UAC dialog and returns the remote SDP answer.
 
 For carriers that challenge outbound requests with SIP digest authentication, include both a username and password:
 

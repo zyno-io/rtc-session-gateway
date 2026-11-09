@@ -5,7 +5,7 @@ This page tracks the VitePress documentation expansion. The goal is a public-qua
 ## Audiences
 
 - Application integrators need command examples, lifecycle diagrams, and error semantics.
-- Telephony engineers need SIP routing, Drachtio behavior, SDP ownership, re-INVITE behavior, and recording details.
+- Telephony engineers need SIP routing, sipbridge behavior, SDP ownership, re-INVITE behavior, and recording details.
 - Frontend/WebRTC engineers need browser signaling, ICE restart, endpoint lifecycle, and failure notification docs.
 - Operators need deployment, health, logging, security, rollback, and troubleshooting docs.
 - Maintainers need test strategy, local E2E, release, and compatibility docs.
@@ -101,6 +101,6 @@ The docs are ready for first public use when:
 - A new integrator can run the service locally from the docs alone.
 - A backend engineer can implement inbound SIP answer/reject without reading source.
 - A browser engineer can implement SIP-less WebRTC signaling without reading source.
-- An operator can deploy with Drachtio and rtpbridge and understand required network paths.
+- An operator can deploy with sipbridge and rtpbridge and understand required network paths.
 - Recording access and merge behavior are precise enough to build archival storage safely.
 - All examples pass a docs smoke test or are covered by tests in `test/` or `scripts/`.

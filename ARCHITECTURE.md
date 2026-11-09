@@ -2,7 +2,7 @@
 
 RTC owns application call/session policy and owner connections. sipbridge owns SIP
 transactions, dialogs, timers, retransmission, ACK/CANCEL construction and physical
-writes. rtpbridge owns media. Discovery supplies authenticated endpoint metadata;
+writes. rtpbridge owns media. A deployment-owned catalog supplies endpoint metadata;
 it neither proxies control nor grants call ownership. Runtime activation and real
 acceptance evidence remain distinct from source implementation.
 
@@ -60,3 +60,17 @@ non-admission before waiting for existing SIP/media/owner work. The native sessi
 stays alive until retained calls finish or bounded forced cleanup expires. HTTP
 and WebSocket command surfaces preserve owner affinity during drain. SRF, Drachtio
 shared secrets, tags, route callbacks and fallback transports are removed.
+
+## Public integration boundary
+
+RTC's runtime dependencies are sipbridge native control and rtpbridge media/
+recording APIs, plus application-owner HTTP or WebSocket connections. It imports
+no Zynotalk backend package and makes no backend registry/tunnel calls. The
+catalog file is a public deployment input: an operator, supervisor or optional
+discovery service can publish it. No particular publisher image or registry is
+required. Deployment charts, registry credentials and product-specific adapters
+belong to the consuming deployment, outside RTC's public contract.
+
+The contract receipt pins the schema distributed by sipbridge and generated
+bindings matching its published receipt. Sipbridge's wire field `hello.nexus`
+names the calling application process; it does not identify an external service.

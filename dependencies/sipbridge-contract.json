@@ -1,6 +1,6 @@
 {
-    "repository": "https://git.s24.dev/signal24/products/zyno/zynotalk-cluster-backends",
-    "source": "proto/sipbridge-control.proto",
+    "repository": "https://git.s24.dev/signal24/oss/sipbridge",
+    "source": "dependencies/sipbridge-control.proto",
     "schema_sha256": "8f9e6843aee6a74a932a597d8589abb52845452c7d500950332c0fd5b568ccca",
     "protoc": "3.21.12",
     "protoc_gen_go": "1.36.12",
@@ -12,8 +12,7 @@
     "digest_challenge_case_sha256": "01647794997aa864eab906cccfdacb010673b25d1c2ea6922a3a733878c26004",
     "wire_encoding": "json",
     "subprotocol": "sipbridge.control.json.v1",
-    "sipbridgeRevision": "bdd6a6f38ed585cbd048b10ee202616d2d4cc34b",
-    "canonicalRevision": "51512739448ff5c9264a0410405593bcd2d543a2",
+    "sipbridgeRevision": "81b868e6bc9917ce2aa1ad2e27d7d5aa04f69b1b",
     "files": {
         "schema": {
             "path": "dependencies/sipbridge-control.proto",

@@ -2,25 +2,20 @@
 
 ## Public Health
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/healthz` | Drachtio connection health and active SIP call count. |
-| `GET` | `/readyz` | Readiness for new work; 503 during drain or Drachtio disconnection. |
+| Method | Path       | Description                                                                                                |
+| ------ | ---------- | ---------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/healthz` | Process liveness and active SIP call count.                                                                |
+| `GET`  | `/readyz`  | Admission readiness; 503 on drain, native signaling loss or required route/media/discovery unavailability. |
 
-## Adapter Routing
+## Admission Status
 
-These routes use the configured HTTP bearer authentication. Configure bearer mode
-when exposing them to a transport adapter. They never call an application webhook
-or fallback router.
+| Method | Path              | Description                                                                                             |
+| ------ | ----------------- | ------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/routing/status` | Local admission/drain state, route count and media catalog revision/expiry/eligible count/reload error. |
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/routing/status` | Admission/drain state, process tag, route count and media catalog revision/expiry/eligible count/reload error. |
-| `POST` | `/routing/lookup` | Side-effect-free route match; body `{destinationUri, destinationUser?}`, response `{matched, acceptNew, tag?}`. |
-
-Lookup bodies are limited to 16 KiB. URI/user lengths are bounded to 2048/256
-characters. A match retains `matched=true` during drain or dependency loss but
-returns `acceptNew=false` without a tag. See [cross-cluster deployment](../guide/cross-cluster.md).
+Native SIP routing uses the authenticated sipbridge control session. Application
+owners register routes through RTC's control API or configure static HTTP routes.
+The removed `/routing/lookup` and `/drachtio/route` endpoints return 404.
 
 ## Calls
 

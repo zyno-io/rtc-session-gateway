@@ -1,20 +1,24 @@
 # Cross-Cluster Deployment
 
-RTC runs on the application network and connects directly to dedicated sipbridge
-and per-backend rtpbridge endpoints on the edge network. The discovery sidecar
-only publishes public metadata; native SIP/control traffic does not tunnel
-through platform adapters. RTC imports no private platform SDK.
+RTC connects directly to sipbridge for native SIP control and to rtpbridge for
+media control and recording access. Application owners use RTC's HTTP or control
+WebSocket API. These are the runtime integration boundaries; no Zynotalk backend,
+private SDK, registry client or signaling tunnel is required.
 
 ```mermaid
 flowchart LR
     O[Application owner] -->|HTTP or control WS| G[RTC gateway]
-    D[Discovery sidecar] -->|atomic catalog v2| G
-    D -->|authenticated metadata watches| R[Platform registries]
+    D[Operator or catalog publisher] -->|public catalog v2 file| G
     G -->|WSS mTLS native control| S[sipbridge]
     G -->|WSS HMAC and HTTPS recordings| M[rtpbridge]
     P[Remote SIP peers] <--> S
     P <--> M
 ```
+
+A deployment may use a discovery sidecar to create the catalog. It may also
+supply the file through its own supervisor or configuration process. RTC never
+contacts that publisher's registries or requires its implementation. Local Compose
+creates the catalog itself and runs with sipbridge and rtpbridge alone.
 
 ## Endpoint catalog and identity
 
@@ -44,7 +48,7 @@ Connect to known fresh signaling even with `acceptNew=false`. RTC publishes nati
 status from local routes/media/lifecycle independently of core admission. Owners
 can register routes while RTC is unready; readiness becomes available after local
 admission and fresh native/media capacity agree. `ROUTES_REQUIRED=true` and
-`RTPBRIDGE_REQUIRED=true` enforce those platform gates.
+`RTPBRIDGE_REQUIRED=true` enforce those admission gates.
 
 `SIP_ALLOWED_DOMAINS_JSON` limits new inbound INVITEs to exact Request-URI hosts
 before destination-user routing. Existing native dialogs retain their authority.
