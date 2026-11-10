@@ -108,6 +108,8 @@ services:
     image: ${SIPBRIDGE_IMAGE:?Set SIPBRIDGE_IMAGE to the qualified native runtime}
     environment:
       SIPBRIDGE_STATE_BACKEND: memory
+      # The expanded suite retains more than sixteen groups before their replay cutoff.
+      SIPBRIDGE_MEMORY_MAX_BYTES: '2147483648'
     command:
       - --instance
       - sipbridge-e2e

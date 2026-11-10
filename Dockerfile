@@ -24,7 +24,7 @@ CMD ["node", "."]
 FROM build AS e2e
 RUN apk add --no-cache coturn ffmpeg
 
-FROM node:24-alpine AS production
+FROM node:24-alpine AS runtime
 
 WORKDIR /app
 
@@ -42,3 +42,10 @@ COPY --from=build /app/dist ./dist
 ENV NODE_ENV=production
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "."]
+
+FROM e2e AS acceptance-controller
+RUN chown -R node:node /app
+USER node
+CMD ["node", "dist/acceptance/main.js"]
+
+FROM runtime AS production
