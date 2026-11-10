@@ -186,3 +186,16 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
             BUILD_VERSION=0.0.0-main
+
+      - name: Build And Publish Acceptance Controller
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          target: acceptance-controller
+          push: true
+          tags: ghcr.io/zyno-io/rtc-session-gateway:acceptance-main
+          labels: |
+            org.opencontainers.image.source=https://github.com/zyno-io/rtc-session-gateway
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            BUILD_VERSION=0.0.0-main

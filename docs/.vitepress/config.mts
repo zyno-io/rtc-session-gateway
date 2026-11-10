@@ -43,6 +43,7 @@ export default defineConfig({
                 text: 'Development',
                 items: [
                     { text: 'Testing', link: '/development/testing' },
+                    { text: 'Staging Acceptance', link: '/development/staging-acceptance' },
                     { text: 'Native Discovery Contract', link: '/development/native-discovery-contract' },
                     { text: 'Local E2E', link: '/development/local-e2e' },
                     { text: 'Native SIP Implementation', link: '/development/native-sipbridge-plan' },
@@ -52,9 +53,7 @@ export default defineConfig({
                 ]
             }
         ],
-        socialLinks: [
-            { icon: 'github', link: 'https://github.com/zyno-io/rtc-session-gateway' }
-        ],
+        socialLinks: [{ icon: 'github', link: 'https://github.com/zyno-io/rtc-session-gateway' }],
         footer: {
             message: 'Released by Zyno Consulting.',
             copyright: 'Copyright Zyno Consulting'

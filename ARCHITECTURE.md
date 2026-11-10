@@ -88,3 +88,20 @@ certificates. The Compose suite covers SIP, media, recordings and drain against
 real sipbridge and rtpbridge containers. None of these qualify a deployment
 network, delivered identities or production rollout; see
 [testing](docs/development/testing.md).
+
+## Staging acceptance owner
+
+`acceptance/main.ts` is a separate, opt-in test-controller entry point, published
+from this repository as an acceptance-controller image. It uses only RTC's public
+owner WebSocket API, registers exact test routes on each discovered process, and
+keeps ownership pinned to each connection. It has no Kubernetes API permissions,
+backend SDK, discovery-reader credential or native-controller private key.
+The normal gateway image/entry point does not launch it.
+
+Owner requests, per-call media and receipts are bounded. A control disconnect
+fails pending work and never replays a mutation; a replacement connection only
+registers fresh routes. Reports contain counters and scenario outcomes, never SIP,
+SDP, bearer tokens or raw upstream errors. Its HTTP listener binds loopback by
+default; mutation/report access requires the configured owner token. Tests against
+fixtures and its media smoke scenarios do not establish real audio/TURN/drain
+acceptance; the deployment runner must collect those separately.

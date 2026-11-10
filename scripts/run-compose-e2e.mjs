@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { SipStreamPeer } from './support/sip-stream-peer.mjs';
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -88,6 +89,7 @@ async function main() {
     await runOutboundSipScenario(control);
     await runOutboundCancelScenario(control);
     await runReinviteScenario(control);
+    await runAcceptanceControllerScenario();
     await runMultiBackendScenario();
     await runCatalogAdmissionScenario();
     await runMediaScenario();
@@ -250,6 +252,68 @@ async function runCatalogAdmissionScenario() {
         await control.request('session.delete', { sessionId: existing.sessionId });
         if (fresh) await control.request('session.delete', { sessionId: fresh.sessionId });
     }
+}
+
+async function runAcceptanceControllerScenario() {
+    step('Checking the RTC-owned acceptance controller bootstrap, SIP policy, media smoke and cleanup');
+    const dockerExec = code => {
+        try {
+            return execFileSync('docker', ['compose', '-f', composeFile, 'exec', '-T', 'gateway', 'node', '-e', code], {
+                env: { ...process.env, COMPOSE_PROJECT_NAME: projectName },
+                encoding: 'utf8'
+            });
+        } catch (error) {
+            if (error.stdout?.toString().trim().startsWith('{')) console.error(error.stdout.toString());
+            throw error;
+        }
+    };
+    dockerExec(
+        `const fs=require('node:fs');fs.writeFileSync('/tmp/acceptance-token','synthetic-acceptance-token');const child=require('node:child_process').spawn(process.execPath,['dist/acceptance/main.js'],{detached:true,stdio:'ignore',env:{...process.env,RTC_ACCEPTANCE_CONTROL_URL:'ws://127.0.0.1:3001/control',RTC_ACCEPTANCE_TOKEN_FILE:'/tmp/acceptance-token'}});fs.writeFileSync('/tmp/acceptance-pid',String(child.pid));child.unref();`
+    );
+    const invoke = async (path = '/report', body) =>
+        JSON.parse(
+            dockerExec(
+                `fetch('http://127.0.0.1:3002'+${JSON.stringify(path)},{method:${JSON.stringify(body ? 'POST' : 'GET')},headers:{Authorization:'Bearer synthetic-acceptance-token'},${body ? 'body:' + JSON.stringify(JSON.stringify(body)) : ''}}).then(async r=>{if(!r.ok)process.exit(1);console.log(await r.text())}).catch(()=>process.exit(1))`
+            )
+        );
+    const sip = await SipTcpClient.create();
+    try {
+        await eventually(async () => assert((await invoke()).controllerReady, 'acceptance owner should register before native admission'), 15000);
+        const denied = sip.buildInvite({ user: 'rtc-acceptance-reject' });
+        sip.send(denied.message);
+        const rejected = await sip.waitForFinalResponse(denied.callId, 10000);
+        assertEqual(rejected.status, 486, 'acceptance reject route');
+        sip.send(sip.buildAck(denied, rejected));
+        const invite = sip.buildInvite({ user: 'rtc-acceptance' });
+        sip.send(invite.message);
+        const answer = await sip.waitForFinalResponse(invite.callId, 10000);
+        assertEqual(answer.status, 200, 'acceptance answer');
+        sip.send(sip.buildAck(invite, answer));
+        sip.send(sip.buildBye(invite, answer));
+        const bye = await sip.waitForFinalResponse(invite.callId, 10000, '2 BYE');
+        assertEqual(bye.status, 200, 'acceptance BYE');
+        await eventually(async () => {
+            const report = await invoke();
+            assert(report.instances[0].counters.ended >= 1 && report.instances[0].activeCalls === 0, 'acceptance call/media cleanup');
+        }, 10000);
+        const networkReport = JSON.parse(
+            dockerExec(
+                `const child=require('node:child_process').spawnSync(process.execPath,['scripts/staging-acceptance.mjs'],{stdio:'inherit',env:{...process.env,RTC_ACCEPTANCE_GATEWAY_URL:'http://127.0.0.1:3001',RTC_ACCEPTANCE_ADVERTISE_IP:'10.89.42.20',RTC_ACCEPTANCE_SIP_HOST:'10.89.42.30',RTC_ACCEPTANCE_SIP_DOMAIN:'localhost',RTC_ACCEPTANCE_SIP_PORT:'5060',RTC_ACCEPTANCE_SIP_PLAINTEXT:'true',RTC_ACCEPTANCE_TOKEN_FILE:'/tmp/acceptance-token'}});process.exit(child.status??1);`
+            )
+        );
+        assert(
+            networkReport.ok === true && networkReport.checks.includes('decoded-recording'),
+            'RTC-owned network probe must prove decoded audio and recording'
+        );
+        if (process.env.E2E_ARTIFACTS_DIR)
+            writeFileSync(`${process.env.E2E_ARTIFACTS_DIR}/acceptance-network.json`, JSON.stringify(networkReport, null, 2));
+        const smoke = await invoke('/run', { scenario: 'media' });
+        assert(smoke.ok && smoke.checks.includes('recording-start-stop'), 'acceptance public media API smoke');
+    } finally {
+        sip.close();
+        dockerExec(`const fs=require('node:fs');process.kill(Number(fs.readFileSync('/tmp/acceptance-pid','utf8')),'SIGTERM');`);
+    }
+    await assertGatewayEmpty('acceptance controller cleanup');
 }
 
 async function runBackendAuthenticationScenario() {
@@ -1894,190 +1958,9 @@ class SipResponderClient {
 }
 
 class SipTcpClient {
-    constructor(socket, localPort) {
-        this.socket = socket;
-        this.localPort = localPort;
-        this.messages = [];
-        this.waiters = [];
-        this.buffer = '';
-        socket.on('data', data => this.receive(data.toString()));
+    static create() {
+        return SipStreamPeer.create({ host: sipHost, port: sipPort });
     }
-
-    static async create() {
-        const socket = net.createConnection({ host: sipHost, port: sipPort });
-        await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('SIP TCP connect timeout')), 10_000);
-            socket.once('connect', () => {
-                clearTimeout(timer);
-                resolve();
-            });
-            socket.once('error', reject);
-        });
-        return new SipTcpClient(socket, socket.address().port);
-    }
-
-    buildInvite({ user, sdp }) {
-        const callId = `${randomUUID()}@rtc-session-gateway-e2e`;
-        const fromTag = randomToken();
-        const branch = `z9hG4bK-${randomToken()}`;
-        const uri = `sip:${user}@${sipHost}:${sipPort}`;
-        const body = sdp || localSdp(this.localPort + 10);
-        const headers = [
-            `INVITE ${uri} SIP/2.0`,
-            `Via: SIP/2.0/TCP 127.0.0.1:${this.localPort};branch=${branch};rport`,
-            'Max-Forwards: 70',
-            `From: "E2E Caller" <sip:caller@127.0.0.1>;tag=${fromTag}`,
-            `To: <sip:${user}@127.0.0.1>`,
-            `Call-ID: ${callId}`,
-            'CSeq: 1 INVITE',
-            `Contact: <sip:caller@127.0.0.1:${this.localPort};transport=tcp>`,
-            'Content-Type: application/sdp',
-            `Content-Length: ${Buffer.byteLength(body)}`
-        ];
-        return {
-            callId,
-            fromTag,
-            uri,
-            cseq: 1,
-            message: `${headers.join('\r\n')}\r\n\r\n${body}`
-        };
-    }
-
-    buildAck(invite, response) {
-        const to = response.headers.to || response.headers.t;
-        const contact = response.headers.contact?.match(/<([^>]+)>/)?.[1] || invite.uri;
-        const headers = [
-            `ACK ${contact} SIP/2.0`,
-            `Via: SIP/2.0/TCP 127.0.0.1:${this.localPort};branch=z9hG4bK-${randomToken()};rport`,
-            'Max-Forwards: 70',
-            `From: "E2E Caller" <sip:caller@127.0.0.1>;tag=${invite.fromTag}`,
-            `To: ${to}`,
-            `Call-ID: ${invite.callId}`,
-            `CSeq: ${invite.cseq} ACK`,
-            `Contact: <sip:caller@127.0.0.1:${this.localPort};transport=tcp>`,
-            'Content-Length: 0'
-        ];
-        return `${headers.join('\r\n')}\r\n\r\n`;
-    }
-
-    buildReinvite(invite, response, sdp) {
-        const contact = response.headers.contact?.match(/<([^>]+)>/)?.[1] || invite.uri;
-        const message =
-            [
-                `INVITE ${contact} SIP/2.0`,
-                `Via: SIP/2.0/TCP 127.0.0.1:${this.localPort};branch=z9hG4bK-${randomToken()};rport`,
-                'Max-Forwards: 70',
-                `From: "E2E Caller" <sip:caller@127.0.0.1>;tag=${invite.fromTag}`,
-                `To: ${response.headers.to}`,
-                `Call-ID: ${invite.callId}`,
-                'CSeq: 2 INVITE',
-                `Contact: <sip:caller@127.0.0.1:${this.localPort};transport=tcp>`,
-                'Content-Type: application/sdp',
-                `Content-Length: ${Buffer.byteLength(sdp)}`
-            ].join('\r\n') + `\r\n\r\n${sdp}`;
-        return { ...invite, cseq: 2, message };
-    }
-
-    buildResponse(request, status, reason) {
-        const headers = [
-            `SIP/2.0 ${status} ${reason}`,
-            ...request.via.map(value => `Via: ${value}`),
-            `From: ${request.headers.from || request.headers.f}`,
-            `To: ${request.headers.to || request.headers.t}`,
-            `Call-ID: ${request.headers['call-id'] || request.headers.i}`,
-            `CSeq: ${request.headers.cseq}`,
-            'Content-Length: 0'
-        ];
-        return `${headers.join('\r\n')}\r\n\r\n`;
-    }
-
-    send(message) {
-        this.socket.write(message);
-    }
-
-    receive(chunk) {
-        this.buffer += chunk;
-        while (true) {
-            const parsed = takeSipMessage(this.buffer);
-            if (!parsed) return;
-            this.buffer = this.buffer.slice(parsed.raw.length);
-            this.messages.push(parsed);
-            for (const waiter of [...this.waiters]) {
-                if (!waiter.matches(parsed)) continue;
-                this.waiters = this.waiters.filter(candidate => candidate !== waiter);
-                clearTimeout(waiter.timer);
-                waiter.resolve(parsed);
-            }
-        }
-    }
-
-    waitForFinalResponse(callId, timeoutMs, cseq = '1 INVITE') {
-        return this.waitFor(
-            message => message.kind === 'response' && message.status >= 200 && message.headers['call-id'] === callId && message.headers.cseq === cseq,
-            timeoutMs
-        );
-    }
-
-    waitForRequest(method, callId, timeoutMs) {
-        return this.waitFor(message => message.kind === 'request' && message.method === method && message.headers['call-id'] === callId, timeoutMs);
-    }
-
-    waitFor(matches, timeoutMs) {
-        const existing = this.messages.find(matches);
-        if (existing) return Promise.resolve(existing);
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('timed out waiting for SIP message')), timeoutMs);
-            this.waiters.push({ matches, resolve, reject, timer });
-        });
-    }
-
-    close() {
-        this.socket.end();
-        this.socket.destroy();
-    }
-}
-
-function takeSipMessage(buffer) {
-    const separatorMatch = /\r?\n\r?\n/.exec(buffer);
-    if (!separatorMatch) return undefined;
-    const headEnd = separatorMatch.index;
-    const separatorLength = separatorMatch[0].length;
-    const head = buffer.slice(0, headEnd);
-    const contentLengthLine = head.split(/\r?\n/).find(line => /^content-length\s*:/i.test(line));
-    const contentLength = Number(contentLengthLine?.split(':')[1]?.trim() || 0);
-    const totalLength = headEnd + separatorLength + contentLength;
-    if (buffer.length < totalLength) return undefined;
-    return parseSipMessage(buffer.slice(0, totalLength));
-}
-
-function parseSipMessage(raw) {
-    const [head, body = ''] = raw.split(/\r?\n\r?\n/);
-    const lines = head.split(/\r?\n/);
-    const startLine = lines.shift() || '';
-    const headers = {};
-    const via = [];
-    for (const line of lines) {
-        const index = line.indexOf(':');
-        if (index < 0) continue;
-        const name = line.slice(0, index).trim().toLowerCase();
-        const value = line.slice(index + 1).trim();
-        if (name === 'via' || name === 'v') via.push(value);
-        headers[name] = value;
-    }
-    if (startLine.startsWith('SIP/2.0')) {
-        const match = /^SIP\/2\.0\s+(\d+)/.exec(startLine);
-        return {
-            kind: 'response',
-            raw,
-            startLine,
-            status: Number(match?.[1] || 0),
-            headers,
-            via,
-            body
-        };
-    }
-    const [method, uri] = startLine.split(/\s+/);
-    return { kind: 'request', raw, startLine, method, uri, headers, via, body };
 }
 
 function localSdp(port) {
