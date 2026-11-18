@@ -18,6 +18,8 @@ export class FirewallReconciler {
     private digest?: string;
     private initialized = false;
     private readonly mirror = new Map<string, number>();
+    /** Targets whose last kernel add failed; they must not suppress the narrower bans they would cover. */
+    private readonly addFailed = new Set<string>();
     private applying?: Promise<void>;
     private pending = false;
     readonly status = {
@@ -127,20 +129,17 @@ export class FirewallReconciler {
                     if (expiresAt <= this.now() || allow.some(entry => overlaps(range, entry))) continue;
                     if (covering?.family === range.family && covering.first <= range.first && covering.last >= range.last) continue;
                     desired.set(block.target, expiresAt);
-                    covering = range;
+                    if (!this.addFailed.has(block.target)) covering = range;
                 }
+                for (const target of this.addFailed) if (!desired.has(target)) this.addFailed.delete(target);
                 // Each kernel operation is isolated: one rejected target must not abort or wipe the rest.
-                const failures: { target: string; error: unknown }[] = [];
+                const failures: { target: string; op: 'add' | 'remove'; error: unknown }[] = [];
                 const attempt = async (op: 'add' | 'remove', target: string, fn: () => Promise<void>) => {
                     try {
                         await fn();
                         return true;
                     } catch (error) {
-                        logger.error(
-                            { target, op, err: error instanceof Error ? error.message : String(error) },
-                            'Firewall backend operation failed'
-                        );
-                        failures.push({ target, error });
+                        failures.push({ target, op, error });
                         return false;
                     }
                 };
@@ -154,9 +153,24 @@ export class FirewallReconciler {
                     }
                     const remaining = expiresAt - this.now();
                     if (remaining <= 0) continue;
-                    if (await attempt('add', target, () => this.backend.add(target, Math.ceil(remaining / 1000)))) this.mirror.set(target, expiresAt);
+                    if (await attempt('add', target, () => this.backend.add(target, Math.ceil(remaining / 1000)))) {
+                        this.mirror.set(target, expiresAt);
+                        this.addFailed.delete(target);
+                    } else this.addFailed.add(target);
                 }
                 if (failures.length) {
+                    // One bounded summary per pass; per-operation logging could emit thousands of lines every few seconds.
+                    logger.error(
+                        {
+                            failed: failures.length,
+                            sample: failures.slice(0, 5).map(({ target, op, error }) => ({
+                                target,
+                                op,
+                                err: error instanceof Error ? error.message : String(error)
+                            }))
+                        },
+                        'Firewall backend operations failed'
+                    );
                     const first = failures[0].error;
                     const error = new Error(
                         failures.length === 1 && first instanceof Error

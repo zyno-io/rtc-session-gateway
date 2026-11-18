@@ -204,3 +204,10 @@ test('manual bans do not leak parsed ranges into serialized output and still mat
     assert.doesNotThrow(() => JSON.stringify(firewall.snapshot()));
     assert.deepEqual(Object.keys(firewall.blocks()[0]).sort(), ['expiresAt', 'kind', 'reason', 'target']);
 });
+
+test('a source in ::/64 is not auto-banned because its /64 would cover IPv6 loopback', () => {
+    const firewall = new SipFirewall(config({ threshold: 1 }), () => start);
+    firewall.observe('::2', 'scan', 'no-route');
+    assert.equal(firewall.shouldReject('::1'), false);
+    assert.equal(firewall.snapshot().blocks.length, 0);
+});

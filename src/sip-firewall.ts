@@ -142,8 +142,8 @@ export class SipFirewall extends EventEmitter {
             return;
         }
         // Loopback is never scored; IPv6 sources are scored and banned per /64 so rotating within a prefix accumulates.
-        if (overlapsLoopback(addressRange(ip))) return;
         const key = scoreKey(ip);
+        if (overlapsLoopback(addressRange(ip)) || overlapsLoopback(addressRange(key))) return;
         if (this.isAllowed(key) || this.shouldReject(ip)) return;
         const now = this.now();
         if (transactionId) {

@@ -234,3 +234,27 @@ test('a silent owner whose last snapshot is stale can be replaced by an instance
     reconciler.accept(earlier());
     assert.equal(reconciler.state.instanceId, 'owner-b');
 });
+
+test('a covering range whose add keeps failing does not permanently drop the narrower bans it covers', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expires = new Date(start + 10000).toISOString();
+    reconciler.accept(snapshot(1, [{ target: '198.51.100.7', expiresAt: expires }]));
+    await reconciler.reconcile();
+    const originalAdd = backend.add.bind(backend);
+    backend.add = async (target, ttl) => {
+        if (target === '198.51.100.0/24') throw new Error('rejected');
+        return originalAdd(target, ttl);
+    };
+    reconciler.accept(
+        snapshot(2, [
+            { target: '198.51.100.7', expiresAt: expires },
+            { target: '198.51.100.0/24', expiresAt: expires }
+        ])
+    );
+    await assert.rejects(reconciler.reconcile(), /rejected/);
+    await assert.rejects(reconciler.reconcile(), /rejected/);
+    await assert.rejects(reconciler.reconcile(), /rejected/);
+    assert.equal(backend.calls.filter(call => call === 'add 198.51.100.7 10').length, 2);
+    assert.equal(reconciler.state.active, 1);
+});
