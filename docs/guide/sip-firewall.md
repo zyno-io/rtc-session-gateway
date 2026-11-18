@@ -26,9 +26,17 @@ creates no RTC call context.
 Order for a fresh request:
 
 1. A gateway that is draining, not connected or not admitting answers 503. This is never scored.
-2. A banned source gets 403, for any method. It is not scored again and its ban is not extended.
-3. An INVITE for an unknown host or without a route gets 404 and one observation for its source.
-4. Everything else proceeds to the normal owner decision.
+2. A banned source gets 403 for any request sipbridge presents to the gateway. It is not scored again and its ban is not extended. sipbridge answers OPTIONS itself, so OPTIONS never reaches this check; only the kernel ban stops an OPTIONS flood.
+3. REGISTER and SUBSCRIBE get 405, requests for a forgotten dialog get 481, other unanswerable first requests are refused, and a flow change gets 403. None of these is scored.
+4. An INVITE for an unknown host or without a route gets 404 and one observation for its source. With `SIP_FIREWALL_MODE=off` this check does not run at admission and the ordinary handler answers the 404.
+5. Everything else proceeds to the normal owner decision.
+
+A no-route 404 is returned but not scored while the gateway cannot know whether the
+route should exist: when control routing is in use (no static routes, or owners have
+connected) and no control owner is connected, and for `SIP_FIREWALL_ROUTE_GRACE_MS`
+(default 300000, 5 minutes) after any control owner disconnects. Valid carrier traffic
+for a DID whose owner is briefly away therefore does not earn bans. An unknown-host 404
+is always scored.
 
 Scores decay with a ten-minute half-life and ban at 10. Ordinary route failures
 weigh 1, plausible North American numbers weigh 0.25 and suspicious international
@@ -37,8 +45,10 @@ Automatic bans last 15 minutes, then 1 hour, 6 hours and 24 hours. Tier memory
 expires seven days after the last ban. This is an abuse detector, not a rate
 limiter for otherwise valid calls.
 
-Retransmissions of one transaction are scored once, keyed by Call-ID and CSeq with a
-short-lived bounded marker. Loopback sources are never scored or banned. IPv6 sources
+Every fresh request sipbridge presents is its own observation. sipbridge absorbs
+same-branch retransmissions, so one transaction is scored once, while a scanner that
+reuses a Call-ID and CSeq with new tags or branches per target is scored per request.
+Loopback sources are never scored or banned. IPv6 sources
 are scored and banned per /64 so a scanner rotating inside its prefix still
 accumulates.
 
@@ -57,8 +67,9 @@ Everything depends on sipbridge seeing the real client address. Behind Kubernete
 Services use `externalTrafficPolicy: Local` (or a load balancer that preserves the
 client source address); with SNAT, every caller looks
 like the node or load balancer, the carrier-wide allowlist protects nobody and a
-single scanner can ban the whole front end. Verify with a test INVITE that the
-source IP in the gateway's firewall status or logs is the caller's.
+single scanner can ban the whole front end. Verify with a test INVITE to an
+unrouted user: the gateway logs `No route for INVITE` (info) with `sourceIp`, and a
+resulting ban logs `Firewall ban` with the banned address. The IP must be the caller's.
 
 ### Kernel scope
 
@@ -89,21 +100,22 @@ unsupported. Packet logging is disabled; named kernel counters remain available.
 
 ## Gateway configuration
 
-| Variable                                | Default                | Meaning                                                                               |
-| --------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------- |
-| `SIP_FIREWALL_MODE`                     | `shadow`               | `off`, `shadow` or `enforce`. Shadow scores without applying blocks.                  |
-| `SIP_FIREWALL_ALLOWLIST_JSON`           | `[]`                   | Trusted IPv4/IPv6 addresses or CIDRs.                                                 |
-| `SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES` | `false`                | Score unknown or invalid `Replaces` observations where the gateway handles them.      |
-| `SIP_FIREWALL_THRESHOLD`                | `10`                   | Positive integer score threshold.                                                     |
-| `SIP_FIREWALL_HALF_LIFE_MS`             | `600000`               | Score decay half-life.                                                                |
-| `SIP_FIREWALL_BAN_TTLS_SEC`             | `900,3600,21600,86400` | Positive, nondecreasing tiers, maximum 24 hours each.                                 |
-| `SIP_FIREWALL_MAX_RECORDS`              | `100000`               | Maximum score/tier records and bounded transaction markers.                           |
-| `SIP_FIREWALL_MAX_BLOCKS`               | `10000`                | Maximum manual plus automatic candidates.                                             |
-| `SIP_FIREWALL_ADMIN_TOKEN`              | unset                  | Separate bearer for operator APIs; unset disables access.                             |
-| `SIP_FIREWALL_SNAPSHOT_TOKEN`           | unset                  | Read-only bearer for `/firewall/snapshot`.                                            |
-| `SIP_FIREWALL_PUBLISHER_URL`            | unset                  | Receiver URL ending in `/v1/snapshot`; unset leaves publication to an external agent. |
-| `SIP_FIREWALL_PUBLISHER_TOKEN`          | unset                  | Receiver bearer; required with the publisher URL.                                     |
-| `SIP_FIREWALL_PUBLISHER_CA_FILE`        | system trust           | CA for an HTTPS receiver.                                                             |
+| Variable                                | Default                | Meaning                                                                                             |
+| --------------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------- |
+| `SIP_FIREWALL_MODE`                     | `shadow`               | `off`, `shadow` or `enforce`. Shadow scores without applying blocks.                                |
+| `SIP_FIREWALL_ALLOWLIST_JSON`           | `[]`                   | Trusted IPv4/IPv6 addresses or CIDRs.                                                               |
+| `SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES` | `false`                | Score unknown or invalid `Replaces` observations where the gateway handles them.                    |
+| `SIP_FIREWALL_ROUTE_GRACE_MS`           | `300000`               | Do not score no-route 404s while no owner is connected or for this long after an owner disconnects. |
+| `SIP_FIREWALL_THRESHOLD`                | `10`                   | Positive integer score threshold.                                                                   |
+| `SIP_FIREWALL_HALF_LIFE_MS`             | `600000`               | Score decay half-life.                                                                              |
+| `SIP_FIREWALL_BAN_TTLS_SEC`             | `900,3600,21600,86400` | Positive, nondecreasing tiers, maximum 24 hours each.                                               |
+| `SIP_FIREWALL_MAX_RECORDS`              | `100000`               | Maximum score/tier records and bounded transaction markers.                                         |
+| `SIP_FIREWALL_MAX_BLOCKS`               | `10000`                | Maximum manual plus automatic candidates.                                                           |
+| `SIP_FIREWALL_ADMIN_TOKEN`              | unset                  | Separate bearer for operator APIs; unset disables access.                                           |
+| `SIP_FIREWALL_SNAPSHOT_TOKEN`           | unset                  | Read-only bearer for `/firewall/snapshot`.                                                          |
+| `SIP_FIREWALL_PUBLISHER_URL`            | unset                  | Receiver URL ending in `/v1/snapshot`; unset leaves publication to an external agent.               |
+| `SIP_FIREWALL_PUBLISHER_TOKEN`          | unset                  | Receiver bearer; required with the publisher URL.                                                   |
+| `SIP_FIREWALL_PUBLISHER_CA_FILE`        | system trust           | CA for an HTTPS receiver.                                                                           |
 
 Record capacity never evicts a live ban. Expired scores and markers are swept in
 bounded batches; new observations are skipped when capacity is exhausted. Limits and
@@ -201,7 +213,7 @@ manual bans, unblock, adjacent-range handling, timeout changes, kernel expiry wi
 the sidecar stopped, missed-update and restart recovery, gateway owner
 replacement, and sipbridge namespace replacement. It creates disposable TLS
 fixtures, needs `SIPBRIDGE_IMAGE` from `dependencies/sipbridge-runtime.json`, tears
-down its own containers and network, and never touches the host firewall. IPv6 SIP
-is exercised only when sipbridge's SIP listener accepts IPv6; otherwise IPv6
-enforcement is probed against the sidecar's receiver port. See the
+down its own containers and network, and never touches the host firewall. IPv6 is exercised
+with SIP over UDP and TCP from an attacker in a separate /64 to sipbridge's `[::]:5060`
+listener (an automatic IPv6 ban covers a /64, which must not contain the gateway or a carrier). See the
 [firewall plan](../development/sip-firewall-plan.md) for what each run covered.

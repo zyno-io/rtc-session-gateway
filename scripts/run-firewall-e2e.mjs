@@ -87,6 +87,26 @@ try {
     writeSignalingOnlyCatalog(fixtures + '/endpoints.json', { ip: '10.89.43.2', validMs: 60 * 60 * 1000 });
     compose(['up', '-d', '--build']);
     await waitFor(() => exec('gateway', `(async()=>{const r=await fetch('http://127.0.0.1:3001/readyz');console.log(r.status)})()`) === '200');
+    // A connected control owner makes a missing route abuse evidence; without one the gateway never scores no-route misses.
+    execFileSync(
+        'docker',
+        [
+            'compose',
+            '-f',
+            'docker-compose.firewall.yml',
+            '-p',
+            project,
+            'exec',
+            '-d',
+            '-T',
+            'gateway',
+            'node',
+            '-e',
+            "const ws=new(require('ws'))('ws://127.0.0.1:3001/control');ws.on('open',()=>ws.send(JSON.stringify({type:'request',id:'r1',method:'route.register',params:{routes:[{match:'exact',value:'e2e-owner'}]}})));ws.on('close',()=>process.exit(1));setInterval(()=>{},1e6)"
+        ],
+        { env, stdio: 'inherit' }
+    );
+    await delay(1500);
     console.log('Carrier allowlist preserves repeated IPv4 scans');
     for (let i = 0; i < 4; i++) probe('carrier');
     probe();

@@ -79,8 +79,10 @@ export interface SipSource {
     port: number;
     transport: string;
 }
-/** Admission policy for fresh requests: returns a SIP status to deny with, or undefined to admit. */
-export type SourcePolicy = (message: SipMessage, source: SipSource | undefined) => number | undefined;
+/** Returns true when the observed source is banned. */
+export type BanPolicy = (source: SipSource | undefined) => boolean;
+/** Route admission for a fresh request that survived every other check: a SIP status to deny with, or undefined to admit. */
+export type RoutePolicy = (message: SipMessage, source: SipSource | undefined) => number | undefined;
 export interface SipResponse {
     finalResponseSent: boolean;
     respond(status: number, options?: { body?: string; headers?: Record<string, string> }): Promise<void>;
@@ -173,8 +175,10 @@ export class SipbridgeSignaling extends EventEmitter {
     onInvite?: (request: IncomingSipRequest, response: SipResponse) => Promise<void>;
     applicationReady: () => boolean = () => true;
     acceptingIngress: (message: SipMessage) => boolean = () => true;
-    /** Source-based admission (firewall); runs for fresh requests after the 503 not-admitting check. */
-    sourcePolicy?: SourcePolicy;
+    /** Banned-source refusal (403); runs for fresh requests right after the unscored 503 check. */
+    banPolicy?: BanPolicy;
+    /** Route check and scoring (404); runs last, after every protocol refusal. */
+    routePolicy?: RoutePolicy;
     isDraining: () => boolean = () => false;
     constructor(private config: GatewayConfig) {
         super();
@@ -601,10 +605,7 @@ export class SipbridgeSignaling extends EventEmitter {
     private admission(request: RequestPresented, fresh: boolean, full: boolean): number | undefined {
         const message = request.message!;
         if (fresh && (full || !this.isConnected || !this.applicationReady() || this.isDraining() || !this.acceptingIngress(message))) return 503;
-        if (fresh && this.sourcePolicy) {
-            const status = this.sourcePolicy(message, sourceOf(request));
-            if (status) return status;
-        }
+        if (fresh && this.banPolicy?.(sourceOf(request))) return 403;
         // REGISTER and SUBSCRIBE need a final decision; this application serves neither.
         if (message.method === 'REGISTER' || message.method === 'SUBSCRIBE') return 405;
         // A tagged or answered request for a context RTC no longer tracks belongs to a forgotten dialog, never a new call.
@@ -613,6 +614,7 @@ export class SipbridgeSignaling extends EventEmitter {
         if (fresh && !ANSWERED_FIRST_METHODS.includes(message.method)) return DIALOG_ONLY_METHODS.includes(message.method) ? 481 : 405;
         // sipbridge proposes flow adoption only when the request's flow differs from the context's; no socket migration.
         if (request.flowAdoption) return 403;
+        if (fresh && this.routePolicy) return this.routePolicy(message, sourceOf(request));
         return undefined;
     }
     /** Submits the single native decision for a request; resolves true when the request was admitted for handling. */

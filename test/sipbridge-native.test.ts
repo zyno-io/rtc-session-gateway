@@ -962,3 +962,138 @@ test('native firewall scores each unrouted INVITE once, then refuses the banned 
         await fixture.close();
     }
 });
+
+function rawInvite(
+    peer: Awaited<ReturnType<typeof sipPeer>>,
+    host: string,
+    sipPort: number,
+    o: { user: string; callId: string; fromTag: string; branch: string; toTag?: string; cseq?: number }
+) {
+    const uri = `sip:${o.user}@localhost`;
+    const wire = `INVITE ${uri} SIP/2.0\r\nVia: SIP/2.0/UDP ${host}:${peer.port};branch=${o.branch};rport\r\nMax-Forwards: 70\r\nFrom: <sip:caller@localhost>;tag=${o.fromTag}\r\nTo: <${uri}>${o.toTag ? ';tag=' + o.toTag : ''}\r\nCall-ID: ${o.callId}\r\nCSeq: ${o.cseq ?? 1} INVITE\r\nContact: <sip:caller@${host}:${peer.port};transport=udp>\r\nContent-Length: 0\r\n\r\n`;
+    peer.socket.send(wire, sipPort, '127.0.0.1');
+}
+
+test('native firewall scores every distinct fresh request even with a reused Call-ID and CSeq', firewallNative, async () => {
+    const fixture = await nativeFixture();
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL_MODE: 'enforce', SIP_FIREWALL_THRESHOLD: '100' }));
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"other","url":"https://owner.test/sip"}]' });
+    const gateway = new SipGateway(
+        config,
+        new CallRegistry(),
+        {
+            async postJson() {
+                return {};
+            }
+        } as never,
+        new SipbridgeSignaling(config),
+        undefined,
+        undefined,
+        { firewall }
+    );
+    const peer = await sipPeer(fixture.sipPort, externalAddress);
+    const callId = randomUUID() + '@scan';
+    const responses = () => peer.messages.filter(message => message.startsWith('SIP/2.0 404')).length;
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        for (let i = 0; i < 6; i++) {
+            rawInvite(peer, externalAddress!, fixture.sipPort, {
+                user: 'scan' + i,
+                callId,
+                fromTag: randomUUID(),
+                branch: 'z9hG4bK-' + randomUUID()
+            });
+            await until(() => responses() > i, 4000);
+        }
+        assert.equal(firewall.counters.observations, 6);
+        // A true retransmission (same branch) is absorbed and scored once.
+        const retransmitted = { user: 'again', callId, fromTag: randomUUID(), branch: 'z9hG4bK-' + randomUUID() };
+        rawInvite(peer, externalAddress!, fixture.sipPort, retransmitted);
+        await until(() => responses() > 6, 4000);
+        rawInvite(peer, externalAddress!, fixture.sipPort, retransmitted);
+        await new Promise(resolve => setTimeout(resolve, 600));
+        assert.equal(firewall.counters.observations, 7);
+    } catch (error) {
+        console.error(fixture.logs, peer.messages);
+        throw error;
+    } finally {
+        await gateway.shutdown();
+        peer.close();
+        await fixture.close();
+    }
+});
+
+test('native firewall leaves a forgotten-dialog re-INVITE to the 481 refusal, unscored', firewallNative, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL_MODE: 'shadow' }));
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+    const signaling = new SipbridgeSignaling(config);
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson(_url: string, body: { event?: string }) {
+                return body?.event === 'invite' ? { action: 'answer', sdp } : {};
+            }
+        } as never,
+        signaling,
+        undefined,
+        undefined,
+        { firewall }
+    );
+    const peer = await sipPeer(fixture.sipPort, externalAddress);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        const client = [...(signaling as any).peers.values()][0].client;
+        const request = client.request.bind(client);
+        let lost = false;
+        // The 200 reaches sipbridge but its result is lost, so RTC fences the first-request context.
+        client.request = async (payload: any, budget?: number) => {
+            const result = await request(payload, budget);
+            if (
+                !lost &&
+                payload.$case === 'command' &&
+                payload.command.action?.$case === 'respond' &&
+                payload.command.action.respond.status === 200
+            ) {
+                lost = true;
+                throw new Error('simulated lost result');
+            }
+            return result;
+        };
+        peer.send('INVITE', 1, '', sdp);
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
+        const toTag = /^To:.*;tag=([^;\s]+)/im.exec(peer.messages.find(message => message.startsWith('SIP/2.0 200'))!)![1];
+        peer.send('ACK', 1, toTag, '', 'z9hG4bK-' + randomUUID());
+        const contexts = (signaling as any).contexts as Map<string, { expiresAt?: number }>;
+        await until(() => [...contexts.values()].some(state => state.expiresAt !== undefined));
+        for (const state of contexts.values()) if (state.expiresAt) state.expiresAt = Date.now() - 1;
+        await until(() => contexts.size === 0, 5000);
+        peer.messages.length = 0;
+        // The re-INVITE targets an unrouted user: it must still be refused as a forgotten dialog, not scored as a route miss.
+        rawInvite(peer, externalAddress!, fixture.sipPort, {
+            user: 'unrouted',
+            callId: peer.callId,
+            fromTag: peer.tag,
+            branch: 'z9hG4bK-' + randomUUID(),
+            toTag,
+            cseq: 2
+        });
+        await until(() => peer.messages.some(message => /^SIP\/2\.0 [2-6]\d\d/.test(message)), 8000);
+        assert.match(
+            peer.messages.find(message => /^SIP\/2\.0 [2-6]\d\d/.test(message))!,
+            /^SIP\/2\.0 481/
+        );
+        assert.equal(firewall.counters.observations, 0);
+    } catch (error) {
+        console.error(fixture.logs, peer.messages);
+        throw error;
+    } finally {
+        await gateway.shutdown();
+        peer.close();
+        await fixture.close();
+    }
+});

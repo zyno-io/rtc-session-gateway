@@ -42,8 +42,9 @@ media allocation or call state:
 | Ack, BYE, CANCEL, re-INVITE, other established-dialog traffic | Not scored                                                                           |
 | Unknown or invalid `Replaces`                                 | Not scored by default (`SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES`)                      |
 
-Retransmissions are scored once through a short-lived marker keyed by source,
-Call-ID and CSeq. The in-handler route checks remain as an unscored fallback.
+Each fresh request sipbridge presents is one observation (it absorbs same-branch
+retransmissions); no-route misses are not scored while no owner is connected or within
+`SIP_FIREWALL_ROUTE_GRACE_MS` of an owner disconnect. The in-handler route checks remain as an unscored fallback.
 sipbridge answers OPTIONS itself, so the policy sees only requests sipbridge
 presents. Scores decay with a ten-minute half-life, ban at 10, and ban for 15
 minutes, 1, 6 then 24 hours. This detects repeated invalid attempts; a flood aimed

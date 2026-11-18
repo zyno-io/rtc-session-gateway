@@ -50,6 +50,7 @@ required deployment shape.
 | `SIP_FIREWALL_MODE`                     | `shadow`               | `off`, `shadow` (score only) or `enforce` (refuse banned sources and publish bans). |
 | `SIP_FIREWALL_ALLOWLIST_JSON`           | `[]`                   | JSON array of trusted IPv4/IPv6 addresses or CIDRs that are never scored or banned. |
 | `SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES` | `false`                | Score unknown or invalid `Replaces` observations (opt-in).                          |
+| `SIP_FIREWALL_ROUTE_GRACE_MS`           | `300000`               | Do not score no-route 404s while no control owner is connected or for this long after one disconnects. |
 | `SIP_FIREWALL_THRESHOLD`                | `10`                   | Score at which a source is banned.                                                  |
 | `SIP_FIREWALL_HALF_LIFE_MS`             | `600000`               | Score decay half-life.                                                              |
 | `SIP_FIREWALL_BAN_TTLS_SEC`             | `900,3600,21600,86400` | Repeat-offender ban tiers; nondecreasing, each at most 24 hours.                    |

@@ -56,6 +56,7 @@ export class ControlHub extends EventEmitter {
         });
         ws.on('close', () => this.removeConnection(id));
         ws.on('error', err => this.logger.warn({ err, connectionId: id }, 'Control connection error'));
+        this.emit('connection', id);
         return id;
     }
 

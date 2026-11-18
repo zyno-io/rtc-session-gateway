@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { addressRange, blockRange, overlaps, overlapsLoopback, sourceIp, type AddressRange } from './firewall-address';
+import { BaseLogger } from './logger';
 import { FIREWALL_MAX_ALLOWS, FIREWALL_MAX_BLOCKS, FIREWALL_MAX_TTL_MS, type FirewallSnapshot } from './firewall-contract';
 
 export interface SipFirewallConfig {
@@ -14,6 +15,8 @@ export interface SipFirewallConfig {
     adminToken?: string;
     snapshotToken?: string;
     observeUnknownReplaces: boolean;
+    /** After a control owner disconnects, no-route misses are not scored for this long. */
+    routeGraceMs: number;
     publisherUrl?: string;
     publisherToken?: string;
     publisherCaFile?: string;
@@ -39,6 +42,8 @@ export function loadFirewallConfig(env: NodeJS.ProcessEnv = process.env): SipFir
         banTtlsSec.some((ttl, i) => !Number.isSafeInteger(ttl) || ttl <= 0 || ttl > 86400 || (i > 0 && ttl < banTtlsSec[i - 1]))
     )
         throw new Error('Invalid SIP_FIREWALL_BAN_TTLS_SEC');
+    const routeGraceMs = Number(env.SIP_FIREWALL_ROUTE_GRACE_MS ?? 300_000);
+    if (!Number.isSafeInteger(routeGraceMs) || routeGraceMs < 0 || routeGraceMs > 86_400_000) throw new Error('Invalid SIP_FIREWALL_ROUTE_GRACE_MS');
     const publisherUrl = env.SIP_FIREWALL_PUBLISHER_URL;
     if (publisherUrl) {
         const url = new URL(publisherUrl);
@@ -57,6 +62,7 @@ export function loadFirewallConfig(env: NodeJS.ProcessEnv = process.env): SipFir
         mode,
         allowlist: targets('SIP_FIREWALL_ALLOWLIST_JSON', FIREWALL_MAX_ALLOWS),
         observeUnknownReplaces: env.SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES === 'true',
+        routeGraceMs,
         threshold: number('SIP_FIREWALL_THRESHOLD', 10, 10000),
         halfLifeMs: number('SIP_FIREWALL_HALF_LIFE_MS', 600_000, 86_400_000),
         banTtlsSec,
@@ -195,6 +201,10 @@ export class SipFirewall extends EventEmitter {
             tier
         };
         this.automatic.set(key, block);
+        BaseLogger.child({ ns: 'SipFirewall' }).info(
+            { sourceIp: key, tier, reason: block.reason, ttlSec: this.config.banTtlsSec[tier] },
+            'Firewall ban'
+        );
         record.tier = Math.min(tier + 1, this.config.banTtlsSec.length - 1);
         record.lastBan = now;
         record.score = 0;

@@ -204,6 +204,7 @@ export async function sipPeer(sipPort: number, host = '127.0.0.1') {
         messages,
         send,
         callId,
+        tag,
         port,
         close() {
             socket.close();

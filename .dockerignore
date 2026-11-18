@@ -11,3 +11,5 @@ coverage
 .e2e
 .e2e-fixtures-*
 e2e-artifacts
+var
+.working

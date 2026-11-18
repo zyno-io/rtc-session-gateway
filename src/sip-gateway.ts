@@ -84,34 +84,52 @@ export class SipGateway {
         this.signaling.applicationReady = () =>
             (!config.ROUTES_REQUIRED || config.ROUTES.length + (controlHub?.routeCount ?? 0) > 0) && (!config.RTPBRIDGE_REQUIRED || mediaReady());
         this.signaling.isDraining = () => lifecycle?.isDraining ?? false;
-        if (this.firewall) this.signaling.sourcePolicy = (message, source) => this.admitSource(message, source);
+        if (this.firewall) {
+            const firewall = this.firewall;
+            this.signaling.banPolicy = source => !!source && firewall.shouldReject(source.ip);
+            // With the firewall off, the in-handler route check answers; nothing runs at admission.
+            if (firewall.config.mode !== 'off') this.signaling.routePolicy = (message, source) => this.admitRoute(message, source);
+        }
+        controlHub?.on('disconnect', () => {
+            this.lastOwnerDisconnect = Date.now();
+        });
+        controlHub?.on('connection', () => {
+            this.ownersSeen = true;
+        });
     }
     private readonly firewall?: SipFirewall;
+    private lastOwnerDisconnect = 0;
+    private ownersSeen = false;
     /**
-     * Source admission for fresh requests, run by the signaling layer before any owner/RTC state exists.
-     * A banned source is refused for any method; only INVITEs for unknown hosts or without a route are scored.
+     * Route admission for a fresh INVITE that passed every protocol check; runs in the signaling layer before any
+     * owner/RTC state exists. Unknown hosts and unrouted INVITEs get 404; the former always scores, the latter
+     * only while owner routes are expected to be present (see routesExpected).
      */
-    private admitSource(message: SipMessage, source: SipSource | undefined): number | undefined {
+    private admitRoute(message: SipMessage, source: SipSource | undefined): number | undefined {
         const firewall = this.firewall;
-        if (!firewall || !source) return undefined;
-        if (firewall.shouldReject(source.ip)) return 403;
-        if (message.method !== 'INVITE') return undefined;
+        if (!firewall || message.method !== 'INVITE') return undefined;
         const destinationUri = stripSipUri(message.uri);
         const destinationUser = getSipUser(destinationUri);
-        const header = (...names: string[]) => message.headers.find(entry => names.includes(entry.name.toLowerCase()))?.value ?? '';
-        const transaction = header('call-id', 'i') + ':' + header('cseq');
+        const sourceIp = source?.ip;
         if (!acceptsSipHost(destinationUri, this.config.SIP_ALLOWED_DOMAINS)) {
-            firewall.observe(source.ip, destinationUser, 'unknown-host', transaction);
+            this.logger.info({ destinationUri, destinationUser, sourceIp }, 'Unknown SIP host for INVITE');
+            if (sourceIp) firewall.observe(sourceIp, destinationUser, 'unknown-host');
             return 404;
         }
-        if (
-            !this.controlHub?.findRoute({ destinationUri, destinationUser }) &&
-            !matchRoute(this.config.ROUTES, { destinationUri, destinationUser })
-        ) {
-            firewall.observe(source.ip, destinationUser, 'no-route', transaction);
-            return 404;
-        }
-        return undefined;
+        if (this.controlHub?.findRoute({ destinationUri, destinationUser }) || matchRoute(this.config.ROUTES, { destinationUri, destinationUser }))
+            return undefined;
+        const scored = !!sourceIp && this.routesExpected(firewall.config.routeGraceMs);
+        this.logger.info({ destinationUri, destinationUser, sourceIp, scored }, 'No route for INVITE');
+        if (scored) firewall.observe(sourceIp, destinationUser, 'no-route');
+        return 404;
+    }
+    /** A missing route is abuse evidence only while owners that would register it are connected and settled. */
+    private routesExpected(graceMs: number): boolean {
+        const hub = this.controlHub;
+        if (!hub) return true;
+        const controlRouting = this.config.ROUTES.length === 0 || this.ownersSeen || hub.size > 0;
+        if (controlRouting && hub.size === 0) return false;
+        return Date.now() - this.lastOwnerDisconnect >= graceMs;
     }
     get isConnected() {
         return this.signaling.isConnected;
