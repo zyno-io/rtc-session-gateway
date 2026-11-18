@@ -90,6 +90,8 @@ async function main() {
     await runOutboundSipScenario(control);
     await runOutboundCancelScenario(control);
     await runReinviteScenario(control);
+    await runSipHandoffScenario();
+    await runSipHandoffScenario({ srtp: true });
     await runAcceptanceControllerScenario();
     await runMultiBackendScenario();
     await runCatalogAdmissionScenario();
@@ -477,6 +479,309 @@ async function runOutboundCancelScenario(controlClient) {
         await responder.close();
     }
     await assertRtpbridgeSessionsEmpty('cancelled outbound INVITE should leave no media');
+}
+
+async function runSipHandoffScenario({ srtp = false } = {}) {
+    step(`Running direct ${srtp ? 'SRTP' : 'RTP'} SIP handoff, recording boundary, REFER/Replaces return and owner/backend independence`);
+    const owner = await connectControl(controlUrl);
+    const sip = await SipTcpClient.create();
+    const probe = await RtpProbeClient.start();
+    const center = await SipResponderClient.start();
+    const env = { ...process.env, COMPOSE_PROJECT_NAME: projectName };
+    let sessionId;
+    let stoppedBackend;
+    try {
+        await owner.request('route.register', { routes: [{ match: 'exact', value: 'e2e-handoff' }] });
+        const callerPeer = await probe.createPeer();
+        const centerPeer = await probe.createPeer();
+        const callerCrypto = srtp ? await probe.request('peer.sdes', { peerId: callerPeer.peerId }) : undefined;
+        const centerCrypto = srtp ? await probe.request('peer.sdes', { peerId: centerPeer.peerId }) : undefined;
+        const callerSdp = rtpAnswer(callerPeer.ip, callerPeer.port, callerCrypto?.crypto);
+        const centerSdp = rtpAnswer(centerPeer.ip, centerPeer.port, centerCrypto?.crypto);
+        await center.request('configure', { sdp: centerSdp });
+        const media = await owner.request('session.create', { callId: 'e2e-handoff' });
+        let invite = sip.buildInvite({ user: 'e2e-handoff', sdp: callerSdp });
+        const requested = owner.waitForRequest('sip.invite', 10_000);
+        sip.send(invite.message);
+        const request = await requested;
+        const endpoint = await owner.request('rtp.createFromOffer', { sessionId: media.sessionId, sdp: request.params.sdp });
+        if (srtp) await probe.request('peer.secure', { peerId: callerPeer.peerId, sdp: endpoint.sdpAnswer });
+        owner.respond(request.id, { action: 'answer', sdp: endpoint.sdpAnswer });
+        let answer = await sip.waitForFinalResponse(invite.callId, 10_000);
+        sip.send(sip.buildAck(invite, answer));
+        const answered = await owner.waitForEvent('sip.answered', 10_000);
+        sessionId = answered.sessionId;
+        const initialCall = await getJson(`${gatewayBaseUrl}/calls/${encodeURIComponent(sessionId)}`);
+        const logicalCallId = initialCall.logicalCallId;
+        const recording = await owner.request('recording.start', {
+            sessionId: media.sessionId,
+            filePath: `e2e-handoff-${srtp ? 'srtp' : 'rtp'}-before.pcap`
+        });
+        await probe.sendPackets(callerPeer.peerId, parseRtpTarget(endpoint.sdpAnswer), 30, { payloadMode: 'tone' });
+
+        let lastCarrierCseq = 0;
+        async function nextCarrierInvite() {
+            const request = await sip.waitFor(
+                message =>
+                    message.kind === 'request' &&
+                    message.method === 'INVITE' &&
+                    message.headers['call-id'] === invite.callId &&
+                    Number(message.headers.cseq.split(' ')[0]) > lastCarrierCseq,
+                10_000
+            );
+            lastCarrierCseq = Number(request.headers.cseq.split(' ')[0]);
+            return request;
+        }
+
+        async function handoff(mediaSessionId, transferId) {
+            const carrierRequest = nextCarrierInvite();
+            const operation = owner.request(
+                'sip.transfer',
+                {
+                    sessionId,
+                    mediaSessionId,
+                    transferId,
+                    requestUri: `sip:center@gateway:${center.port};transport=tcp`
+                },
+                20_000
+            );
+            const offer = await carrierRequest;
+            assertEqual(parseRtpTarget(offer.body).port, centerPeer.port, 'carrier must receive the destination media address');
+            sip.send(sip.buildResponse(offer, 200, 'OK', callerSdp));
+            const result = await operation;
+            step(`Transfer ${transferId} committed; checking destination ACK`);
+            const destinationInvite = await center.waitForEvent('invite', 10_000);
+            assertEqual(destinationInvite.body, '', 'handoff destination must receive an offerless INVITE');
+            const ack = await center.waitForEvent(
+                'ack',
+                10_000,
+                destinationInvite.headers.cseq.replace('INVITE', 'ACK'),
+                destinationInvite.headers['call-id']
+            );
+            assertEqual(parseRtpTarget(ack.body).port, callerPeer.port, 'destination ACK must contain carrier media address');
+            if (srtp) {
+                await probe.request('peer.secure', { peerId: callerPeer.peerId, sdp: offer.body });
+                await probe.request('peer.secure', { peerId: centerPeer.peerId, sdp: ack.body });
+            }
+            assertEqual(result.state, 'completed', 'handoff state');
+            return result;
+        }
+        const transferred = await handoff(media.sessionId, 'first-handoff');
+        assertEqual(transferred.logicalCallId, logicalCallId, 'handoff keeps logical identity');
+        const archive = transferred.recordings.find(item => item.recordingId === recording.recordingId);
+        assert(archive, 'handoff must return finalized recording');
+        const archivedBefore = await getBinary(`${gatewayBaseUrl}${archive.downloadPath}`);
+        assertAudio(pcapRtp(archivedBefore, endpoint.endpointId), { minimum: 20, label: 'pre-handoff recording' });
+
+        async function assertDirectAudio(label) {
+            await probe.request('peer.reset', { peerId: callerPeer.peerId });
+            await probe.request('peer.reset', { peerId: centerPeer.peerId });
+            await Promise.all([
+                probe.sendPackets(callerPeer.peerId, { host: centerPeer.ip, port: centerPeer.port }, 50, { payloadMode: 'tone' }),
+                probe.sendPackets(centerPeer.peerId, { host: callerPeer.ip, port: callerPeer.port }, 50, { payloadMode: 'tone' })
+            ]);
+            const toCaller = await probe.request('peer.packets', { peerId: callerPeer.peerId });
+            const toCenter = await probe.request('peer.packets', { peerId: centerPeer.peerId });
+            assertAudio(toCaller, { minimum: 40, label: `${label} caller audio` });
+            assertAudio(toCenter, { minimum: 40, label: `${label} destination audio` });
+            if (srtp)
+                assert(
+                    [...toCaller, ...toCenter].every(packet => packet.wireLength === packet.length + 10),
+                    'direct SRTP must authenticate and decrypt'
+                );
+        }
+        await assertDirectAudio('direct handoff');
+
+        // The gateway must relay subsequent offer/answer exchanges without asking
+        // the application or creating new media, including an answer carried in ACK.
+        const directionSdp = (sdp, direction, version) => sdp.replace(/^o=(\S+ \S+) \d+/m, `o=$1 ${version}`).replace('a=sendrecv', `a=${direction}`);
+        for (const [direction, peerDirection, version] of [
+            ['sendonly', 'recvonly', 2],
+            ['sendrecv', 'sendrecv', 3]
+        ]) {
+            await center.request('configure', { sdp: directionSdp(centerSdp, peerDirection, version) });
+            const modify = sip.buildReinvite(invite, answer, directionSdp(callerSdp, direction, version));
+            sip.send(modify.message);
+            const forwarded = await center.waitForEvent('invite', 10_000);
+            assert(forwarded.body.includes(`a=${direction}`), 'paired re-INVITE must relay the caller media direction');
+            const result = await sip.waitForFinalResponse(invite.callId, 10_000, `${modify.cseq} INVITE`);
+            assertEqual(result.status, 200, 'paired hold/resume must succeed');
+            assert(result.body.includes(`a=${peerDirection}`), 'paired answer must relay the destination media direction');
+            sip.send(sip.buildAck(modify, result));
+            await center.waitForEvent('ack', 10_000, forwarded.headers.cseq.replace('INVITE', 'ACK'), forwarded.headers['call-id']);
+            invite = modify;
+            answer = result;
+        }
+        const offerless = sip.buildReinvite(invite, answer, '');
+        sip.send(offerless.message);
+        const forwardedOfferless = await center.waitForEvent('invite', 10_000);
+        assertEqual(forwardedOfferless.body, '', 'paired offerless re-INVITE must request the peer offer');
+        const lateOffer = await sip.waitForFinalResponse(invite.callId, 10_000, `${offerless.cseq} INVITE`);
+        assertEqual(lateOffer.status, 200, 'paired late offer must succeed');
+        assertEqual(parseRtpTarget(lateOffer.body).port, centerPeer.port, 'late offer keeps direct destination media');
+        sip.send(sip.buildAck(offerless, lateOffer, directionSdp(callerSdp, 'sendrecv', 4)));
+        const lateAnswer = await center.waitForEvent(
+            'ack',
+            10_000,
+            forwardedOfferless.headers.cseq.replace('INVITE', 'ACK'),
+            forwardedOfferless.headers['call-id']
+        );
+        assertEqual(parseRtpTarget(lateAnswer.body).port, callerPeer.port, 'matching ACK must relay the direct carrier answer');
+        invite = offerless;
+        answer = lateOffer;
+        await assertDirectAudio('after paired hold/resume and late offer');
+        const archivedAfter = await getBinary(`${gatewayBaseUrl}${archive.downloadPath}`);
+        assert(archivedBefore.equals(archivedAfter), 'external audio must not extend the finalized recording');
+        await assertRtpbridgeSessionsEmpty('direct handoff releases all call media');
+
+        const unrelated = sip.buildInvite({ user: 'e2e-handoff', sdp: callerSdp, referredBy: 'sip:center@call-center.example' });
+        const unrelatedRequest = owner.waitForRequest('sip.invite', 10_000);
+        sip.send(unrelated.message);
+        const independent = await unrelatedRequest;
+        assert(independent.params.logicalCallId !== logicalCallId, 'matching caller identity without Replaces must remain a new call');
+        assertEqual(independent.params.returning, undefined, 'ordinary referred INVITE follows normal inbound routing');
+        const independentMedia = await owner.request('session.create', { callId: independent.params.callId });
+        const independentEndpoint = await owner.request('rtp.createFromOffer', { sessionId: independentMedia.sessionId, sdp: callerSdp });
+        owner.respond(independent.id, { action: 'answer', sdp: independentEndpoint.sdpAnswer });
+        const independentAnswer = await sip.waitForFinalResponse(unrelated.callId, 10_000);
+        sip.send(sip.buildAck(unrelated, independentAnswer));
+        const independentAnswered = await owner.waitForEvent('sip.answered', 10_000);
+        sip.send(sip.buildBye(unrelated, independentAnswer));
+        await sip.waitForFinalResponse(unrelated.callId, 10_000, '2 BYE');
+        await owner.waitForEvent('sip.bye', 10_000, event => event.sessionId === independentAnswered.sessionId);
+        await owner.request('session.delete', { sessionId: independentMedia.sessionId });
+
+        const returnedInvite = owner.waitForRequest('sip.invite', 10_000);
+        await center.request('refer', { target: 'sip:e2e-handoff@gateway.example' });
+        const returning = await returnedInvite;
+        assertEqual(returning.params.logicalCallId, logicalCallId, 'known REFER return keeps identity');
+        assertEqual(returning.params.returning, true, 'return metadata');
+        const returnedMedia = await owner.request('session.create', { callId: sessionId });
+        const returnedEndpoint = await owner.request('rtp.createFromOffer', { sessionId: returnedMedia.sessionId, sdp: returning.params.sdp });
+        const carrierReturn = nextCarrierInvite();
+        owner.respond(returning.id, { action: 'answer', sdp: returnedEndpoint.sdpAnswer });
+        const returnOffer = await carrierReturn;
+        if (srtp) await probe.request('peer.secure', { peerId: callerPeer.peerId, sdp: returnOffer.body });
+        assertEqual(parseRtpTarget(returnOffer.body).port, parseRtpTarget(returnedEndpoint.sdpAnswer).port, 'return re-anchors carrier to new media');
+        sip.send(sip.buildResponse(returnOffer, 200, 'OK', callerSdp));
+        await owner.waitForEvent('sip.answered', 10_000);
+        await center.waitForEvent('bye', 10_000);
+        step('REFER return committed; checking second handoff');
+        const returnedCall = await getJson(`${gatewayBaseUrl}/calls/${encodeURIComponent(sessionId)}`);
+        assertEqual(returnedCall.ownership, 'application', 'return restores application ownership');
+        // A standard Replaces INVITE must reuse the application's current episode.
+        const toTag = /;tag=([^;\s]+)/.exec(answer.headers.to)?.[1];
+        const replacement = sip.buildInvite({
+            user: 'e2e-handoff',
+            sdp: callerSdp,
+            replaces: `${invite.callId};to-tag=${toTag};from-tag=${invite.fromTag}`
+        });
+        const replacementAction = owner.waitForRequest('sip.reinvite', 10_000);
+        const retired = sip.waitForRequest('BYE', invite.callId, 10_000);
+        sip.send(replacement.message);
+        const mediaAction = await replacementAction;
+        owner.respond(mediaAction.id, { action: 'answer', sdp: returnedEndpoint.sdpAnswer });
+        const replacementAnswer = await sip.waitForFinalResponse(replacement.callId, 10_000);
+        assertEqual(replacementAnswer.status, 200, 'authorized Replaces must be accepted');
+        sip.send(sip.buildAck(replacement, replacementAnswer));
+        const retiredRequest = await retired;
+        sip.send(sip.buildResponse(retiredRequest, 200, 'OK'));
+        invite = replacement;
+        answer = replacementAnswer;
+        lastCarrierCseq = 0;
+        const replacedCall = await getJson(`${gatewayBaseUrl}/calls/${encodeURIComponent(sessionId)}`);
+        assertEqual(replacedCall.logicalCallId, logicalCallId, 'Replaces preserves logical identity');
+        assertEqual(replacedCall.sipCallId, replacement.callId, 'Replaces updates only the SIP dialog');
+        const returnRecording = await owner.request('recording.start', {
+            sessionId: returnedMedia.sessionId,
+            filePath: `e2e-handoff-${srtp ? 'srtp' : 'rtp'}-return.pcap`
+        });
+        await probe.sendPackets(callerPeer.peerId, parseRtpTarget(returnedEndpoint.sdpAnswer), 30, { payloadMode: 'tone' });
+        const second = await handoff(returnedMedia.sessionId, 'second-handoff');
+        const returnArchive = second.recordings.find(item => item.recordingId === returnRecording.recordingId);
+        assert(returnArchive && returnArchive.recordingId !== archive.recordingId, 'return records a distinct segment');
+        const returnedAudio = await getBinary(`${gatewayBaseUrl}${returnArchive.downloadPath}`);
+        assertAudio(pcapRtp(returnedAudio, returnedEndpoint.endpointId), { minimum: 20, label: 'returned application recording' });
+
+        const externalTag = /;tag=([^;\s]+)/.exec(answer.headers.to)?.[1];
+        const returningReplacement = sip.buildInvite({
+            user: 'e2e-handoff',
+            sdp: callerSdp,
+            replaces: `${invite.callId};to-tag=${externalTag};from-tag=${invite.fromTag}`
+        });
+        const replacementInbound = owner.waitForRequest('sip.invite', 10_000);
+        const oldCarrierBye = sip.waitForRequest('BYE', invite.callId, 10_000);
+        sip.send(returningReplacement.message);
+        const incomingReplacement = await replacementInbound;
+        assertEqual(incomingReplacement.params.returning, true, 'handed-off Replaces starts a returned episode');
+        assertEqual(incomingReplacement.params.logicalCallId, logicalCallId, 'handed-off Replaces keeps logical identity');
+        assertEqual(incomingReplacement.params.previousSessionId, sessionId, 'replacement links the retired gateway session');
+        const replacementMedia = await owner.request('session.create', { callId: incomingReplacement.params.callId });
+        const replacementEndpoint = await owner.request('rtp.createFromOffer', { sessionId: replacementMedia.sessionId, sdp: callerSdp });
+        if (srtp) await probe.request('peer.secure', { peerId: callerPeer.peerId, sdp: replacementEndpoint.sdpAnswer });
+        owner.respond(incomingReplacement.id, { action: 'answer', sdp: replacementEndpoint.sdpAnswer });
+        const newAnswer = await sip.waitForFinalResponse(returningReplacement.callId, 10_000);
+        assertEqual(newAnswer.status, 200, 'Replaces return must be accepted');
+        sip.send(sip.buildAck(returningReplacement, newAnswer));
+        const retiredCarrier = await oldCarrierBye;
+        sip.send(sip.buildResponse(retiredCarrier, 200, 'OK'));
+        await center.waitForEvent('bye', 10_000);
+        const replacementAnswered = await owner.waitForEvent('sip.answered', 10_000);
+        sessionId = replacementAnswered.sessionId;
+        invite = returningReplacement;
+        answer = newAnswer;
+        lastCarrierCseq = 0;
+        const replacementRecording = await owner.request('recording.start', {
+            sessionId: replacementMedia.sessionId,
+            filePath: `e2e-handoff-${srtp ? 'srtp' : 'rtp'}-replaced.pcap`
+        });
+        await probe.sendPackets(callerPeer.peerId, parseRtpTarget(replacementEndpoint.sdpAnswer), 30, { payloadMode: 'tone' });
+        const third = await handoff(replacementMedia.sessionId, 'third-handoff');
+        assertEqual(third.logicalCallId, logicalCallId, 'replacement can be handed off again under the same logical call');
+        const replacementArchive = third.recordings.find(item => item.recordingId === replacementRecording.recordingId);
+        assert(
+            replacementArchive && replacementArchive.recordingId !== returnArchive.recordingId,
+            'replacement recording is finalized independently'
+        );
+        const replacedAudio = await getBinary(`${gatewayBaseUrl}${replacementArchive.downloadPath}`);
+        assertAudio(pcapRtp(replacedAudio, replacementEndpoint.endpointId), { minimum: 20, label: 'Replaces returned application recording' });
+        await owner.close();
+        const owned = await getJson(`${gatewayBaseUrl}/calls/${encodeURIComponent(sessionId)}`);
+        assertEqual(owned.ownership, 'handed-off', 'owner disconnect must preserve the handoff');
+        stoppedBackend = replacementMedia.backendId === '10.89.42.10' ? 'rtpbridge' : 'rtpbridge-b';
+        run('docker', ['compose', '-f', composeFile, 'kill', '-s', 'SIGKILL', stoppedBackend], { env });
+        await assertDirectAudio('after application and media shutdown');
+        const bye = sip.buildBye(invite, answer);
+        sip.send(bye);
+        await sip.waitForFinalResponse(invite.callId, 10_000, '2 BYE');
+        await center.waitForEvent('bye', 10_000);
+        sessionId = undefined;
+        const calls = await getJson(`${gatewayBaseUrl}/calls`);
+        const sessions = await getJson(`${gatewayBaseUrl}/sessions`);
+        assertEqual(calls.calls.length, 0, 'paired BYE removes handed-off dialogs while media backend is down');
+        assertEqual(sessions.sessions.length, 0, 'handoff leaves no application media sessions');
+    } finally {
+        if (stoppedBackend) {
+            run('docker', ['compose', '-f', composeFile, 'up', '-d', '--no-deps', stoppedBackend], { env });
+            const base = rtpbridgeHttpUrls[stoppedBackend === 'rtpbridge' ? 0 : 1];
+            await waitForHttp(`${base}/health`, body => body?.status === 'ok', 30_000);
+            // The backend's coturn shares its network namespace and must rejoin the restarted container's.
+            run('docker', ['compose', '-f', composeFile, 'restart', stoppedBackend === 'rtpbridge' ? 'turn' : 'turn-b'], { env });
+        }
+        if (sessionId) {
+            const pendingBye = sip
+                .waitForRequest('BYE', undefined, 5000)
+                .then(request => sip.send(sip.buildResponse(request, 200, 'OK')))
+                .catch(() => undefined);
+            await postJson(`${gatewayBaseUrl}/calls/${encodeURIComponent(sessionId)}/bye`, {}).catch(() => undefined);
+            await pendingBye;
+        }
+        await owner.close();
+        sip.close();
+        await center.close();
+        await probe.close();
+    }
+    await assertGatewayEmpty('handoff, return and replacement cleanup');
 }
 
 async function runReinviteScenario(controlClient) {
@@ -1857,8 +2162,8 @@ class SipResponderClient {
         return bootstrap;
     }
 
-    waitForEvent(event, timeoutMs) {
-        return this.request('event.wait', { event, timeoutMs }, timeoutMs + 1_000);
+    waitForEvent(event, timeoutMs, cseq, callId) {
+        return this.request('event.wait', { event, timeoutMs, cseq, callId }, timeoutMs + 1_000);
     }
 
     async close() {

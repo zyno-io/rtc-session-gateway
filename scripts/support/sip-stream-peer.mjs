@@ -47,7 +47,7 @@ export class SipStreamPeer {
         return new SipStreamPeer(socket, socket.address().port, options);
     }
 
-    buildInvite({ user, sdp }) {
+    buildInvite({ user, sdp, replaces, referredBy }) {
         const callId = `${randomUUID()}@rtc-session-gateway-e2e`;
         const fromTag = randomToken();
         const branch = `z9hG4bK-${randomToken()}`;
@@ -63,6 +63,8 @@ export class SipStreamPeer {
             'CSeq: 1 INVITE',
             `Contact: <sip:caller@${this.advertisedHost}:${this.localPort};transport=${this.transport.toLowerCase()}>`,
             'Content-Type: application/sdp',
+            ...(replaces ? [`Replaces: ${replaces}`] : []),
+            ...(referredBy ? [`Referred-By: <${referredBy}>`] : []),
             `Content-Length: ${Buffer.byteLength(body)}`
         ];
         return {
@@ -75,7 +77,7 @@ export class SipStreamPeer {
         };
     }
 
-    buildAck(invite, response) {
+    buildAck(invite, response, body = '') {
         const to = response.headers.to || response.headers.t;
         const contact = response.status >= 300 ? invite.uri : response.headers.contact?.match(/<([^>]+)>/)?.[1] || invite.uri;
         const headers = [
@@ -87,13 +89,15 @@ export class SipStreamPeer {
             `Call-ID: ${invite.callId}`,
             `CSeq: ${invite.cseq} ACK`,
             `Contact: <sip:caller@${this.advertisedHost}:${this.localPort};transport=${this.transport.toLowerCase()}>`,
-            'Content-Length: 0'
+            ...(body ? ['Content-Type: application/sdp'] : []),
+            `Content-Length: ${Buffer.byteLength(body)}`
         ];
-        return `${headers.join('\r\n')}\r\n\r\n`;
+        return `${headers.join('\r\n')}\r\n\r\n${body}`;
     }
 
     buildReinvite(invite, response, sdp) {
         const contact = response.headers.contact?.match(/<([^>]+)>/)?.[1] || invite.uri;
+        const cseq = invite.cseq + 1;
         const message =
             [
                 `INVITE ${contact} SIP/2.0`,
@@ -102,12 +106,12 @@ export class SipStreamPeer {
                 `From: "E2E Caller" <sip:caller@127.0.0.1>;tag=${invite.fromTag}`,
                 `To: ${response.headers.to}`,
                 `Call-ID: ${invite.callId}`,
-                'CSeq: 2 INVITE',
+                `CSeq: ${cseq} INVITE`,
                 `Contact: <sip:caller@${this.advertisedHost}:${this.localPort};transport=${this.transport.toLowerCase()}>`,
-                'Content-Type: application/sdp',
+                ...(sdp ? ['Content-Type: application/sdp'] : []),
                 `Content-Length: ${Buffer.byteLength(sdp)}`
             ].join('\r\n') + `\r\n\r\n${sdp}`;
-        return { ...invite, cseq: 2, message };
+        return { ...invite, cseq, message };
     }
 
     buildBye(invite, response) {
@@ -126,7 +130,7 @@ export class SipStreamPeer {
         ].join('\r\n');
     }
 
-    buildResponse(request, status, reason) {
+    buildResponse(request, status, reason, body = '') {
         const headers = [
             `SIP/2.0 ${status} ${reason}`,
             ...request.via.map(value => `Via: ${value}`),
@@ -134,9 +138,15 @@ export class SipStreamPeer {
             `To: ${request.headers.to || request.headers.t}`,
             `Call-ID: ${request.headers['call-id'] || request.headers.i}`,
             `CSeq: ${request.headers.cseq}`,
-            'Content-Length: 0'
+            ...(body
+                ? [
+                      'Content-Type: application/sdp',
+                      `Contact: <sip:caller@${this.advertisedHost}:${this.localPort};transport=${this.transport.toLowerCase()}>`
+                  ]
+                : []),
+            `Content-Length: ${Buffer.byteLength(body)}`
         ];
-        return `${headers.join('\r\n')}\r\n\r\n`;
+        return `${headers.join('\r\n')}\r\n\r\n${body}`;
     }
 
     send(message) {
