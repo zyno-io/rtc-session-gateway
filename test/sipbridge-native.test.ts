@@ -790,3 +790,66 @@ test('a full receipt table evicts the oldest receipts instead of refusing messag
         await fixture.close();
     }
 });
+
+test(
+    'a re-INVITE in a dialog whose uncertain first-request context expired is refused, never offered as a new call',
+    { ...native, timeout: 30000 },
+    async () => {
+        const fixture = await nativeFixture();
+        const registry = new CallRegistry();
+        const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+        const signaling = new SipbridgeSignaling(config);
+        const events: string[] = [];
+        const gateway = new SipGateway(
+            config,
+            registry,
+            {
+                async postJson(_url: string, body: { event?: string }) {
+                    events.push(body?.event ?? '');
+                    return body?.event === 'invite' ? { action: 'answer', sdp } : {};
+                }
+            } as never,
+            signaling
+        );
+        const peer = await sipPeer(fixture.sipPort);
+        try {
+            await gateway.start();
+            await until(() => gateway.isConnected);
+            const client = [...(signaling as any).peers.values()][0].client;
+            const request = client.request.bind(client);
+            let lost = false;
+            // The 200 reaches sipbridge but its result is lost, so RTC fences the first-request context.
+            client.request = async (payload: any, budget?: number) => {
+                const result = await request(payload, budget);
+                if (
+                    !lost &&
+                    payload.$case === 'command' &&
+                    payload.command.action?.$case === 'respond' &&
+                    payload.command.action.respond.status === 200
+                ) {
+                    lost = true;
+                    throw new Error('simulated lost result');
+                }
+                return result;
+            };
+            peer.send('INVITE', 1, '', sdp);
+            await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
+            const toTag = /^To:.*;tag=([^;\s]+)/im.exec(peer.messages.find(message => message.startsWith('SIP/2.0 200'))!)![1];
+            peer.send('ACK', 1, toTag, '', 'z9hG4bK-' + randomUUID());
+            const contexts = (signaling as any).contexts as Map<string, { expiresAt?: number }>;
+            await until(() => [...contexts.values()].some(state => state.expiresAt !== undefined));
+            for (const state of contexts.values()) if (state.expiresAt) state.expiresAt = Date.now() - 1;
+            await until(() => contexts.size === 0, 5000);
+            peer.messages.length = 0;
+            peer.send('INVITE', 2, toTag, sdp, 'z9hG4bK-' + randomUUID());
+            await until(() => peer.messages.some(message => /^SIP\/2\.0 [2-6]\d\d/.test(message)), 8000);
+            assert.ok(peer.messages.some(message => message.startsWith('SIP/2.0 481')));
+            assert.equal(events.filter(event => event === 'invite').length, 1);
+            assert.equal(registry.size, 0);
+        } finally {
+            await gateway.shutdown();
+            peer.close();
+            await fixture.close();
+        }
+    }
+);

@@ -387,6 +387,9 @@ export class SipbridgeSignaling extends EventEmitter {
         state.uncertain = true;
         if (state.first && !state.dialog && state.expiresAt === undefined) state.expiresAt = Date.now() + UNCERTAIN_FIRST_REQUEST_MS;
     }
+    private expireUnanswered(state: Context) {
+        if (state.first && !state.dialog && !state.ended && state.expiresAt === undefined) state.expiresAt = Date.now() + UNCERTAIN_FIRST_REQUEST_MS;
+    }
     private drop(state: Context, reason: string) {
         this.retire(state, reason);
         if (state.snapshot.context) this.contexts.delete(contextKey(state.snapshot.context));
@@ -476,6 +479,8 @@ export class SipbridgeSignaling extends EventEmitter {
             marker.dispatched = true;
             const state = this.remember(peer, client, request.snapshot, full ? 'transient' : 'enforce');
             const task = this.decide(state, request, fresh, full).then(admitted => (admitted ? this.present(state, request, fresh) : undefined));
+            // A first request that leaves present() without a final response (e.g. not-sent failures) must still expire.
+            if (fresh) void task.finally(() => this.expireUnanswered(state)).catch(() => undefined);
             this.pendingRequests.set(key, task);
             void task.catch(() => undefined).finally(() => this.pendingRequests.delete(key));
             return;
@@ -583,6 +588,8 @@ export class SipbridgeSignaling extends EventEmitter {
         if (fresh && (full || !this.isConnected || !this.applicationReady() || this.isDraining() || !this.acceptingIngress(message))) return 503;
         // REGISTER and SUBSCRIBE need a final decision; this application serves neither.
         if (message.method === 'REGISTER' || message.method === 'SUBSCRIBE') return 405;
+        // A tagged or answered request for a context RTC no longer tracks belongs to a forgotten dialog, never a new call.
+        if (fresh && (message.addresses?.to?.values[0]?.params?.tag || request.snapshot?.answered)) return 481;
         // A first request is admitted only if present() answers it; anything else would hold a context forever.
         if (fresh && !ANSWERED_FIRST_METHODS.includes(message.method)) return DIALOG_ONLY_METHODS.includes(message.method) ? 481 : 405;
         // sipbridge proposes flow adoption only when the request's flow differs from the context's; no socket migration.
@@ -816,7 +823,14 @@ export class SipbridgeSignaling extends EventEmitter {
                 if (![OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(result.certainty))
                     throw new NativeOperationError('Outbound native outcome unknown', true);
                 if (result.error) throw new NativeOperationError(result.error);
-                if (cancelled) await this.command(state, { $case: 'cancel', cancel: {} });
+                if (cancelled)
+                    try {
+                        await this.command(state, { $case: 'cancel', cancel: {} });
+                    } catch (error) {
+                        // The INVITE is already on the wire; a failed CANCEL never makes the outcome safely retryable.
+                        this.fence(state);
+                        throw new NativeOperationError(error instanceof Error ? error.message : 'Outbound cancel failed', true);
+                    }
                 if (state.ended) throw new NativeOperationError('Outbound call ended');
                 if (state.snapshot.answered) {
                     state.dialog ??= new NativeDialog(state, this);
