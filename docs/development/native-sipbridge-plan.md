@@ -44,9 +44,11 @@ term ends affected local contexts.
 ## 4. SIP/application boundary
 
 RTC implements one direct request decision per notified request (admission
-policy, flow-adoption receipt and deferred or final status), event receipts,
-application probes and ephemeral credential lookup. It keeps only local context ownership, reference, sequence and policy
-state, and rejects unknown contexts and unsupported methods. sipbridge keeps
+policy and a deferred or final status), event receipts, application probes and
+ephemeral credential lookup. It has no flow-adoption support: a request on a
+different flow than its context is refused with 403. sipbridge handles unknown
+contexts itself; RTC keeps only local context ownership, reference, sequence and
+policy state, and refuses unsupported methods. sipbridge keeps
 transaction, dialog, ACK, CANCEL, timer and write semantics.
 
 Commands serialize per context with command-time delivery admission. UNKNOWN
@@ -79,12 +81,12 @@ forced cleanup runs.
 
 ## 7. Verification
 
-| Area                                                                                                                                                                                         | Evidence                                                                                                        |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Catalog parsing, expiry, invalid replacement, affinity                                                                                                                                       | `test/endpoint-catalog.test.ts`                                                                                 |
-| Canonical JSON, uncertainty fencing, reconnect inspection                                                                                                                                    | `test/sipbridge-codec.test.ts`                                                                                  |
-| Inbound/outbound calls, CANCEL, re-INVITE, BYE, bootstrap, stale signaling, TLS name and client URI rejection, duplicate ingress, owner disconnect, reconnect, authority change, digest auth | `test/sipbridge-native.test.ts` via `yarn test:native` (pinned sipbridge, memory state, synthetic certificates) |
-| Two-backend media/HMAC, audio, TURN/WebRTC, recordings, teardown and drain over native signaling                                                                                             | `yarn e2e:compose`, in both media modes                                                                         |
+| Area                                                                                                                                                                                                                                                                                        | Evidence                                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Catalog parsing, expiry, invalid replacement, affinity                                                                                                                                                                                                                                      | `test/endpoint-catalog.test.ts`                                                                                 |
+| Canonical JSON, uncertainty fencing, reconnect inspection                                                                                                                                                                                                                                   | `test/sipbridge-codec.test.ts`                                                                                  |
+| Inbound/outbound calls, CANCEL, re-INVITE, BYE, bootstrap, stale signaling, TLS name and client URI rejection, duplicate request notifications, admission denial and context release, flow refusal, owner disconnect, session loss and stale-term redelivery, authority change, digest auth | `test/sipbridge-native.test.ts` via `yarn test:native` (pinned sipbridge, memory state, synthetic certificates) |
+| Two-backend media/HMAC, audio, TURN/WebRTC, recordings, teardown and drain over native signaling                                                                                                                                                                                            | `yarn e2e:compose`, in both media modes                                                                         |
 
 No dedicated tests cover heartbeat deadlines or certificate reload on reconnect.
 

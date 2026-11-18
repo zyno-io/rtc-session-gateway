@@ -7,7 +7,10 @@ const native = {
 import { loadConfig } from '../src/config';
 import { SipGateway } from '../src/sip-gateway';
 import { CallRegistry } from '../src/call-registry';
-import { nativeFixture, sipPeer, until } from './support/native-fixture';
+import { createSocket } from 'node:dgram';
+import { randomUUID } from 'node:crypto';
+import { SipbridgeSignaling } from '../src/sipbridge-signaling';
+import { nativeFixture, sipPeer, udpUas, until } from './support/native-fixture';
 
 const sdp = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=RTC\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n';
 test('native memory SIP accepts, ACKs and remotely terminates an inbound dialog over mTLS control', native, async () => {
@@ -432,6 +435,156 @@ test('native outbound digest authentication resolves transient credentials for t
     } finally {
         await gateway.shutdown();
         uas.close();
+        await fixture.close();
+    }
+});
+
+const contextCount = (signaling: SipbridgeSignaling) => (signaling as any).contexts.size as number;
+const toTagOf = (wire: string) => /^To:.*;tag=([^;\r\n]+)/im.exec(wire)?.[1];
+
+test(
+    'a session lost to reconnect leaves no stale-term cascade: later calls survive the old term event retries',
+    { ...native, timeout: 60000 },
+    async () => {
+        const fixture = await nativeFixture();
+        const registry = new CallRegistry();
+        const config = loadConfig(fixture.tls);
+        const signaling = new SipbridgeSignaling(config);
+        let connections = 0;
+        let disconnections = 0;
+        signaling.on('connected', () => connections++);
+        signaling.on('disconnected', () => disconnections++);
+        const gateway = new SipGateway(
+            config,
+            registry,
+            {
+                async postJson() {
+                    return {};
+                }
+            } as never,
+            signaling
+        );
+        const uas = await udpUas(sdp);
+        const dial = () =>
+            gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' });
+        try {
+            await gateway.start();
+            await until(() => gateway.isConnected);
+            await dial();
+            for (const peer of (signaling as any).peers.values()) peer.client.close();
+            await until(() => connections >= 2);
+            assert.equal(registry.size, 0);
+            const fresh = await dial();
+            // sipbridge redelivers the old term's lifecycle events for roughly two minutes; they must not disturb this session.
+            await new Promise(resolve => setTimeout(resolve, 18000));
+            assert.equal(registry.size, 1);
+            assert.equal(connections, 2);
+            assert.equal(disconnections, 1);
+            assert.equal(uas.messages.filter(wire => wire.startsWith('BYE ')).length, 1);
+            await gateway.bye(fresh.sessionId);
+            assert.equal(registry.size, 0);
+        } finally {
+            await gateway.shutdown();
+            uas.close();
+            await fixture.close();
+        }
+    }
+);
+
+test('rejected first requests leave no contexts and capacity refusals do not close the session', { ...native, timeout: 60000 }, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+    const signaling = new SipbridgeSignaling(config);
+    let deny = true;
+    signaling.acceptingIngress = () => !deny;
+    let disconnections = 0;
+    signaling.on('disconnected', () => disconnections++);
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson() {
+                return { action: 'reject', status: 486 };
+            }
+        } as never,
+        signaling
+    );
+    const uas = await udpUas(sdp);
+    const peers = await Promise.all(Array.from({ length: 6 }, () => sipPeer(fixture.sipPort)));
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        await gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' });
+        assert.equal(contextCount(signaling), 1);
+        // Admission denial, owner rejection and an unsupported first request.
+        for (const peer of peers.slice(0, 3)) peer.send('INVITE', 1, '', sdp);
+        await until(() => peers.slice(0, 3).every(peer => peer.messages.some(message => message.startsWith('SIP/2.0 503'))));
+        deny = false;
+        for (const peer of peers.slice(3, 5)) peer.send('INVITE', 1, '', sdp);
+        await until(() => peers.slice(3, 5).every(peer => peer.messages.some(message => message.startsWith('SIP/2.0 486'))));
+        peers[5].send('MESSAGE', 1, '', 'hi');
+        await until(() => peers[5].messages.some(message => /^SIP\/2.0 [2-6]/.test(message)));
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        assert.equal(contextCount(signaling), 1);
+        // At capacity a fresh request is refused with 503 and nothing else is disturbed.
+        const contexts = (signaling as any).contexts as Map<string, any>;
+        const live = [...contexts.values()][0];
+        for (let i = 0; contexts.size < 1024; i++)
+            contexts.set('filler' + i, { ...live, snapshot: { ...live.snapshot, context: { ...live.snapshot.context, id: 'filler' + i } } });
+        const extra = await sipPeer(fixture.sipPort);
+        peers.push(extra);
+        extra.send('INVITE', 1, '', sdp);
+        await until(() => extra.messages.some(message => message.startsWith('SIP/2.0 503')), 3000);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        assert.equal(disconnections, 0);
+        assert.equal(registry.size, 1);
+        assert.equal(
+            uas.messages.some(wire => wire.startsWith('BYE ')),
+            false
+        );
+    } finally {
+        await gateway.shutdown();
+        uas.close();
+        for (const peer of peers) peer.close();
+        await fixture.close();
+    }
+});
+
+test('a request on a different flow is refused immediately', native, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+    const gateway = new SipGateway(config, registry, {
+        async postJson() {
+            return { action: 'answer', sdp };
+        }
+    } as never);
+    const peer = await sipPeer(fixture.sipPort);
+    const other = createSocket('udp4');
+    await new Promise<void>(resolve => other.bind(0, '127.0.0.1', resolve));
+    const replies: { at: number; wire: string }[] = [];
+    other.on('message', bytes => replies.push({ at: Date.now(), wire: bytes.toString() }));
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        peer.send('INVITE', 1, '', sdp);
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
+        const toTag = toTagOf(peer.messages.find(message => message.startsWith('SIP/2.0 200'))!)!;
+        peer.send('ACK', 1, toTag, '', 'z9hG4bK-ack');
+        await until(() => registry.size === 1);
+        const port = other.address().port;
+        const wire = `BYE sip:support@localhost SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:${port};branch=z9hG4bK-${randomUUID()};rport\r\nMax-Forwards: 70\r\nFrom: <sip:caller@localhost>;tag=${/;tag=([^;>\r\n]+)/.exec(peer.messages.find(m => m.startsWith('SIP/2.0 200'))!.match(/^From:.*$/im)![0])![1]}\r\nTo: <sip:support@localhost>;tag=${toTag}\r\nCall-ID: ${peer.callId}\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n`;
+        const started = Date.now();
+        other.send(wire, fixture.sipPort, '127.0.0.1');
+        await until(() => replies.some(reply => /^SIP\/2.0 [2-6]/.test(reply.wire)), 5000);
+        const final = replies.find(reply => /^SIP\/2.0 [2-6]/.test(reply.wire))!;
+        assert.ok(final.at - started < 1500, 'refused after ' + (final.at - started) + 'ms: ' + final.wire.split('\r\n')[0]);
+        assert.equal(registry.size, 1);
+    } finally {
+        await gateway.shutdown();
+        peer.close();
+        other.close();
         await fixture.close();
     }
 });

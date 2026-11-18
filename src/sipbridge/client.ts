@@ -303,6 +303,7 @@ export class SipbridgeControlClient {
                 lease.application.epoch !== this.options.process.epoch ||
                 !isSipbridgeStateAuthority(lease.authority) ||
                 !ack.stateAuthority ||
+                ack.stateAuthority.schemaVersion !== 1 ||
                 lease.authority.service !== ack.stateAuthority.service ||
                 lease.authority.generation !== ack.stateAuthority.generation ||
                 lease.authority.primaryId !== ack.stateAuthority.primaryId ||

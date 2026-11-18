@@ -65,6 +65,13 @@ Keep the old gateway's sipbridge and rtpbridge endpoints reachable until it exit
 A sipbridge state-authority change, such as a restart with memory state, ends the
 calls held under the old authority; RTC does not migrate them.
 
+**Warning:** with memory-state sipbridge, any loss of the gateway's control session
+to that sipbridge (network drop, certificate rotation that forces a reconnect, a
+gateway restart) ends every call on that sipbridge, because sipbridge expires the
+session's application term and sends BYE for its calls. Reconnecting does not
+restore them. Treat control-session stability as call availability. See sipbridge's
+[memory-core](https://github.com/zyno-io/sipbridge/blob/main/docs/memory-core.md) notes.
+
 Existing HTTP-owned calls need a stable route to their owning instance for commands during drain; a shared Service that removes that instance on readiness failure is insufficient. Persistent control WebSockets already retain that connection affinity, provided the load balancer preserves established connections when readiness changes. Application route registrations are local to each gateway, so register them on replacements before sending new calls there.
 
 Set the platform's termination grace period longer than the natural drain plus cleanup budget, including any pre-stop hook time. For example:

@@ -30,13 +30,19 @@ connected, reconciled session to a fresh entry with `acceptNew=true`.
 
 When the signaling section expires or an entry disappears, new calls are refused.
 Sessions that still carry calls stay open until those calls end; sessions with no
-retained calls are closed. Retained work stays pinned to its original state
-authority, lease term and RTC process. If a reconnect reports a different state
-authority or lease term, RTC ends the affected local contexts and never migrates
-calls or replays commands to the new authority.
+retained calls are closed. Work is pinned to its original state authority, lease
+term and RTC process. With Memory sipbridge, losing an established control session
+expires that session's application term and sipbridge ends all of its calls
+([memory-core](https://github.com/zyno-io/sipbridge/blob/main/docs/memory-core.md)
+on control-session disconnect). RTC therefore ends every call it holds on that
+sipbridge as soon as the session closes, and a reconnect admits only fresh calls
+under a new term. Lifecycle events of an earlier term that sipbridge redelivers to
+the new session are acknowledged and ignored; per-message errors never close the
+session, because a close ends every call. RTC never migrates calls or replays
+commands to a new authority or term.
 
-Before readmitting new calls, a reconnect inspects retained contexts with at most
-eight concurrent reads. Only an owned ended snapshot or a retirement proof from the
+A reconnect still inspects any context that remains locally, with at most eight
+concurrent reads. Only an owned ended snapshot or a retirement proof from the
 current authority retires a call; a lookup failure or absence without proof
 leaves it fenced. Inspection never clears an uncertain-mutation fence.
 
