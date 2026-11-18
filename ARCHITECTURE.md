@@ -77,7 +77,7 @@ Deployment charts, registry access and product-specific adapters belong to the
 consuming deployment.
 
 The contract receipt in `dependencies/` pins the schema distributed by sipbridge and
-the generated bindings matching its published receipt. The wire field `hello.nexus`
+the generated bindings matching its published receipt. The wire field `hello.controller`
 names the calling application process; it does not identify an external service.
 
 ## Evidence

@@ -32,18 +32,20 @@ fallback.
 Each startup creates a random process epoch; connection attempts increase
 monotonically. Reconnect backoff starts at 250 ms and is capped at 5 seconds.
 Client key, certificate and CA files are re-read for each handshake. The hello
-must negotiate the required capabilities, a matching instance ID, the state
-authority, lease and heartbeat bounds. RTC bootstraps against non-admitting
+must negotiate the required capabilities (`sip.v1`, state, native completion,
+command admission and budget, dialog continuity and `sip.request-decision.v1`), a
+matching instance ID, the state authority, lease and heartbeat bounds. RTC bootstraps against non-admitting
 entries and reports status from routes, media and lifecycle rather than
-sipbridge readiness. Session loss fails pending RPCs without ending retained calls
-or replaying commands; a changed state authority or lease term ends affected
-contexts.
+sipbridge readiness. Session loss fails pending RPCs without replaying commands. Memory sipbridge
+expires the lost session's application term and ends that term's calls natively; a
+reconnect admits fresh work under a new term, and a changed state authority or lease
+term ends affected local contexts.
 
 ## 4. SIP/application boundary
 
-RTC implements typed ingress decisions, exact-context ingest, request and event
-receipts, application probes, flow-adoption receipts and ephemeral credential
-lookup. It keeps only local context ownership, reference, sequence and policy
+RTC implements one direct request decision per notified request (admission
+policy, flow-adoption receipt and deferred or final status), event receipts,
+application probes and ephemeral credential lookup. It keeps only local context ownership, reference, sequence and policy
 state, and rejects unknown contexts and unsupported methods. sipbridge keeps
 transaction, dialog, ACK, CANCEL, timer and write semantics.
 
@@ -77,12 +79,12 @@ forced cleanup runs.
 
 ## 7. Verification
 
-| Area | Evidence |
-| --- | --- |
-| Catalog parsing, expiry, invalid replacement, affinity | `test/endpoint-catalog.test.ts` |
-| Canonical JSON, uncertainty fencing, reconnect inspection | `test/sipbridge-codec.test.ts` |
+| Area                                                                                                                                                                                         | Evidence                                                                                                        |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Catalog parsing, expiry, invalid replacement, affinity                                                                                                                                       | `test/endpoint-catalog.test.ts`                                                                                 |
+| Canonical JSON, uncertainty fencing, reconnect inspection                                                                                                                                    | `test/sipbridge-codec.test.ts`                                                                                  |
 | Inbound/outbound calls, CANCEL, re-INVITE, BYE, bootstrap, stale signaling, TLS name and client URI rejection, duplicate ingress, owner disconnect, reconnect, authority change, digest auth | `test/sipbridge-native.test.ts` via `yarn test:native` (pinned sipbridge, memory state, synthetic certificates) |
-| Two-backend media/HMAC, audio, TURN/WebRTC, recordings, teardown and drain over native signaling | `yarn e2e:compose`, in both media modes |
+| Two-backend media/HMAC, audio, TURN/WebRTC, recordings, teardown and drain over native signaling                                                                                             | `yarn e2e:compose`, in both media modes                                                                         |
 
 No dedicated tests cover heartbeat deadlines or certificate reload on reconnect.
 

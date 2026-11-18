@@ -10,9 +10,8 @@
  * Canonical control contract and source for generated JSON codecs/validation.
  * Wire transport is UTF-8 JSON text only (sipbridge.control.json.v1), with
  * lowerCamelCase keys, symbolic enums, uint64 decimal strings and base64 bytes.
- * Application families require the explicitly
- * negotiated sip.v1 capability; the session-only
- * executable never admits SIP. PROTOCOL.md and ARCHITECTURE.md in sipbridge own
+ * Application families require the explicitly negotiated sip.v1 capability.
+ * PROTOCOL.md and ARCHITECTURE.md in sipbridge own
  * behavioral semantics. Reference/correlation strings match [A-Za-z0-9_.:@+-]{1,96}.
  */
 export interface Envelope {
@@ -45,14 +44,11 @@ export interface Envelope {
         | { $case: 'credentialResult'; credentialResult: CredentialResult } //
         /** Reads existing physical attempt evidence only; never authorizes a write. */
         | { $case: 'inspectEffect'; inspectEffect: FlowWrite }
-        | { $case: 'settleEffect'; settleEffect: EffectSettlement } //
-        /** Native proof that all SIP procedures and delivery reconciliation have retired. */
-        | { $case: 'retireAuthority'; retireAuthority: ContextSnapshot }
         | { $case: 'probeApplication'; probeApplication: ApplicationProbe }
         | { $case: 'applicationStatus'; applicationStatus: ApplicationStatus }
-        | { $case: 'reconcileContext'; reconcileContext: ContextReconcile }
-        | { $case: 'reconcileAuthority'; reconcileAuthority: AuthorityReconcile }
-        | { $case: 'authorityReceipt'; authorityReceipt: AuthorityReceipt }
+        | { $case: 'controllerContexts'; controllerContexts: ControllerContexts }
+        | { $case: 'controllerContextsResult'; controllerContextsResult: ControllerContextsResult }
+        | { $case: 'requestDecision'; requestDecision: RequestDecision }
         | undefined;
 }
 
@@ -66,13 +62,36 @@ export interface Bounds {
 }
 
 export interface SessionHello {
-    nexus?: ProcessRef | undefined;
+    controller?: ProcessRef | undefined;
     connectionAttempt: bigint;
     major: number;
     minMinor: number;
     maxMinor: number;
     capabilities: string[];
     bounds?: Bounds | undefined;
+    recovery?: ControllerRecovery | undefined;
+}
+
+/**
+ * Possession proof for reattaching a logical controller application. Tokens are
+ * sensitive: never include hello/recovery payloads in logs or diagnostics.
+ */
+export interface ControllerRecovery {
+    application?: ProcessRef | undefined;
+    term: string;
+    token: string;
+    attemptId: string;
+    attachmentGeneration: bigint;
+}
+
+export interface ControllerContexts {
+    cursor: string;
+    limit: number;
+}
+
+export interface ControllerContextsResult {
+    contexts: ContextRef[];
+    cursor: string;
 }
 
 export interface SessionHelloAck {
@@ -91,8 +110,9 @@ export interface SessionHelloAck {
 }
 
 /**
- * SIP-owner authority in the selected state adapter. A session may renew only its authenticated
- * process and current live term; a successor term never revives older contexts.
+ * SIP-owner authority in the selected state adapter. Application identifies the
+ * original logical owner lineage; holder is the authenticated controller process.
+ * Recovery tokens are sensitive and must never appear in logs or diagnostics.
  */
 export interface ApplicationLease {
     application?: ProcessRef | undefined;
@@ -100,6 +120,12 @@ export interface ApplicationLease {
     term: string;
     checkedAtMs: bigint;
     expiresAtMs: bigint;
+    recoveryToken: string;
+    holder?: ProcessRef | undefined;
+    attachmentGeneration: bigint;
+    reattachUntilMs: bigint;
+    leaseLifetimeMs: number;
+    reattachTimeoutMs: number;
 }
 
 export interface SessionStatus {
@@ -239,7 +265,7 @@ export interface IngressReceived {
 
 export interface RouteResult {
     outcome: RouteResult_Outcome;
-    nexus?: ProcessRef | undefined;
+    controller?: ProcessRef | undefined;
     sipStatus: number;
 }
 
@@ -382,6 +408,7 @@ export interface ContextSnapshot {
     executor?: ProcessRef | undefined;
     directoryEpoch: string;
     applicationLeaseTerm: string;
+    attachmentGeneration: bigint;
 }
 
 export enum ContextSnapshot_Kind {
@@ -440,6 +467,28 @@ export interface RequestPresented {
     requestId: string;
     message?: SipMessage | undefined;
     flow?: FlowRef | undefined;
+    /** Native-validated proposal; ordered publication is returned in RequestDecision. */
+    flowAdoption?: FlowAdoptionRequest | undefined;
+}
+
+/**
+ * sip.request-decision.v1: one decision for one exact pending native request.
+ * status=0 admits asynchronous handling; REGISTER/SUBSCRIBE require a final status.
+ * Accepted SUBSCRIBE includes its required NOTIFY content before native commit.
+ */
+export interface RequestDecision {
+    context?: ContextRef | undefined;
+    requestId: string;
+    sequence: bigint;
+    admission?: CommandAdmission | undefined;
+    basis: OwnerIngest_Admission;
+    principalId: string;
+    bindingId: string;
+    delivery?: ContextDelivery | undefined;
+    status: number;
+    headers: Header[];
+    body: Buffer;
+    notify?: DialogRequest | undefined;
 }
 
 /**
@@ -485,8 +534,6 @@ export interface CredentialResult {
 export interface NetworkTarget {
     proxy: string;
     transport: string;
-    username: string;
-    password: string;
     credential?: CredentialRef | undefined;
 }
 
@@ -731,9 +778,6 @@ export interface EgressRequest {
 
 export interface FlowWrite {
     flow?: FlowRef | undefined;
-    bindingId: string;
-    bindingRevision: bigint;
-    wire: Buffer;
     effect?: StateEffectRef | undefined;
     permit?: SendPermit | undefined;
 }
@@ -789,12 +833,6 @@ export function deliveryResult_OutcomeToJSON(object: DeliveryResult_Outcome): st
         default:
             return 'UNRECOGNIZED';
     }
-}
-
-/** Historical reconciliation only; this message cannot start a physical write. */
-export interface EffectSettlement {
-    write?: FlowWrite | undefined;
-    delivery?: DeliveryResult | undefined;
 }
 
 /** Read-only proof from the current trusted directory; a control disconnect is not owner loss. */
@@ -917,36 +955,6 @@ export interface FlowAdoptionRequest {
 export interface FlowAdoptionResult {
     receipt?: ContextDelivery | undefined;
     error: string;
-}
-
-/** Explicit quiescent native barrier; never an implicit owner/permit reset. */
-export interface ContextReconcile {
-    context?: ContextRef | undefined;
-    fromDirectoryEpoch: string;
-    directoryEpoch: string;
-}
-
-export interface AuthorityReconcile {
-    snapshot?: ContextSnapshot | undefined;
-    fromDirectoryEpoch: string;
-    directoryEpoch: string;
-    token: string;
-    barrierRevision: bigint;
-    origin?: SipMessage | undefined;
-    completionScope: string;
-    flow?: FlowRef | undefined;
-}
-
-export interface AuthorityReceipt {
-    context?: ContextRef | undefined;
-    application?: ProcessRef | undefined;
-    fromDirectoryEpoch: string;
-    directoryEpoch: string;
-    token: string;
-    barrierRevision: bigint;
-    completionScope: string;
-    delivery?: ContextDelivery | undefined;
-    ownerLost: boolean;
 }
 
 export const Envelope: MessageFns<Envelope> = {
@@ -1077,112 +1085,80 @@ export const Envelope: MessageFns<Envelope> = {
                                                                                           $case: 'inspectEffect',
                                                                                           inspectEffect: FlowWrite.fromJSON(object.inspect_effect)
                                                                                       }
-                                                                                    : isSet(object.settleEffect)
+                                                                                    : isSet(object.probeApplication)
                                                                                       ? {
-                                                                                            $case: 'settleEffect',
-                                                                                            settleEffect: EffectSettlement.fromJSON(
-                                                                                                object.settleEffect
+                                                                                            $case: 'probeApplication',
+                                                                                            probeApplication: ApplicationProbe.fromJSON(
+                                                                                                object.probeApplication
                                                                                             )
                                                                                         }
-                                                                                      : isSet(object.settle_effect)
+                                                                                      : isSet(object.probe_application)
                                                                                         ? {
-                                                                                              $case: 'settleEffect',
-                                                                                              settleEffect: EffectSettlement.fromJSON(
-                                                                                                  object.settle_effect
+                                                                                              $case: 'probeApplication',
+                                                                                              probeApplication: ApplicationProbe.fromJSON(
+                                                                                                  object.probe_application
                                                                                               )
                                                                                           }
-                                                                                        : isSet(object.retireAuthority)
+                                                                                        : isSet(object.applicationStatus)
                                                                                           ? {
-                                                                                                $case: 'retireAuthority',
-                                                                                                retireAuthority: ContextSnapshot.fromJSON(
-                                                                                                    object.retireAuthority
+                                                                                                $case: 'applicationStatus',
+                                                                                                applicationStatus: ApplicationStatus.fromJSON(
+                                                                                                    object.applicationStatus
                                                                                                 )
                                                                                             }
-                                                                                          : isSet(object.retire_authority)
+                                                                                          : isSet(object.application_status)
                                                                                             ? {
-                                                                                                  $case: 'retireAuthority',
-                                                                                                  retireAuthority: ContextSnapshot.fromJSON(
-                                                                                                      object.retire_authority
+                                                                                                  $case: 'applicationStatus',
+                                                                                                  applicationStatus: ApplicationStatus.fromJSON(
+                                                                                                      object.application_status
                                                                                                   )
                                                                                               }
-                                                                                            : isSet(object.probeApplication)
+                                                                                            : isSet(object.controllerContexts)
                                                                                               ? {
-                                                                                                    $case: 'probeApplication',
-                                                                                                    probeApplication: ApplicationProbe.fromJSON(
-                                                                                                        object.probeApplication
+                                                                                                    $case: 'controllerContexts',
+                                                                                                    controllerContexts: ControllerContexts.fromJSON(
+                                                                                                        object.controllerContexts
                                                                                                     )
                                                                                                 }
-                                                                                              : isSet(object.probe_application)
+                                                                                              : isSet(object.controller_contexts)
                                                                                                 ? {
-                                                                                                      $case: 'probeApplication',
-                                                                                                      probeApplication: ApplicationProbe.fromJSON(
-                                                                                                          object.probe_application
+                                                                                                      $case: 'controllerContexts',
+                                                                                                      controllerContexts: ControllerContexts.fromJSON(
+                                                                                                          object.controller_contexts
                                                                                                       )
                                                                                                   }
-                                                                                                : isSet(object.applicationStatus)
+                                                                                                : isSet(object.controllerContextsResult)
                                                                                                   ? {
-                                                                                                        $case: 'applicationStatus',
-                                                                                                        applicationStatus: ApplicationStatus.fromJSON(
-                                                                                                            object.applicationStatus
-                                                                                                        )
+                                                                                                        $case: 'controllerContextsResult',
+                                                                                                        controllerContextsResult:
+                                                                                                            ControllerContextsResult.fromJSON(
+                                                                                                                object.controllerContextsResult
+                                                                                                            )
                                                                                                     }
-                                                                                                  : isSet(object.application_status)
+                                                                                                  : isSet(object.controller_contexts_result)
                                                                                                     ? {
-                                                                                                          $case: 'applicationStatus',
-                                                                                                          applicationStatus:
-                                                                                                              ApplicationStatus.fromJSON(
-                                                                                                                  object.application_status
+                                                                                                          $case: 'controllerContextsResult',
+                                                                                                          controllerContextsResult:
+                                                                                                              ControllerContextsResult.fromJSON(
+                                                                                                                  object.controller_contexts_result
                                                                                                               )
                                                                                                       }
-                                                                                                    : isSet(object.reconcileContext)
+                                                                                                    : isSet(object.requestDecision)
                                                                                                       ? {
-                                                                                                            $case: 'reconcileContext',
-                                                                                                            reconcileContext:
-                                                                                                                ContextReconcile.fromJSON(
-                                                                                                                    object.reconcileContext
-                                                                                                                )
+                                                                                                            $case: 'requestDecision',
+                                                                                                            requestDecision: RequestDecision.fromJSON(
+                                                                                                                object.requestDecision
+                                                                                                            )
                                                                                                         }
-                                                                                                      : isSet(object.reconcile_context)
+                                                                                                      : isSet(object.request_decision)
                                                                                                         ? {
-                                                                                                              $case: 'reconcileContext',
-                                                                                                              reconcileContext:
-                                                                                                                  ContextReconcile.fromJSON(
-                                                                                                                      object.reconcile_context
+                                                                                                              $case: 'requestDecision',
+                                                                                                              requestDecision:
+                                                                                                                  RequestDecision.fromJSON(
+                                                                                                                      object.request_decision
                                                                                                                   )
                                                                                                           }
-                                                                                                        : isSet(object.reconcileAuthority)
-                                                                                                          ? {
-                                                                                                                $case: 'reconcileAuthority',
-                                                                                                                reconcileAuthority:
-                                                                                                                    AuthorityReconcile.fromJSON(
-                                                                                                                        object.reconcileAuthority
-                                                                                                                    )
-                                                                                                            }
-                                                                                                          : isSet(object.reconcile_authority)
-                                                                                                            ? {
-                                                                                                                  $case: 'reconcileAuthority',
-                                                                                                                  reconcileAuthority:
-                                                                                                                      AuthorityReconcile.fromJSON(
-                                                                                                                          object.reconcile_authority
-                                                                                                                      )
-                                                                                                              }
-                                                                                                            : isSet(object.authorityReceipt)
-                                                                                                              ? {
-                                                                                                                    $case: 'authorityReceipt',
-                                                                                                                    authorityReceipt:
-                                                                                                                        AuthorityReceipt.fromJSON(
-                                                                                                                            object.authorityReceipt
-                                                                                                                        )
-                                                                                                                }
-                                                                                                              : isSet(object.authority_receipt)
-                                                                                                                ? {
-                                                                                                                      $case: 'authorityReceipt',
-                                                                                                                      authorityReceipt:
-                                                                                                                          AuthorityReceipt.fromJSON(
-                                                                                                                              object.authority_receipt
-                                                                                                                          )
-                                                                                                                  }
-                                                                                                                : undefined
+                                                                                                        : undefined
         };
     },
 
@@ -1245,20 +1221,16 @@ export const Envelope: MessageFns<Envelope> = {
             obj.credentialResult = CredentialResult.toJSON(message.payload.credentialResult);
         } else if (message.payload?.$case === 'inspectEffect') {
             obj.inspectEffect = FlowWrite.toJSON(message.payload.inspectEffect);
-        } else if (message.payload?.$case === 'settleEffect') {
-            obj.settleEffect = EffectSettlement.toJSON(message.payload.settleEffect);
-        } else if (message.payload?.$case === 'retireAuthority') {
-            obj.retireAuthority = ContextSnapshot.toJSON(message.payload.retireAuthority);
         } else if (message.payload?.$case === 'probeApplication') {
             obj.probeApplication = ApplicationProbe.toJSON(message.payload.probeApplication);
         } else if (message.payload?.$case === 'applicationStatus') {
             obj.applicationStatus = ApplicationStatus.toJSON(message.payload.applicationStatus);
-        } else if (message.payload?.$case === 'reconcileContext') {
-            obj.reconcileContext = ContextReconcile.toJSON(message.payload.reconcileContext);
-        } else if (message.payload?.$case === 'reconcileAuthority') {
-            obj.reconcileAuthority = AuthorityReconcile.toJSON(message.payload.reconcileAuthority);
-        } else if (message.payload?.$case === 'authorityReceipt') {
-            obj.authorityReceipt = AuthorityReceipt.toJSON(message.payload.authorityReceipt);
+        } else if (message.payload?.$case === 'controllerContexts') {
+            obj.controllerContexts = ControllerContexts.toJSON(message.payload.controllerContexts);
+        } else if (message.payload?.$case === 'controllerContextsResult') {
+            obj.controllerContextsResult = ControllerContextsResult.toJSON(message.payload.controllerContextsResult);
+        } else if (message.payload?.$case === 'requestDecision') {
+            obj.requestDecision = RequestDecision.toJSON(message.payload.requestDecision);
         }
         return obj;
     }
@@ -1314,7 +1286,7 @@ export const SessionHello: MessageFns<SessionHello> = {
     fromJSON(value: unknown): SessionHello {
         const object = isObject(value) ? value : {};
         return {
-            nexus: isSet(object.nexus) ? ProcessRef.fromJSON(object.nexus) : undefined,
+            controller: isSet(object.controller) ? ProcessRef.fromJSON(object.controller) : undefined,
             connectionAttempt: isSet(object.connectionAttempt)
                 ? BigInt(globalThis.String(object.connectionAttempt))
                 : isSet(object.connection_attempt)
@@ -1324,14 +1296,15 @@ export const SessionHello: MessageFns<SessionHello> = {
             minMinor: isSet(object.minMinor) ? globalThis.Number(object.minMinor) : isSet(object.min_minor) ? globalThis.Number(object.min_minor) : 0,
             maxMinor: isSet(object.maxMinor) ? globalThis.Number(object.maxMinor) : isSet(object.max_minor) ? globalThis.Number(object.max_minor) : 0,
             capabilities: globalThis.Array.isArray(object?.capabilities) ? object.capabilities.map((e: unknown) => globalThis.String(e)) : [],
-            bounds: isSet(object.bounds) ? Bounds.fromJSON(object.bounds) : undefined
+            bounds: isSet(object.bounds) ? Bounds.fromJSON(object.bounds) : undefined,
+            recovery: isSet(object.recovery) ? ControllerRecovery.fromJSON(object.recovery) : undefined
         };
     },
 
     toJSON(message: SessionHello): unknown {
         const obj: Record<string, unknown> = {};
-        if (message.nexus !== undefined) {
-            obj.nexus = ProcessRef.toJSON(message.nexus);
+        if (message.controller !== undefined) {
+            obj.controller = ProcessRef.toJSON(message.controller);
         }
         if (message.connectionAttempt !== 0n) {
             obj.connectionAttempt = message.connectionAttempt.toString();
@@ -1350,6 +1323,92 @@ export const SessionHello: MessageFns<SessionHello> = {
         }
         if (message.bounds !== undefined) {
             obj.bounds = Bounds.toJSON(message.bounds);
+        }
+        if (message.recovery !== undefined) {
+            obj.recovery = ControllerRecovery.toJSON(message.recovery);
+        }
+        return obj;
+    }
+};
+
+export const ControllerRecovery: MessageFns<ControllerRecovery> = {
+    fromJSON(value: unknown): ControllerRecovery {
+        const object = isObject(value) ? value : {};
+        return {
+            application: isSet(object.application) ? ProcessRef.fromJSON(object.application) : undefined,
+            term: isSet(object.term) ? globalThis.String(object.term) : '',
+            token: isSet(object.token) ? globalThis.String(object.token) : '',
+            attemptId: isSet(object.attemptId)
+                ? globalThis.String(object.attemptId)
+                : isSet(object.attempt_id)
+                  ? globalThis.String(object.attempt_id)
+                  : '',
+            attachmentGeneration: isSet(object.attachmentGeneration)
+                ? BigInt(globalThis.String(object.attachmentGeneration))
+                : isSet(object.attachment_generation)
+                  ? BigInt(globalThis.String(object.attachment_generation))
+                  : 0n
+        };
+    },
+
+    toJSON(message: ControllerRecovery): unknown {
+        const obj: Record<string, unknown> = {};
+        if (message.application !== undefined) {
+            obj.application = ProcessRef.toJSON(message.application);
+        }
+        if (message.term !== '') {
+            obj.term = message.term;
+        }
+        if (message.token !== '') {
+            obj.token = message.token;
+        }
+        if (message.attemptId !== '') {
+            obj.attemptId = message.attemptId;
+        }
+        if (message.attachmentGeneration !== 0n) {
+            obj.attachmentGeneration = message.attachmentGeneration.toString();
+        }
+        return obj;
+    }
+};
+
+export const ControllerContexts: MessageFns<ControllerContexts> = {
+    fromJSON(value: unknown): ControllerContexts {
+        const object = isObject(value) ? value : {};
+        return {
+            cursor: isSet(object.cursor) ? globalThis.String(object.cursor) : '',
+            limit: isSet(object.limit) ? globalThis.Number(object.limit) : 0
+        };
+    },
+
+    toJSON(message: ControllerContexts): unknown {
+        const obj: Record<string, unknown> = {};
+        if (message.cursor !== '') {
+            obj.cursor = message.cursor;
+        }
+        if (message.limit !== 0) {
+            obj.limit = message.limit;
+        }
+        return obj;
+    }
+};
+
+export const ControllerContextsResult: MessageFns<ControllerContextsResult> = {
+    fromJSON(value: unknown): ControllerContextsResult {
+        const object = isObject(value) ? value : {};
+        return {
+            contexts: globalThis.Array.isArray(object?.contexts) ? object.contexts.map((e: unknown) => ContextRef.fromJSON(e)) : [],
+            cursor: isSet(object.cursor) ? globalThis.String(object.cursor) : ''
+        };
+    },
+
+    toJSON(message: ControllerContextsResult): unknown {
+        const obj: Record<string, unknown> = {};
+        if (message.contexts?.length) {
+            obj.contexts = message.contexts.map(e => ContextRef.toJSON(e));
+        }
+        if (message.cursor !== '') {
+            obj.cursor = message.cursor;
         }
         return obj;
     }
@@ -1452,7 +1511,33 @@ export const ApplicationLease: MessageFns<ApplicationLease> = {
                 ? BigInt(globalThis.String(object.expiresAtMs))
                 : isSet(object.expires_at_ms)
                   ? BigInt(globalThis.String(object.expires_at_ms))
-                  : 0n
+                  : 0n,
+            recoveryToken: isSet(object.recoveryToken)
+                ? globalThis.String(object.recoveryToken)
+                : isSet(object.recovery_token)
+                  ? globalThis.String(object.recovery_token)
+                  : '',
+            holder: isSet(object.holder) ? ProcessRef.fromJSON(object.holder) : undefined,
+            attachmentGeneration: isSet(object.attachmentGeneration)
+                ? BigInt(globalThis.String(object.attachmentGeneration))
+                : isSet(object.attachment_generation)
+                  ? BigInt(globalThis.String(object.attachment_generation))
+                  : 0n,
+            reattachUntilMs: isSet(object.reattachUntilMs)
+                ? BigInt(globalThis.String(object.reattachUntilMs))
+                : isSet(object.reattach_until_ms)
+                  ? BigInt(globalThis.String(object.reattach_until_ms))
+                  : 0n,
+            leaseLifetimeMs: isSet(object.leaseLifetimeMs)
+                ? globalThis.Number(object.leaseLifetimeMs)
+                : isSet(object.lease_lifetime_ms)
+                  ? globalThis.Number(object.lease_lifetime_ms)
+                  : 0,
+            reattachTimeoutMs: isSet(object.reattachTimeoutMs)
+                ? globalThis.Number(object.reattachTimeoutMs)
+                : isSet(object.reattach_timeout_ms)
+                  ? globalThis.Number(object.reattach_timeout_ms)
+                  : 0
         };
     },
 
@@ -1472,6 +1557,24 @@ export const ApplicationLease: MessageFns<ApplicationLease> = {
         }
         if (message.expiresAtMs !== 0n) {
             obj.expiresAtMs = message.expiresAtMs.toString();
+        }
+        if (message.recoveryToken !== '') {
+            obj.recoveryToken = message.recoveryToken;
+        }
+        if (message.holder !== undefined) {
+            obj.holder = ProcessRef.toJSON(message.holder);
+        }
+        if (message.attachmentGeneration !== 0n) {
+            obj.attachmentGeneration = message.attachmentGeneration.toString();
+        }
+        if (message.reattachUntilMs !== 0n) {
+            obj.reattachUntilMs = message.reattachUntilMs.toString();
+        }
+        if (message.leaseLifetimeMs !== 0) {
+            obj.leaseLifetimeMs = message.leaseLifetimeMs;
+        }
+        if (message.reattachTimeoutMs !== 0) {
+            obj.reattachTimeoutMs = message.reattachTimeoutMs;
         }
         return obj;
     }
@@ -2134,7 +2237,7 @@ export const RouteResult: MessageFns<RouteResult> = {
         const object = isObject(value) ? value : {};
         return {
             outcome: isSet(object.outcome) ? routeResult_OutcomeFromJSON(object.outcome) : 0,
-            nexus: isSet(object.nexus) ? ProcessRef.fromJSON(object.nexus) : undefined,
+            controller: isSet(object.controller) ? ProcessRef.fromJSON(object.controller) : undefined,
             sipStatus: isSet(object.sipStatus)
                 ? globalThis.Number(object.sipStatus)
                 : isSet(object.sip_status)
@@ -2148,8 +2251,8 @@ export const RouteResult: MessageFns<RouteResult> = {
         if (message.outcome !== 0) {
             obj.outcome = routeResult_OutcomeToJSON(message.outcome);
         }
-        if (message.nexus !== undefined) {
-            obj.nexus = ProcessRef.toJSON(message.nexus);
+        if (message.controller !== undefined) {
+            obj.controller = ProcessRef.toJSON(message.controller);
         }
         if (message.sipStatus !== 0) {
             obj.sipStatus = message.sipStatus;
@@ -2295,7 +2398,12 @@ export const ContextSnapshot: MessageFns<ContextSnapshot> = {
                 ? globalThis.String(object.applicationLeaseTerm)
                 : isSet(object.application_lease_term)
                   ? globalThis.String(object.application_lease_term)
-                  : ''
+                  : '',
+            attachmentGeneration: isSet(object.attachmentGeneration)
+                ? BigInt(globalThis.String(object.attachmentGeneration))
+                : isSet(object.attachment_generation)
+                  ? BigInt(globalThis.String(object.attachment_generation))
+                  : 0n
         };
     },
 
@@ -2376,6 +2484,9 @@ export const ContextSnapshot: MessageFns<ContextSnapshot> = {
         if (message.applicationLeaseTerm !== '') {
             obj.applicationLeaseTerm = message.applicationLeaseTerm;
         }
+        if (message.attachmentGeneration !== 0n) {
+            obj.attachmentGeneration = message.attachmentGeneration.toString();
+        }
         return obj;
     }
 };
@@ -2391,7 +2502,12 @@ export const RequestPresented: MessageFns<RequestPresented> = {
                   ? globalThis.String(object.request_id)
                   : '',
             message: isSet(object.message) ? SipMessage.fromJSON(object.message) : undefined,
-            flow: isSet(object.flow) ? FlowRef.fromJSON(object.flow) : undefined
+            flow: isSet(object.flow) ? FlowRef.fromJSON(object.flow) : undefined,
+            flowAdoption: isSet(object.flowAdoption)
+                ? FlowAdoptionRequest.fromJSON(object.flowAdoption)
+                : isSet(object.flow_adoption)
+                  ? FlowAdoptionRequest.fromJSON(object.flow_adoption)
+                  : undefined
         };
     },
 
@@ -2408,6 +2524,82 @@ export const RequestPresented: MessageFns<RequestPresented> = {
         }
         if (message.flow !== undefined) {
             obj.flow = FlowRef.toJSON(message.flow);
+        }
+        if (message.flowAdoption !== undefined) {
+            obj.flowAdoption = FlowAdoptionRequest.toJSON(message.flowAdoption);
+        }
+        return obj;
+    }
+};
+
+export const RequestDecision: MessageFns<RequestDecision> = {
+    fromJSON(value: unknown): RequestDecision {
+        const object = isObject(value) ? value : {};
+        return {
+            context: isSet(object.context) ? ContextRef.fromJSON(object.context) : undefined,
+            requestId: isSet(object.requestId)
+                ? globalThis.String(object.requestId)
+                : isSet(object.request_id)
+                  ? globalThis.String(object.request_id)
+                  : '',
+            sequence: isSet(object.sequence) ? BigInt(globalThis.String(object.sequence)) : 0n,
+            admission: isSet(object.admission) ? CommandAdmission.fromJSON(object.admission) : undefined,
+            basis: isSet(object.basis) ? ownerIngest_AdmissionFromJSON(object.basis) : 0,
+            principalId: isSet(object.principalId)
+                ? globalThis.String(object.principalId)
+                : isSet(object.principal_id)
+                  ? globalThis.String(object.principal_id)
+                  : '',
+            bindingId: isSet(object.bindingId)
+                ? globalThis.String(object.bindingId)
+                : isSet(object.binding_id)
+                  ? globalThis.String(object.binding_id)
+                  : '',
+            delivery: isSet(object.delivery) ? ContextDelivery.fromJSON(object.delivery) : undefined,
+            status: isSet(object.status) ? globalThis.Number(object.status) : 0,
+            headers: globalThis.Array.isArray(object?.headers) ? object.headers.map((e: unknown) => Header.fromJSON(e)) : [],
+            body: isSet(object.body) ? Buffer.from(bytesFromBase64(globalThis.String(object.body))) : Buffer.alloc(0),
+            notify: isSet(object.notify) ? DialogRequest.fromJSON(object.notify) : undefined
+        };
+    },
+
+    toJSON(message: RequestDecision): unknown {
+        const obj: Record<string, unknown> = {};
+        if (message.context !== undefined) {
+            obj.context = ContextRef.toJSON(message.context);
+        }
+        if (message.requestId !== '') {
+            obj.requestId = message.requestId;
+        }
+        if (message.sequence !== 0n) {
+            obj.sequence = message.sequence.toString();
+        }
+        if (message.admission !== undefined) {
+            obj.admission = CommandAdmission.toJSON(message.admission);
+        }
+        if (message.basis !== 0) {
+            obj.basis = ownerIngest_AdmissionToJSON(message.basis);
+        }
+        if (message.principalId !== '') {
+            obj.principalId = message.principalId;
+        }
+        if (message.bindingId !== '') {
+            obj.bindingId = message.bindingId;
+        }
+        if (message.delivery !== undefined) {
+            obj.delivery = ContextDelivery.toJSON(message.delivery);
+        }
+        if (message.status !== 0) {
+            obj.status = message.status;
+        }
+        if (message.headers?.length) {
+            obj.headers = message.headers.map(e => Header.toJSON(e));
+        }
+        if (message.body.length !== 0) {
+            obj.body = base64FromBytes(message.body);
+        }
+        if (message.notify !== undefined) {
+            obj.notify = DialogRequest.toJSON(message.notify);
         }
         return obj;
     }
@@ -2572,8 +2764,6 @@ export const NetworkTarget: MessageFns<NetworkTarget> = {
         return {
             proxy: isSet(object.proxy) ? globalThis.String(object.proxy) : '',
             transport: isSet(object.transport) ? globalThis.String(object.transport) : '',
-            username: isSet(object.username) ? globalThis.String(object.username) : '',
-            password: isSet(object.password) ? globalThis.String(object.password) : '',
             credential: isSet(object.credential) ? CredentialRef.fromJSON(object.credential) : undefined
         };
     },
@@ -2585,12 +2775,6 @@ export const NetworkTarget: MessageFns<NetworkTarget> = {
         }
         if (message.transport !== '') {
             obj.transport = message.transport;
-        }
-        if (message.username !== '') {
-            obj.username = message.username;
-        }
-        if (message.password !== '') {
-            obj.password = message.password;
         }
         if (message.credential !== undefined) {
             obj.credential = CredentialRef.toJSON(message.credential);
@@ -3019,17 +3203,6 @@ export const FlowWrite: MessageFns<FlowWrite> = {
         const object = isObject(value) ? value : {};
         return {
             flow: isSet(object.flow) ? FlowRef.fromJSON(object.flow) : undefined,
-            bindingId: isSet(object.bindingId)
-                ? globalThis.String(object.bindingId)
-                : isSet(object.binding_id)
-                  ? globalThis.String(object.binding_id)
-                  : '',
-            bindingRevision: isSet(object.bindingRevision)
-                ? BigInt(globalThis.String(object.bindingRevision))
-                : isSet(object.binding_revision)
-                  ? BigInt(globalThis.String(object.binding_revision))
-                  : 0n,
-            wire: isSet(object.wire) ? Buffer.from(bytesFromBase64(globalThis.String(object.wire))) : Buffer.alloc(0),
             effect: isSet(object.effect) ? StateEffectRef.fromJSON(object.effect) : undefined,
             permit: isSet(object.permit) ? SendPermit.fromJSON(object.permit) : undefined
         };
@@ -3039,15 +3212,6 @@ export const FlowWrite: MessageFns<FlowWrite> = {
         const obj: Record<string, unknown> = {};
         if (message.flow !== undefined) {
             obj.flow = FlowRef.toJSON(message.flow);
-        }
-        if (message.bindingId !== '') {
-            obj.bindingId = message.bindingId;
-        }
-        if (message.bindingRevision !== 0n) {
-            obj.bindingRevision = message.bindingRevision.toString();
-        }
-        if (message.wire.length !== 0) {
-            obj.wire = base64FromBytes(message.wire);
         }
         if (message.effect !== undefined) {
             obj.effect = StateEffectRef.toJSON(message.effect);
@@ -3083,27 +3247,6 @@ export const DeliveryResult: MessageFns<DeliveryResult> = {
         }
         if (message.recorded !== false) {
             obj.recorded = message.recorded;
-        }
-        return obj;
-    }
-};
-
-export const EffectSettlement: MessageFns<EffectSettlement> = {
-    fromJSON(value: unknown): EffectSettlement {
-        const object = isObject(value) ? value : {};
-        return {
-            write: isSet(object.write) ? FlowWrite.fromJSON(object.write) : undefined,
-            delivery: isSet(object.delivery) ? DeliveryResult.fromJSON(object.delivery) : undefined
-        };
-    },
-
-    toJSON(message: EffectSettlement): unknown {
-        const obj: Record<string, unknown> = {};
-        if (message.write !== undefined) {
-            obj.write = FlowWrite.toJSON(message.write);
-        }
-        if (message.delivery !== undefined) {
-            obj.delivery = DeliveryResult.toJSON(message.delivery);
         }
         return obj;
     }
@@ -3348,169 +3491,6 @@ export const FlowAdoptionResult: MessageFns<FlowAdoptionResult> = {
         }
         if (message.error !== '') {
             obj.error = message.error;
-        }
-        return obj;
-    }
-};
-
-export const ContextReconcile: MessageFns<ContextReconcile> = {
-    fromJSON(value: unknown): ContextReconcile {
-        const object = isObject(value) ? value : {};
-        return {
-            context: isSet(object.context) ? ContextRef.fromJSON(object.context) : undefined,
-            fromDirectoryEpoch: isSet(object.fromDirectoryEpoch)
-                ? globalThis.String(object.fromDirectoryEpoch)
-                : isSet(object.from_directory_epoch)
-                  ? globalThis.String(object.from_directory_epoch)
-                  : '',
-            directoryEpoch: isSet(object.directoryEpoch)
-                ? globalThis.String(object.directoryEpoch)
-                : isSet(object.directory_epoch)
-                  ? globalThis.String(object.directory_epoch)
-                  : ''
-        };
-    },
-
-    toJSON(message: ContextReconcile): unknown {
-        const obj: Record<string, unknown> = {};
-        if (message.context !== undefined) {
-            obj.context = ContextRef.toJSON(message.context);
-        }
-        if (message.fromDirectoryEpoch !== '') {
-            obj.fromDirectoryEpoch = message.fromDirectoryEpoch;
-        }
-        if (message.directoryEpoch !== '') {
-            obj.directoryEpoch = message.directoryEpoch;
-        }
-        return obj;
-    }
-};
-
-export const AuthorityReconcile: MessageFns<AuthorityReconcile> = {
-    fromJSON(value: unknown): AuthorityReconcile {
-        const object = isObject(value) ? value : {};
-        return {
-            snapshot: isSet(object.snapshot) ? ContextSnapshot.fromJSON(object.snapshot) : undefined,
-            fromDirectoryEpoch: isSet(object.fromDirectoryEpoch)
-                ? globalThis.String(object.fromDirectoryEpoch)
-                : isSet(object.from_directory_epoch)
-                  ? globalThis.String(object.from_directory_epoch)
-                  : '',
-            directoryEpoch: isSet(object.directoryEpoch)
-                ? globalThis.String(object.directoryEpoch)
-                : isSet(object.directory_epoch)
-                  ? globalThis.String(object.directory_epoch)
-                  : '',
-            token: isSet(object.token) ? globalThis.String(object.token) : '',
-            barrierRevision: isSet(object.barrierRevision)
-                ? BigInt(globalThis.String(object.barrierRevision))
-                : isSet(object.barrier_revision)
-                  ? BigInt(globalThis.String(object.barrier_revision))
-                  : 0n,
-            origin: isSet(object.origin) ? SipMessage.fromJSON(object.origin) : undefined,
-            completionScope: isSet(object.completionScope)
-                ? globalThis.String(object.completionScope)
-                : isSet(object.completion_scope)
-                  ? globalThis.String(object.completion_scope)
-                  : '',
-            flow: isSet(object.flow) ? FlowRef.fromJSON(object.flow) : undefined
-        };
-    },
-
-    toJSON(message: AuthorityReconcile): unknown {
-        const obj: Record<string, unknown> = {};
-        if (message.snapshot !== undefined) {
-            obj.snapshot = ContextSnapshot.toJSON(message.snapshot);
-        }
-        if (message.fromDirectoryEpoch !== '') {
-            obj.fromDirectoryEpoch = message.fromDirectoryEpoch;
-        }
-        if (message.directoryEpoch !== '') {
-            obj.directoryEpoch = message.directoryEpoch;
-        }
-        if (message.token !== '') {
-            obj.token = message.token;
-        }
-        if (message.barrierRevision !== 0n) {
-            obj.barrierRevision = message.barrierRevision.toString();
-        }
-        if (message.origin !== undefined) {
-            obj.origin = SipMessage.toJSON(message.origin);
-        }
-        if (message.completionScope !== '') {
-            obj.completionScope = message.completionScope;
-        }
-        if (message.flow !== undefined) {
-            obj.flow = FlowRef.toJSON(message.flow);
-        }
-        return obj;
-    }
-};
-
-export const AuthorityReceipt: MessageFns<AuthorityReceipt> = {
-    fromJSON(value: unknown): AuthorityReceipt {
-        const object = isObject(value) ? value : {};
-        return {
-            context: isSet(object.context) ? ContextRef.fromJSON(object.context) : undefined,
-            application: isSet(object.application) ? ProcessRef.fromJSON(object.application) : undefined,
-            fromDirectoryEpoch: isSet(object.fromDirectoryEpoch)
-                ? globalThis.String(object.fromDirectoryEpoch)
-                : isSet(object.from_directory_epoch)
-                  ? globalThis.String(object.from_directory_epoch)
-                  : '',
-            directoryEpoch: isSet(object.directoryEpoch)
-                ? globalThis.String(object.directoryEpoch)
-                : isSet(object.directory_epoch)
-                  ? globalThis.String(object.directory_epoch)
-                  : '',
-            token: isSet(object.token) ? globalThis.String(object.token) : '',
-            barrierRevision: isSet(object.barrierRevision)
-                ? BigInt(globalThis.String(object.barrierRevision))
-                : isSet(object.barrier_revision)
-                  ? BigInt(globalThis.String(object.barrier_revision))
-                  : 0n,
-            completionScope: isSet(object.completionScope)
-                ? globalThis.String(object.completionScope)
-                : isSet(object.completion_scope)
-                  ? globalThis.String(object.completion_scope)
-                  : '',
-            delivery: isSet(object.delivery) ? ContextDelivery.fromJSON(object.delivery) : undefined,
-            ownerLost: isSet(object.ownerLost)
-                ? globalThis.Boolean(object.ownerLost)
-                : isSet(object.owner_lost)
-                  ? globalThis.Boolean(object.owner_lost)
-                  : false
-        };
-    },
-
-    toJSON(message: AuthorityReceipt): unknown {
-        const obj: Record<string, unknown> = {};
-        if (message.context !== undefined) {
-            obj.context = ContextRef.toJSON(message.context);
-        }
-        if (message.application !== undefined) {
-            obj.application = ProcessRef.toJSON(message.application);
-        }
-        if (message.fromDirectoryEpoch !== '') {
-            obj.fromDirectoryEpoch = message.fromDirectoryEpoch;
-        }
-        if (message.directoryEpoch !== '') {
-            obj.directoryEpoch = message.directoryEpoch;
-        }
-        if (message.token !== '') {
-            obj.token = message.token;
-        }
-        if (message.barrierRevision !== 0n) {
-            obj.barrierRevision = message.barrierRevision.toString();
-        }
-        if (message.completionScope !== '') {
-            obj.completionScope = message.completionScope;
-        }
-        if (message.delivery !== undefined) {
-            obj.delivery = ContextDelivery.toJSON(message.delivery);
-        }
-        if (message.ownerLost !== false) {
-            obj.ownerLost = message.ownerLost;
         }
         return obj;
     }

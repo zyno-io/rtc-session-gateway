@@ -14,7 +14,7 @@ export interface JsonMessage {
     oneofs: readonly string[];
 }
 export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
-    '.zyno.sipbridge.v1.Envelope': {
+    '.sipbridge.control.v1.Envelope': {
         fields: {
             correlationId: {
                 kind: 'string',
@@ -30,181 +30,169 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             hello: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SessionHello',
+                message: '.sipbridge.control.v1.SessionHello',
                 oneof: 'payload'
             },
             helloAck: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SessionHelloAck',
+                message: '.sipbridge.control.v1.SessionHelloAck',
                 oneof: 'payload',
                 alias: 'hello_ack'
             },
             status: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SessionStatus',
+                message: '.sipbridge.control.v1.SessionStatus',
                 oneof: 'payload'
             },
             ping: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Heartbeat',
+                message: '.sipbridge.control.v1.Heartbeat',
                 oneof: 'payload'
             },
             pong: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Heartbeat',
+                message: '.sipbridge.control.v1.Heartbeat',
                 oneof: 'payload'
             },
             ingress: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.IngressReceived',
+                message: '.sipbridge.control.v1.IngressReceived',
                 oneof: 'payload'
             },
             routeResult: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.RouteResult',
+                message: '.sipbridge.control.v1.RouteResult',
                 oneof: 'payload',
                 alias: 'route_result'
             },
             ingest: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.OwnerIngest',
+                message: '.sipbridge.control.v1.OwnerIngest',
                 oneof: 'payload'
             },
             request: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.RequestPresented',
+                message: '.sipbridge.control.v1.RequestPresented',
                 oneof: 'payload'
             },
             command: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Command',
+                message: '.sipbridge.control.v1.Command',
                 oneof: 'payload'
             },
             result: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.OperationResult',
+                message: '.sipbridge.control.v1.OperationResult',
                 oneof: 'payload'
             },
             egress: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.EgressRequest',
+                message: '.sipbridge.control.v1.EgressRequest',
                 oneof: 'payload'
             },
             write: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowWrite',
+                message: '.sipbridge.control.v1.FlowWrite',
                 oneof: 'payload'
             },
             delivery: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.DeliveryResult',
+                message: '.sipbridge.control.v1.DeliveryResult',
                 oneof: 'payload'
             },
             flowClosed: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowClosed',
+                message: '.sipbridge.control.v1.FlowClosed',
                 oneof: 'payload',
                 alias: 'flow_closed'
             },
             dialogEvent: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.DialogEvent',
+                message: '.sipbridge.control.v1.DialogEvent',
                 oneof: 'payload',
                 alias: 'dialog_event'
             },
             inspect: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextInspect',
+                message: '.sipbridge.control.v1.ContextInspect',
                 oneof: 'payload'
             },
             flowAdoption: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowAdoptionRequest',
+                message: '.sipbridge.control.v1.FlowAdoptionRequest',
                 oneof: 'payload',
                 alias: 'flow_adoption'
             },
             flowAdoptionResult: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowAdoptionResult',
+                message: '.sipbridge.control.v1.FlowAdoptionResult',
                 oneof: 'payload',
                 alias: 'flow_adoption_result'
             },
             sendPermit: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SendPermit',
+                message: '.sipbridge.control.v1.SendPermit',
                 oneof: 'payload',
                 alias: 'send_permit'
             },
             deliverEffect: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowWrite',
+                message: '.sipbridge.control.v1.FlowWrite',
                 oneof: 'payload',
                 alias: 'deliver_effect'
             },
             credentialLookup: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.CredentialLookup',
+                message: '.sipbridge.control.v1.CredentialLookup',
                 oneof: 'payload',
                 alias: 'credential_lookup'
             },
             credentialResult: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.CredentialResult',
+                message: '.sipbridge.control.v1.CredentialResult',
                 oneof: 'payload',
                 alias: 'credential_result'
             },
             inspectEffect: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowWrite',
+                message: '.sipbridge.control.v1.FlowWrite',
                 oneof: 'payload',
                 alias: 'inspect_effect'
             },
-            settleEffect: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.EffectSettlement',
-                oneof: 'payload',
-                alias: 'settle_effect'
-            },
-            retireAuthority: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextSnapshot',
-                oneof: 'payload',
-                alias: 'retire_authority'
-            },
             probeApplication: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ApplicationProbe',
+                message: '.sipbridge.control.v1.ApplicationProbe',
                 oneof: 'payload',
                 alias: 'probe_application'
             },
             applicationStatus: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ApplicationStatus',
+                message: '.sipbridge.control.v1.ApplicationStatus',
                 oneof: 'payload',
                 alias: 'application_status'
             },
-            reconcileContext: {
+            controllerContexts: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextReconcile',
+                message: '.sipbridge.control.v1.ControllerContexts',
                 oneof: 'payload',
-                alias: 'reconcile_context'
+                alias: 'controller_contexts'
             },
-            reconcileAuthority: {
+            controllerContextsResult: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.AuthorityReconcile',
+                message: '.sipbridge.control.v1.ControllerContextsResult',
                 oneof: 'payload',
-                alias: 'reconcile_authority'
+                alias: 'controller_contexts_result'
             },
-            authorityReceipt: {
+            requestDecision: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.AuthorityReceipt',
+                message: '.sipbridge.control.v1.RequestDecision',
                 oneof: 'payload',
-                alias: 'authority_receipt'
+                alias: 'request_decision'
             }
         },
         oneofs: ['payload']
     },
-    '.zyno.sipbridge.v1.ProcessRef': {
+    '.sipbridge.control.v1.ProcessRef': {
         fields: {
             instanceId: {
                 kind: 'string',
@@ -216,7 +204,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Bounds': {
+    '.sipbridge.control.v1.Bounds': {
         fields: {
             maxEnvelopeBytes: {
                 kind: 'uint32',
@@ -225,11 +213,11 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.SessionHello': {
+    '.sipbridge.control.v1.SessionHello': {
         fields: {
-            nexus: {
+            controller: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             connectionAttempt: {
                 kind: 'uint64',
@@ -252,16 +240,67 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             bounds: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Bounds'
+                message: '.sipbridge.control.v1.Bounds'
+            },
+            recovery: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.ControllerRecovery'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.SessionHelloAck': {
+    '.sipbridge.control.v1.ControllerRecovery': {
+        fields: {
+            application: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.ProcessRef'
+            },
+            term: {
+                kind: 'string'
+            },
+            token: {
+                kind: 'string'
+            },
+            attemptId: {
+                kind: 'string',
+                alias: 'attempt_id'
+            },
+            attachmentGeneration: {
+                kind: 'uint64',
+                alias: 'attachment_generation'
+            }
+        },
+        oneofs: []
+    },
+    '.sipbridge.control.v1.ControllerContexts': {
+        fields: {
+            cursor: {
+                kind: 'string'
+            },
+            limit: {
+                kind: 'uint32'
+            }
+        },
+        oneofs: []
+    },
+    '.sipbridge.control.v1.ControllerContextsResult': {
+        fields: {
+            contexts: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.ContextRef',
+                repeated: true
+            },
+            cursor: {
+                kind: 'string'
+            }
+        },
+        oneofs: []
+    },
+    '.sipbridge.control.v1.SessionHelloAck': {
         fields: {
             sipbridge: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             sessionId: {
                 kind: 'string',
@@ -279,7 +318,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             bounds: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Bounds'
+                message: '.sipbridge.control.v1.Bounds'
             },
             heartbeatIntervalMs: {
                 kind: 'uint32',
@@ -291,31 +330,31 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             stateAuthority: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateAuthority',
+                message: '.sipbridge.control.v1.StateAuthority',
                 alias: 'state_authority'
             },
             applicationLease: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ApplicationLease',
+                message: '.sipbridge.control.v1.ApplicationLease',
                 alias: 'application_lease'
             },
             inboundAuthPolicy: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.InboundAuthPolicy',
+                message: '.sipbridge.control.v1.InboundAuthPolicy',
                 alias: 'inbound_auth_policy'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ApplicationLease': {
+    '.sipbridge.control.v1.ApplicationLease': {
         fields: {
             application: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             authority: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateAuthority'
+                message: '.sipbridge.control.v1.StateAuthority'
             },
             term: {
                 kind: 'string'
@@ -327,11 +366,35 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             expiresAtMs: {
                 kind: 'uint64',
                 alias: 'expires_at_ms'
+            },
+            recoveryToken: {
+                kind: 'string',
+                alias: 'recovery_token'
+            },
+            holder: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.ProcessRef'
+            },
+            attachmentGeneration: {
+                kind: 'uint64',
+                alias: 'attachment_generation'
+            },
+            reattachUntilMs: {
+                kind: 'uint64',
+                alias: 'reattach_until_ms'
+            },
+            leaseLifetimeMs: {
+                kind: 'uint32',
+                alias: 'lease_lifetime_ms'
+            },
+            reattachTimeoutMs: {
+                kind: 'uint32',
+                alias: 'reattach_timeout_ms'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.SessionStatus': {
+    '.sipbridge.control.v1.SessionStatus': {
         fields: {
             retainedReady: {
                 kind: 'boolean',
@@ -354,13 +417,13 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             digestChallengePolicy: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.DigestChallengePolicy',
+                message: '.sipbridge.control.v1.DigestChallengePolicy',
                 alias: 'digest_challenge_policy'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.InboundAuthPolicy': {
+    '.sipbridge.control.v1.InboundAuthPolicy': {
         fields: {
             requireRegister: {
                 kind: 'boolean',
@@ -377,7 +440,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.DigestChallengePolicy': {
+    '.sipbridge.control.v1.DigestChallengePolicy': {
         fields: {
             realm: {
                 kind: 'string'
@@ -397,7 +460,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Heartbeat': {
+    '.sipbridge.control.v1.Heartbeat': {
         fields: {
             nonce: {
                 kind: 'string'
@@ -405,11 +468,11 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.FlowRef': {
+    '.sipbridge.control.v1.FlowRef': {
         fields: {
             ingress: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             connectionId: {
                 kind: 'string',
@@ -432,7 +495,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.StateAuthority': {
+    '.sipbridge.control.v1.StateAuthority': {
         fields: {
             service: {
                 kind: 'string'
@@ -451,11 +514,11 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.StateRef': {
+    '.sipbridge.control.v1.StateRef': {
         fields: {
             authority: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateAuthority'
+                message: '.sipbridge.control.v1.StateAuthority'
             },
             groupId: {
                 kind: 'string',
@@ -474,23 +537,23 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ContextRef': {
+    '.sipbridge.control.v1.ContextRef': {
         fields: {
             owner: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             id: {
                 kind: 'string'
             },
             state: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateRef'
+                message: '.sipbridge.control.v1.StateRef'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Header': {
+    '.sipbridge.control.v1.Header': {
         fields: {
             name: {
                 kind: 'string'
@@ -501,7 +564,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Address': {
+    '.sipbridge.control.v1.Address': {
         fields: {
             name: {
                 kind: 'string'
@@ -516,17 +579,17 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.AddressList': {
+    '.sipbridge.control.v1.AddressList': {
         fields: {
             values: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Address',
+                message: '.sipbridge.control.v1.Address',
                 repeated: true
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Via': {
+    '.sipbridge.control.v1.Via': {
         fields: {
             protocol: {
                 kind: 'string'
@@ -544,7 +607,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.DigestCredentials': {
+    '.sipbridge.control.v1.DigestCredentials': {
         fields: {
             username: {
                 kind: 'string'
@@ -576,7 +639,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.SipMessage': {
+    '.sipbridge.control.v1.SipMessage': {
         fields: {
             wire: {
                 kind: 'bytes'
@@ -598,17 +661,17 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             headers: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Header',
+                message: '.sipbridge.control.v1.Header',
                 repeated: true
             },
             addresses: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.AddressList',
+                message: '.sipbridge.control.v1.AddressList',
                 map: true
             },
             vias: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Via',
+                message: '.sipbridge.control.v1.Via',
                 repeated: true
             },
             selectors: {
@@ -617,37 +680,37 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             authorization: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.DigestCredentials'
+                message: '.sipbridge.control.v1.DigestCredentials'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.IngressReceived': {
+    '.sipbridge.control.v1.IngressReceived': {
         fields: {
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
+                message: '.sipbridge.control.v1.FlowRef'
             },
             message: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SipMessage'
+                message: '.sipbridge.control.v1.SipMessage'
             },
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.RouteResult': {
+    '.sipbridge.control.v1.RouteResult': {
         fields: {
             outcome: {
                 kind: 'enum',
                 values: ['UNSPECIFIED', 'ACCEPTED', 'REDIRECT', 'REJECTED', 'UNAVAILABLE']
             },
-            nexus: {
+            controller: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             sipStatus: {
                 kind: 'uint32',
@@ -656,19 +719,19 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.OwnerIngest': {
+    '.sipbridge.control.v1.OwnerIngest': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             application: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
+                message: '.sipbridge.control.v1.FlowRef'
             },
             wire: {
                 kind: 'bytes'
@@ -691,15 +754,15 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ContextSnapshot': {
+    '.sipbridge.control.v1.ContextSnapshot': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             application: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             bindingId: {
                 kind: 'string',
@@ -775,11 +838,11 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             delivery: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextDelivery'
+                message: '.sipbridge.control.v1.ContextDelivery'
             },
             executor: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             directoryEpoch: {
                 kind: 'string',
@@ -788,15 +851,19 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             applicationLeaseTerm: {
                 kind: 'string',
                 alias: 'application_lease_term'
+            },
+            attachmentGeneration: {
+                kind: 'uint64',
+                alias: 'attachment_generation'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.RequestPresented': {
+    '.sipbridge.control.v1.RequestPresented': {
         fields: {
             snapshot: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextSnapshot'
+                message: '.sipbridge.control.v1.ContextSnapshot'
             },
             requestId: {
                 kind: 'string',
@@ -804,16 +871,72 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             message: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SipMessage'
+                message: '.sipbridge.control.v1.SipMessage'
             },
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
+                message: '.sipbridge.control.v1.FlowRef'
+            },
+            flowAdoption: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.FlowAdoptionRequest',
+                alias: 'flow_adoption'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ResponseAuthority': {
+    '.sipbridge.control.v1.RequestDecision': {
+        fields: {
+            context: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.ContextRef'
+            },
+            requestId: {
+                kind: 'string',
+                alias: 'request_id'
+            },
+            sequence: {
+                kind: 'uint64'
+            },
+            admission: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.CommandAdmission'
+            },
+            basis: {
+                kind: 'enum',
+                values: ['UNSPECIFIED', 'EXISTING_FLOW', 'AUTHENTICATED_BINDING', 'TLS_DIALOG_CONTINUITY', 'TLS_TRANSACTION_CONTINUITY']
+            },
+            principalId: {
+                kind: 'string',
+                alias: 'principal_id'
+            },
+            bindingId: {
+                kind: 'string',
+                alias: 'binding_id'
+            },
+            delivery: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.ContextDelivery'
+            },
+            status: {
+                kind: 'uint32'
+            },
+            headers: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.Header',
+                repeated: true
+            },
+            body: {
+                kind: 'bytes'
+            },
+            notify: {
+                kind: 'message',
+                message: '.sipbridge.control.v1.DialogRequest'
+            }
+        },
+        oneofs: []
+    },
+    '.sipbridge.control.v1.ResponseAuthority': {
         fields: {
             directoryEpoch: {
                 kind: 'string',
@@ -826,7 +949,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Respond': {
+    '.sipbridge.control.v1.Respond': {
         fields: {
             requestId: {
                 kind: 'string',
@@ -837,7 +960,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             headers: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Header',
+                message: '.sipbridge.control.v1.Header',
                 repeated: true
             },
             body: {
@@ -853,12 +976,12 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             authority: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ResponseAuthority'
+                message: '.sipbridge.control.v1.ResponseAuthority'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.CredentialRef': {
+    '.sipbridge.control.v1.CredentialRef': {
         fields: {
             id: {
                 kind: 'string'
@@ -869,20 +992,20 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.CredentialLookup': {
+    '.sipbridge.control.v1.CredentialLookup': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             credential: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.CredentialRef'
+                message: '.sipbridge.control.v1.CredentialRef'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.CredentialResult': {
+    '.sipbridge.control.v1.CredentialResult': {
         fields: {
             username: {
                 kind: 'string'
@@ -899,7 +1022,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.NetworkTarget': {
+    '.sipbridge.control.v1.NetworkTarget': {
         fields: {
             proxy: {
                 kind: 'string'
@@ -907,20 +1030,14 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             transport: {
                 kind: 'string'
             },
-            username: {
-                kind: 'string'
-            },
-            password: {
-                kind: 'string'
-            },
             credential: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.CredentialRef'
+                message: '.sipbridge.control.v1.CredentialRef'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.OpenUac': {
+    '.sipbridge.control.v1.OpenUac': {
         fields: {
             uri: {
                 kind: 'string'
@@ -930,7 +1047,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             headers: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Header',
+                message: '.sipbridge.control.v1.Header',
                 repeated: true
             },
             bindingId: {
@@ -943,7 +1060,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             network: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.NetworkTarget'
+                message: '.sipbridge.control.v1.NetworkTarget'
             },
             transport: {
                 kind: 'string'
@@ -954,7 +1071,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.DialogRequest': {
+    '.sipbridge.control.v1.DialogRequest': {
         fields: {
             method: {
                 kind: 'string'
@@ -964,17 +1081,17 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             headers: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Header',
+                message: '.sipbridge.control.v1.Header',
                 repeated: true
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Cancel': {
+    '.sipbridge.control.v1.Cancel': {
         fields: {},
         oneofs: []
     },
-    '.zyno.sipbridge.v1.CommandAdmission': {
+    '.sipbridge.control.v1.CommandAdmission': {
         fields: {
             directoryEpoch: {
                 kind: 'string',
@@ -986,56 +1103,56 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             selectedFlow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef',
+                message: '.sipbridge.control.v1.FlowRef',
                 alias: 'selected_flow'
             },
             expectedDelivery: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextDelivery',
+                message: '.sipbridge.control.v1.ContextDelivery',
                 alias: 'expected_delivery'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.Command': {
+    '.sipbridge.control.v1.Command': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             sequence: {
                 kind: 'uint64'
             },
             admission: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.CommandAdmission'
+                message: '.sipbridge.control.v1.CommandAdmission'
             },
             respond: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Respond',
+                message: '.sipbridge.control.v1.Respond',
                 oneof: 'action'
             },
             openUac: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.OpenUac',
+                message: '.sipbridge.control.v1.OpenUac',
                 oneof: 'action',
                 alias: 'open_uac'
             },
             dialogRequest: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.DialogRequest',
+                message: '.sipbridge.control.v1.DialogRequest',
                 oneof: 'action',
                 alias: 'dialog_request'
             },
             cancel: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.Cancel',
+                message: '.sipbridge.control.v1.Cancel',
                 oneof: 'action'
             }
         },
         oneofs: ['action']
     },
-    '.zyno.sipbridge.v1.OperationResult': {
+    '.sipbridge.control.v1.OperationResult': {
         fields: {
             certainty: {
                 kind: 'enum',
@@ -1050,33 +1167,33 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             snapshot: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextSnapshot'
+                message: '.sipbridge.control.v1.ContextSnapshot'
             },
             request: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SipMessage'
+                message: '.sipbridge.control.v1.SipMessage'
             },
             response: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SipMessage'
+                message: '.sipbridge.control.v1.SipMessage'
             },
             retirementProof: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRetirementProof',
+                message: '.sipbridge.control.v1.ContextRetirementProof',
                 alias: 'retirement_proof'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ContextRetirementProof': {
+    '.sipbridge.control.v1.ContextRetirementProof': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             authority: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateAuthority'
+                message: '.sipbridge.control.v1.StateAuthority'
             },
             reason: {
                 kind: 'enum',
@@ -1085,11 +1202,11 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.StateEffectRef': {
+    '.sipbridge.control.v1.StateEffectRef': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             id: {
                 kind: 'string'
@@ -1101,11 +1218,11 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.EffectAuthorization': {
+    '.sipbridge.control.v1.EffectAuthorization': {
         fields: {
             effect: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateEffectRef'
+                message: '.sipbridge.control.v1.StateEffectRef'
             },
             authorityClass: {
                 kind: 'enum',
@@ -1130,15 +1247,15 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.SendPermit': {
+    '.sipbridge.control.v1.SendPermit': {
         fields: {
             authorization: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.EffectAuthorization'
+                message: '.sipbridge.control.v1.EffectAuthorization'
             },
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
+                message: '.sipbridge.control.v1.FlowRef'
             },
             directoryEpoch: {
                 kind: 'string',
@@ -1155,57 +1272,46 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.EgressRequest': {
+    '.sipbridge.control.v1.EgressRequest': {
         fields: {
             snapshot: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextSnapshot'
+                message: '.sipbridge.control.v1.ContextSnapshot'
             },
             message: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SipMessage'
+                message: '.sipbridge.control.v1.SipMessage'
             },
             returnFlow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef',
+                message: '.sipbridge.control.v1.FlowRef',
                 alias: 'return_flow'
             },
             authorization: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.EffectAuthorization'
+                message: '.sipbridge.control.v1.EffectAuthorization'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.FlowWrite': {
+    '.sipbridge.control.v1.FlowWrite': {
         fields: {
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
-            },
-            bindingId: {
-                kind: 'string',
-                alias: 'binding_id'
-            },
-            bindingRevision: {
-                kind: 'uint64',
-                alias: 'binding_revision'
-            },
-            wire: {
-                kind: 'bytes'
+                message: '.sipbridge.control.v1.FlowRef'
             },
             effect: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateEffectRef'
+                message: '.sipbridge.control.v1.StateEffectRef'
             },
             permit: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SendPermit'
+                message: '.sipbridge.control.v1.SendPermit'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.DeliveryResult': {
+    '.sipbridge.control.v1.DeliveryResult': {
         fields: {
             outcome: {
                 kind: 'enum',
@@ -1216,7 +1322,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             effect: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.StateEffectRef'
+                message: '.sipbridge.control.v1.StateEffectRef'
             },
             recorded: {
                 kind: 'boolean'
@@ -1224,41 +1330,28 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.EffectSettlement': {
+    '.sipbridge.control.v1.ApplicationProbe': {
         fields: {
-            write: {
+            context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowWrite'
+                message: '.sipbridge.control.v1.ContextRef'
             },
-            delivery: {
+            application: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.DeliveryResult'
+                message: '.sipbridge.control.v1.ProcessRef'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ApplicationProbe': {
+    '.sipbridge.control.v1.ApplicationStatus': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             application: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
-            }
-        },
-        oneofs: []
-    },
-    '.zyno.sipbridge.v1.ApplicationStatus': {
-        fields: {
-            context: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
-            },
-            application: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             directoryEpoch: {
                 kind: 'string',
@@ -1274,16 +1367,16 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.FlowClosed': {
+    '.sipbridge.control.v1.FlowClosed': {
         fields: {
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
+                message: '.sipbridge.control.v1.FlowRef'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.DialogEvent': {
+    '.sipbridge.control.v1.DialogEvent': {
         fields: {
             kind: {
                 kind: 'enum',
@@ -1291,11 +1384,11 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             snapshot: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextSnapshot'
+                message: '.sipbridge.control.v1.ContextSnapshot'
             },
             message: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.SipMessage'
+                message: '.sipbridge.control.v1.SipMessage'
             },
             operationId: {
                 kind: 'string',
@@ -1307,20 +1400,20 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ContextInspect': {
+    '.sipbridge.control.v1.ContextInspect': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             }
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.ContextDelivery': {
+    '.sipbridge.control.v1.ContextDelivery': {
         fields: {
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
+                message: '.sipbridge.control.v1.FlowRef'
             },
             nativeRevision: {
                 kind: 'uint64',
@@ -1337,15 +1430,15 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.FlowAdoptionRequest': {
+    '.sipbridge.control.v1.FlowAdoptionRequest': {
         fields: {
             context: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
+                message: '.sipbridge.control.v1.ContextRef'
             },
             application: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
+                message: '.sipbridge.control.v1.ProcessRef'
             },
             principalId: {
                 kind: 'string',
@@ -1357,7 +1450,7 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
             },
             flow: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
+                message: '.sipbridge.control.v1.FlowRef'
             },
             nativeRevision: {
                 kind: 'uint64',
@@ -1369,107 +1462,14 @@ export const SIPBRIDGE_JSON_MESSAGES: Record<string, JsonMessage> = {
         },
         oneofs: []
     },
-    '.zyno.sipbridge.v1.FlowAdoptionResult': {
+    '.sipbridge.control.v1.FlowAdoptionResult': {
         fields: {
             receipt: {
                 kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextDelivery'
+                message: '.sipbridge.control.v1.ContextDelivery'
             },
             error: {
                 kind: 'string'
-            }
-        },
-        oneofs: []
-    },
-    '.zyno.sipbridge.v1.ContextReconcile': {
-        fields: {
-            context: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
-            },
-            fromDirectoryEpoch: {
-                kind: 'string',
-                alias: 'from_directory_epoch'
-            },
-            directoryEpoch: {
-                kind: 'string',
-                alias: 'directory_epoch'
-            }
-        },
-        oneofs: []
-    },
-    '.zyno.sipbridge.v1.AuthorityReconcile': {
-        fields: {
-            snapshot: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextSnapshot'
-            },
-            fromDirectoryEpoch: {
-                kind: 'string',
-                alias: 'from_directory_epoch'
-            },
-            directoryEpoch: {
-                kind: 'string',
-                alias: 'directory_epoch'
-            },
-            token: {
-                kind: 'string'
-            },
-            barrierRevision: {
-                kind: 'uint64',
-                alias: 'barrier_revision'
-            },
-            origin: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.SipMessage'
-            },
-            completionScope: {
-                kind: 'string',
-                alias: 'completion_scope'
-            },
-            flow: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.FlowRef'
-            }
-        },
-        oneofs: []
-    },
-    '.zyno.sipbridge.v1.AuthorityReceipt': {
-        fields: {
-            context: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextRef'
-            },
-            application: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ProcessRef'
-            },
-            fromDirectoryEpoch: {
-                kind: 'string',
-                alias: 'from_directory_epoch'
-            },
-            directoryEpoch: {
-                kind: 'string',
-                alias: 'directory_epoch'
-            },
-            token: {
-                kind: 'string'
-            },
-            barrierRevision: {
-                kind: 'uint64',
-                alias: 'barrier_revision'
-            },
-            completionScope: {
-                kind: 'string',
-                alias: 'completion_scope'
-            },
-            delivery: {
-                kind: 'message',
-                message: '.zyno.sipbridge.v1.ContextDelivery'
-            },
-            ownerLost: {
-                kind: 'boolean',
-                alias: 'owner_lost'
             }
         },
         oneofs: []

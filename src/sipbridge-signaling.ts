@@ -9,8 +9,8 @@ import {
     SIPBRIDGE_NATIVE_COMPLETION_CAPABILITY,
     SIPBRIDGE_COMMAND_ADMISSION_CAPABILITY,
     SIPBRIDGE_COMMAND_BUDGET_CAPABILITY,
-    SIPBRIDGE_DIRECTORY_RECONCILE_CAPABILITY,
-    SIPBRIDGE_COMPLETION_RELAY_CAPABILITY
+    SIPBRIDGE_CONTINUITY_CAPABILITY,
+    SIPBRIDGE_REQUEST_DECISION_CAPABILITY
 } from './sipbridge/codec';
 import {
     Command,
@@ -20,12 +20,12 @@ import {
     DialogEvent_Kind,
     OperationResult_Certainty,
     OwnerIngest_Admission,
-    RouteResult_Outcome,
     type ContextRef,
     type Envelope,
     type FlowRef,
     type ProcessRef,
     RequestPresented,
+    type RequestDecision,
     type SipMessage
 } from './sipbridge/generated/sipbridge-control';
 import type { OutboundSipCallParams } from './sip-gateway';
@@ -36,8 +36,8 @@ const capabilities = [
     SIPBRIDGE_NATIVE_COMPLETION_CAPABILITY,
     SIPBRIDGE_COMMAND_ADMISSION_CAPABILITY,
     SIPBRIDGE_COMMAND_BUDGET_CAPABILITY,
-    SIPBRIDGE_DIRECTORY_RECONCILE_CAPABILITY,
-    SIPBRIDGE_COMPLETION_RELAY_CAPABILITY
+    SIPBRIDGE_CONTINUITY_CAPABILITY,
+    SIPBRIDGE_REQUEST_DECISION_CAPABILITY
 ];
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const processEqual = (a?: ProcessRef, b?: ProcessRef) => a?.instanceId === b?.instanceId && a?.epoch === b?.epoch;
@@ -392,60 +392,10 @@ export class SipbridgeSignaling extends EventEmitter {
     private async receive(peer: Peer, client: SipbridgeControlClient, frame: Envelope) {
         if (this.stopped || (peer.client && peer.client !== client)) return;
         const body = frame.payload;
-        if (body?.$case === 'ingress') {
-            const { context, flow, message } = body.ingress;
-            if (!message || !flow?.ingress) throw new Error('Incomplete native ingress');
-            let state: Context | undefined;
-            if (context) state = this.contexts.get(contextKey(context));
-            const fresh =
-                !state &&
-                message.status === 0 &&
-                !message.addresses.to?.values.some(address => address.params.tag) &&
-                !['ACK', 'CANCEL', 'BYE'].includes(message.method);
-            if (
-                (!state && !fresh) ||
-                (fresh && (!this.isConnected || !this.applicationReady() || this.isDraining() || !this.acceptingIngress(message)))
-            ) {
-                await client.reply(frame.correlationId, {
-                    $case: 'routeResult',
-                    routeResult: { outcome: RouteResult_Outcome.REJECTED, sipStatus: fresh ? 503 : 481 }
-                });
-                return;
-            }
-            // No header/Call-ID matching, socket migration or arbitrary controller redirects.
-            if (state?.snapshot.delivery?.flow && !same(state.snapshot.delivery.flow, flow)) {
-                await client.reply(frame.correlationId, {
-                    $case: 'routeResult',
-                    routeResult: { outcome: RouteResult_Outcome.REJECTED, sipStatus: 403 }
-                });
-                return;
-            }
-            const result = await client.request({
-                $case: 'ingest',
-                ingest: {
-                    context,
-                    application: this.process,
-                    flow,
-                    wire: message.wire,
-                    principalId: state?.snapshot.principalId ?? '',
-                    bindingId: state?.snapshot.bindingId ?? '',
-                    authenticated: false,
-                    admission: OwnerIngest_Admission.EXISTING_FLOW
-                }
-            });
-            const accepted = result.payload?.$case === 'result' && !result.payload.result.error;
-            await client.reply(frame.correlationId, {
-                $case: 'routeResult',
-                routeResult: {
-                    outcome: accepted ? RouteResult_Outcome.ACCEPTED : RouteResult_Outcome.UNAVAILABLE,
-                    sipStatus: accepted ? 0 : 503
-                }
-            });
-            return;
-        }
         if (body?.$case === 'request') {
             const request = body.request;
-            if (!request.snapshot || !request.message || !request.requestId) throw new Error('Incomplete native request');
+            if (!request.snapshot?.context || !request.message || !request.requestId) throw new Error('Incomplete native request');
+            const fresh = !this.contexts.has(contextKey(request.snapshot.context));
             const state = this.remember(peer, client, request.snapshot);
             const key = contextKey(request.snapshot.context!) + ':request:' + request.requestId;
             const fingerprint = createHash('sha256')
@@ -468,10 +418,10 @@ export class SipbridgeSignaling extends EventEmitter {
             if (marker.fingerprint !== fingerprint) throw new Error('Native request replay mismatch');
             if (!this.events.has(key) && this.events.size >= 8192) throw new Error('Native request receipt capacity');
             this.events.set(key, marker);
-            await client.reply(frame.correlationId, { $case: 'result', result: emptyResult() });
+            // A request is a one-shot notification; the exact decision below is its only acceptance.
             if (marker.dispatched) return;
             marker.dispatched = true;
-            const task = this.present(state, request);
+            const task = this.decide(state, request, fresh).then(admitted => (admitted ? this.present(state, request) : undefined));
             this.pendingRequests.set(key, task);
             void task.catch(() => undefined).finally(() => this.pendingRequests.delete(key));
             return;
@@ -503,33 +453,6 @@ export class SipbridgeSignaling extends EventEmitter {
                 state.dialog?.emit('ended', event.kind === DialogEvent_Kind.ENDED ? 'bye' : 'terminated');
                 if (state.credentials) this.credentials.delete(state.credentials.id);
             }
-            return;
-        }
-        if (body?.$case === 'flowAdoption') {
-            const adoption = body.flowAdoption;
-            const state = adoption.context && this.contexts.get(contextKey(adoption.context));
-            if (
-                !state ||
-                state.peer !== peer ||
-                !processEqual(adoption.application, this.process) ||
-                !adoption.flow ||
-                adoption.principalId !== state.snapshot.principalId ||
-                adoption.bindingId !== state.snapshot.bindingId ||
-                adoption.nativeRevision < (state.snapshot.delivery?.nativeRevision ?? 0n)
-            )
-                throw new Error('Invalid context delivery adoption');
-            if (state.snapshot.delivery?.flow && !same(adoption.flow, state.snapshot.delivery.flow))
-                throw new Error('Physical flow replacement requires separate authentication policy');
-            const receipt = {
-                flow: adoption.flow,
-                nativeRevision: adoption.nativeRevision,
-                directoryEpoch: this.process.epoch,
-                registrationTicket: ''
-            };
-            await client.reply(frame.correlationId, {
-                $case: 'flowAdoptionResult',
-                flowAdoptionResult: { receipt, error: '' }
-            });
             return;
         }
         if (body?.$case === 'probeApplication') {
@@ -590,6 +513,90 @@ export class SipbridgeSignaling extends EventEmitter {
         if (body?.$case === 'flowClosed') return; // A socket closure is not application/owner loss.
         throw new Error('Unsupported native message');
     }
+    /**
+     * Policy hook for one pending native request. Returns the SIP status to deny with, or undefined to admit
+     * (the response is then sent with ordinary commands). Source-based admission policy plugs in here.
+     */
+    private admission(state: Context, request: RequestPresented, fresh: boolean): number | undefined {
+        const message = request.message!;
+        if (fresh && (!this.isConnected || !this.applicationReady() || this.isDraining() || !this.acceptingIngress(message))) return 503;
+        // REGISTER and SUBSCRIBE need a final decision; this application serves neither.
+        if (message.method === 'REGISTER' || message.method === 'SUBSCRIBE') return 405;
+        // No socket migration or arbitrary flow replacement.
+        const delivery = state.snapshot.delivery;
+        if (!fresh && delivery?.flow && !same(delivery.flow, request.flow)) return 403;
+        const proposal = request.flowAdoption;
+        if (
+            proposal &&
+            (!processEqual(proposal.application, this.process) ||
+                proposal.principalId !== state.snapshot.principalId ||
+                proposal.bindingId !== state.snapshot.bindingId ||
+                proposal.nativeRevision < (delivery?.nativeRevision ?? 0n) ||
+                (delivery?.flow && !same(proposal.flow, delivery.flow)))
+        )
+            return 403;
+        return undefined;
+    }
+    /** Submits the single native decision for a request; resolves true when the request was admitted for handling. */
+    private async decide(state: Context, request: RequestPresented, fresh: boolean): Promise<boolean> {
+        const status = this.admission(state, request, fresh) ?? 0;
+        const proposal = request.flowAdoption;
+        const admitted = status === 0;
+        try {
+            await this.enqueue(state, async () => {
+                if (state.uncertain || state.ended) throw new NativeOperationError('Native call is ended or uncertain', state.uncertain);
+                const client = state.peer.client;
+                if (!client) throw new NativeOperationError('Native session unavailable', false, true);
+                const decision: RequestDecision = {
+                    context: state.snapshot.context,
+                    requestId: request.requestId,
+                    sequence: state.sequence + 1n,
+                    admission: {
+                        directoryEpoch: this.process.epoch,
+                        expiresAtMs: BigInt(Date.now() + 2000),
+                        expectedDelivery: state.snapshot.delivery
+                    },
+                    basis: OwnerIngest_Admission.EXISTING_FLOW,
+                    principalId: admitted ? state.snapshot.principalId : '',
+                    bindingId: admitted ? state.snapshot.bindingId : '',
+                    delivery:
+                        admitted && proposal
+                            ? {
+                                  flow: proposal.flow,
+                                  nativeRevision: proposal.nativeRevision,
+                                  directoryEpoch: this.process.epoch,
+                                  registrationTicket: randomUUID()
+                              }
+                            : undefined,
+                    status,
+                    headers: status === 405 ? nativeHeaders({ Allow: 'INVITE, ACK, CANCEL, BYE, OPTIONS' }) : [],
+                    body: Buffer.alloc(0)
+                };
+                try {
+                    const frame = await client.request({ $case: 'requestDecision', requestDecision: decision });
+                    if (frame.payload?.$case !== 'result') throw new NativeOperationError('Unexpected native result', true);
+                    const outcome = frame.payload.result;
+                    if (outcome.snapshot) this.remember(state.peer, client, outcome.snapshot);
+                    if (outcome.certainty !== OperationResult_Certainty.ACCEPTED || outcome.error)
+                        throw new NativeOperationError(
+                            outcome.error || 'Native decision refused',
+                            outcome.certainty === OperationResult_Certainty.UNKNOWN
+                        );
+                } catch (error) {
+                    if (!(error instanceof NativeOperationError) || error.uncertain) state.uncertain = true;
+                    throw error instanceof NativeOperationError ? error : new NativeOperationError('Native decision outcome unknown', true);
+                }
+            });
+            return admitted;
+        } catch {
+            // The unanswered request receives a bounded native refusal; nothing was admitted.
+            if (fresh) {
+                this.retire(state, 'rejected');
+                if (state.snapshot.context) this.contexts.delete(contextKey(state.snapshot.context));
+            }
+            return false;
+        }
+    }
     private async present(state: Context, request: RequestPresented) {
         const message = request.message!;
         const headers = Object.fromEntries(message.headers.map(header => [header.name.toLowerCase(), header.value]));
@@ -646,9 +653,16 @@ export class SipbridgeSignaling extends EventEmitter {
         else if (!['ACK', 'CANCEL', 'BYE'].includes(message.method))
             await response.respond(405, { headers: { Allow: 'INVITE, ACK, CANCEL, BYE, OPTIONS' } });
     }
-    async command(state: Context, action: NonNullable<Command['action']>): Promise<ContextSnapshot> {
+    private enqueue<T>(state: Context, work: () => Promise<T>): Promise<T> {
         if ((state.pendingCommands ?? 0) >= 8) throw new NativeOperationError('Native context command capacity');
         state.pendingCommands = (state.pendingCommands ?? 0) + 1;
+        const result = state.tail.then(work).finally(() => {
+            state.pendingCommands!--;
+        });
+        state.tail = result.catch(() => undefined);
+        return result;
+    }
+    async command(state: Context, action: NonNullable<Command['action']>): Promise<ContextSnapshot> {
         const work = async () => {
             if (state.uncertain || state.ended) throw new NativeOperationError('Native call is ended or uncertain', state.uncertain);
             const client = state.peer.client;
@@ -687,11 +701,7 @@ export class SipbridgeSignaling extends EventEmitter {
                 throw error instanceof NativeOperationError ? error : new NativeOperationError('Native command outcome unknown', true);
             }
         };
-        const result = state.tail.then(work).finally(() => {
-            state.pendingCommands!--;
-        });
-        state.tail = result.catch(() => undefined);
-        return result;
+        return this.enqueue(state, work);
     }
     openDialog(params: OutboundSipCallParams): OutboundAttempt {
         let state: Context | undefined;
@@ -739,8 +749,6 @@ export class SipbridgeSignaling extends EventEmitter {
                                 network: {
                                     proxy: params.proxy ?? '',
                                     transport,
-                                    username: '',
-                                    password: '',
                                     credential: credentialId ? { id: credentialId, version: '1' } : undefined
                                 }
                             }

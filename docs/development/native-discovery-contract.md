@@ -38,7 +38,7 @@ and idle sessions close. Expired media never selects a backend for new work.
 
 RTC owns hello, process identity and epoch, monotonic connection attempts, lease
 use, heartbeats, command correlation, route decisions, status and drain. The wire
-field `hello.nexus` identifies the RTC process; it does not name an external
+field `hello.controller` identifies the RTC process; it does not name an external
 service. Frame validation follows the pinned sipbridge contract. A sipbridge
 state-authority change ends old contexts; RTC never replays uncertain operations
 or migrates retained calls. Drain withdraws new admission, continues existing work

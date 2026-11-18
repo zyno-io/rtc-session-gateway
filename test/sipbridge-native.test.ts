@@ -76,7 +76,7 @@ test('native outbound origination, ACK, re-INVITE and BYE use the original nativ
         assert.equal(result.sdp, sdp);
         await gateway.bye(call.sessionId);
         assert.equal(registry.size, 0);
-        assert.ok(uas.messages.some(wire => wire.startsWith('BYE ')));
+        await until(() => uas.messages.some(wire => wire.startsWith('BYE ')));
     } catch (error) {
         console.error(fixture.logs);
         console.error(uas.messages);
@@ -202,7 +202,7 @@ test('native TLS rejects a wrong server name and an unauthorized client URI', na
     }
 });
 
-test('duplicate ingress runs policy once and native CANCEL wins while owner decision is pending', native, async () => {
+test('duplicate request notification runs policy once and native CANCEL wins while owner decision is pending', native, async () => {
     const fixture = await nativeFixture();
     const registry = new CallRegistry();
     const decision = Promise.withResolvers<{ action: string; sdp: string }>();
@@ -245,6 +245,43 @@ test('duplicate ingress runs policy once and native CANCEL wins while owner deci
     }
 });
 
+test('a fresh request refused by admission policy receives its selected SIP status without reaching the owner', native, async () => {
+    const { SipbridgeSignaling } = await import('../src/sipbridge-signaling');
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    let invites = 0;
+    const config = loadConfig({
+        ...fixture.tls,
+        ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]'
+    });
+    const signaling = new SipbridgeSignaling(config);
+    signaling.acceptingIngress = () => false;
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson(_url: string, body: { event: string }) {
+                if (body.event === 'invite') invites++;
+                return {};
+            }
+        } as never,
+        signaling
+    );
+    const peer = await sipPeer(fixture.sipPort);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        peer.send('INVITE', 1, '', sdp);
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 503')), 1500);
+        assert.equal(invites, 0);
+        assert.equal(registry.size, 0);
+    } finally {
+        await gateway.shutdown();
+        peer.close();
+        await fixture.close();
+    }
+});
+
 test('owner disconnect sends native BYE and clears application call ownership', native, async () => {
     const { udpUas } = await import('./support/native-fixture');
     const fixture = await nativeFixture();
@@ -273,7 +310,7 @@ test('owner disconnect sends native BYE and clears application call ownership', 
     }
 });
 
-test('native session reconnect keeps the original authority and retained dialog without replay', native, async () => {
+test('native control session loss ends that term natively and a reconnect admits fresh calls without replay', native, async () => {
     const { SipbridgeSignaling } = await import('../src/sipbridge-signaling');
     const { udpUas } = await import('./support/native-fixture');
     const fixture = await nativeFixture();
@@ -303,10 +340,18 @@ test('native session reconnect keeps the original authority and retained dialog 
         });
         for (const peer of (signaling as any).peers.values()) peer.client.close();
         await until(() => connections >= 2);
-        assert.equal(registry.size, 1);
+        // Memory sipbridge expires an established session's application term and ends its calls natively.
+        await until(() => registry.size === 0 && uas.messages.some(wire => wire.startsWith('BYE ')));
         assert.equal(uas.messages.filter(wire => wire.startsWith('INVITE ')).length, 1);
-        await gateway.reinvite(call.sessionId, sdp);
-        await gateway.bye(call.sessionId);
+        await assert.rejects(gateway.reinvite(call.sessionId, sdp));
+        await until(() => gateway.isConnected);
+        const fresh = await gateway.createOutbound({
+            requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`,
+            sdp,
+            receiverUrl: 'https://owner.test/sip'
+        });
+        assert.equal(registry.size, 1);
+        await gateway.bye(fresh.sessionId);
         assert.equal(registry.size, 0);
     } finally {
         await gateway.shutdown();
