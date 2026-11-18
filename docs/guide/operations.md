@@ -1,5 +1,12 @@
 # Operations
 
+The optional [SIP firewall](./sip-firewall.md) keeps its block list in gateway
+memory and applies finite nftables bans through a separate sidecar that shares
+sipbridge's network namespace. Monitor snapshot receipt/apply age and
+skipped-observation counters (`GET /firewall/status`, receiver `GET /v1/status`)
+independently of readiness; firewall failure never gates `/readyz`. Run exactly one
+gateway per sidecar.
+
 ## Deployment Shape
 
 A production deployment needs:

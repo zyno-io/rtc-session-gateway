@@ -18,6 +18,16 @@ file supplies endpoint metadata; it does not proxy control or grant call ownersh
   protocol authority; cached snapshots are command references, not a second FSM.
 - `sip-gateway.ts`: owner routing, inbound policy, the outbound API, the call
   registry, application events and cleanup. It delegates SIP semantics to sipbridge.
+- `sip-firewall.ts`, `firewall-*.ts`: in-memory abuse score and block list, the
+  operator/snapshot API and the optional snapshot publisher. `sip-gateway.ts`
+  installs a source policy that sipbridge's request-decision path runs for each
+  fresh request (banned source 403; unscored 503 when not admitting; scored 404
+  for unknown host or unrouted INVITE). Sources are the flow addresses sipbridge
+  observed.
+- `firewall-sidecar/`: separate image (nftables-napi is AGPL-3.0-only and is never
+  in the gateway) sharing sipbridge's dedicated network namespace. It applies
+  complete snapshots through nftables; `FIREWALL_PROTECTED_CIDRS` keeps the gateway
+  and probe ranges reachable. One gateway publishes to one sidecar.
 - Control/HTTP and media components keep their existing public API ownership.
 
 ## Admission and retention
@@ -78,7 +88,9 @@ owner WebSockets stay connected during drain.
 ## Public integration boundary
 
 RTC's runtime dependencies are sipbridge native control, rtpbridge media/recording
-APIs and application-owner HTTP or WebSocket connections. It imports no
+APIs and application-owner HTTP or WebSocket connections. The optional firewall
+adds one outbound HTTPS push from the gateway to its sidecar receiver and no
+other runtime dependency. It imports no
 product-specific backend package and calls no registry or tunnel service. The
 catalog file is a deployment input: an operator, supervisor or optional discovery
 publisher can write it, and RTC never uses that publisher's credentials.

@@ -4,6 +4,9 @@ Configuration is read from environment variables at startup. The service exits
 at startup unless `RTC_ENDPOINTS_FILE` and all three `SIPBRIDGE_TLS_*` files are
 configured.
 
+The optional [SIP firewall](./sip-firewall.md) settings (`SIP_FIREWALL_*`) are listed
+[below](#sip-firewall). Its default mode is `shadow`.
+
 | Variable                          | Default                         | Description                                                                                                                                                                                |
 | --------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `RTC_ENDPOINTS_FILE`              | required                        | Authoritative catalog v2 for signaling and media. See [cross-cluster deployment](./cross-cluster.md#endpoint-catalog-and-identity).                                                        |
@@ -35,6 +38,32 @@ configured.
 | `ROUTES_JSON`                     | `[]`                            | Static HTTP route table.                                                                                                                                                                   |
 | `INVITE_HTTP_TIMEOUT_MS`          | `15000`                         | Timeout for static HTTP INVITE webhooks.                                                                                                                                                   |
 | `EVENT_HTTP_TIMEOUT_MS`           | `15000`                         | Timeout for static HTTP follow-up events.                                                                                                                                                  |
+
+## SIP firewall
+
+Gateway settings for the in-memory abuse score and block list. See the
+[SIP firewall guide](./sip-firewall.md) for behavior, the operator API and the
+required deployment shape.
+
+| Variable                                | Default                | Description                                                                         |
+| --------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------- |
+| `SIP_FIREWALL_MODE`                     | `shadow`               | `off`, `shadow` (score only) or `enforce` (refuse banned sources and publish bans). |
+| `SIP_FIREWALL_ALLOWLIST_JSON`           | `[]`                   | JSON array of trusted IPv4/IPv6 addresses or CIDRs that are never scored or banned. |
+| `SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES` | `false`                | Score unknown or invalid `Replaces` observations (opt-in).                          |
+| `SIP_FIREWALL_THRESHOLD`                | `10`                   | Score at which a source is banned.                                                  |
+| `SIP_FIREWALL_HALF_LIFE_MS`             | `600000`               | Score decay half-life.                                                              |
+| `SIP_FIREWALL_BAN_TTLS_SEC`             | `900,3600,21600,86400` | Repeat-offender ban tiers; nondecreasing, each at most 24 hours.                    |
+| `SIP_FIREWALL_MAX_RECORDS`              | `100000`               | Maximum score/tier records and transaction markers.                                 |
+| `SIP_FIREWALL_MAX_BLOCKS`               | `10000`                | Maximum manual plus automatic blocks.                                               |
+| `SIP_FIREWALL_ADMIN_TOKEN`              | unset                  | Bearer for the `/firewall/*` operator API; unset disables it.                       |
+| `SIP_FIREWALL_SNAPSHOT_TOKEN`           | unset                  | Read-only bearer for `GET /firewall/snapshot`.                                      |
+| `SIP_FIREWALL_PUBLISHER_URL`            | unset                  | HTTPS (or loopback HTTP) `/v1/snapshot` URL of the sidecar receiver.                |
+| `SIP_FIREWALL_PUBLISHER_TOKEN`          | unset                  | Receiver bearer; required with the publisher URL.                                   |
+| `SIP_FIREWALL_PUBLISHER_CA_FILE`        | system trust           | CA bundle for an HTTPS receiver.                                                    |
+
+The separate sidecar image reads its own variables, including
+`FIREWALL_PROTECTED_CIDRS`, which must include the gateway's address and any probe,
+kubelet and node ranges. See [sidecar configuration](./sip-firewall.md#sidecar-configuration-and-recovery).
 
 ## Authentication
 

@@ -27,6 +27,7 @@ export default defineConfig({
                     { text: 'Media Sessions', link: '/guide/media-sessions' },
                     { text: 'Recordings', link: '/guide/recordings' },
                     { text: 'Operations', link: '/guide/operations' },
+                    { text: 'SIP Firewall', link: '/guide/sip-firewall' },
                     { text: 'Cross-Cluster Deployment', link: '/guide/cross-cluster' }
                 ]
             },
@@ -47,6 +48,7 @@ export default defineConfig({
                     { text: 'Native Discovery Contract', link: '/development/native-discovery-contract' },
                     { text: 'Local E2E', link: '/development/local-e2e' },
                     { text: 'Native SIP Implementation', link: '/development/native-sipbridge-plan' },
+                    { text: 'SIP Firewall Plan', link: '/development/sip-firewall-plan' },
                     { text: 'Retired Cross-Cluster Plan', link: '/development/cross-cluster-plan' },
                     { text: 'Roadmap', link: '/roadmap' },
                     { text: 'Documentation Plan', link: '/documentation-plan' }

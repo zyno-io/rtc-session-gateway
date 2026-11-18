@@ -81,6 +81,14 @@ routes. `/routing/lookup` and `/drachtio/route` are no longer served.
 
 Decoded audio is not served by this API. Use rtpbridge `pcap2audio` for PCAP-to-WAV conversion: <https://zyno-io.github.io/rtpbridge/protocol/recording.html#decoding-pcap2audio>.
 
+## Firewall
+
+The optional [SIP firewall](../guide/sip-firewall.md#operator-apis) exposes
+`GET /firewall/status`, `GET`/`POST`/`DELETE /firewall/blocks` and
+`GET /firewall/snapshot`. They use their own bearers (`SIP_FIREWALL_ADMIN_TOKEN`
+and `SIP_FIREWALL_SNAPSHOT_TOKEN`) independent of control authentication, and
+answer 401 when the firewall token is unset.
+
 ## Process
 
 | Method | Path | Description |
