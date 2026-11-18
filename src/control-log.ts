@@ -410,6 +410,7 @@ function requestFields(method: string): readonly string[] {
         'session.delete': ['sessionId', 'reason', 'headers'],
         'session.create': ['callId'],
         'sip.createOutbound': ['requestUri', 'sdp', 'headers', 'receiverUrl', 'callingNumber', 'callingName', 'proxy', 'outboundAttemptId', 'auth'],
+        'sip.transfer': ['sessionId', 'mediaSessionId', 'requestUri', 'transferId', 'headers', 'callingNumber', 'callingName', 'proxy', 'auth'],
         'sip.cancelOutbound': ['outboundAttemptId'],
         'sip.reinvite': ['sessionId', 'callId', 'sdp', 'headers', 'event', 'sipCallId', 'receivedAt'],
         'sip.bye': ['sessionId', 'callId', 'reason', 'headers', 'event', 'sipCallId', 'receivedAt'],

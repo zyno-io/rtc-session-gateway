@@ -1,6 +1,8 @@
+import type { SipReturnMetadata, SipTransferStatus } from './sip-handoff-contract';
+
 export type SipHeaders = Record<string, string>;
 
-export interface InviteHttpRequest {
+export interface InviteHttpRequest extends Partial<SipReturnMetadata> {
     event: 'invite';
     callId: string;
     sipCallId: string;
@@ -16,13 +18,14 @@ export interface InviteHttpRequest {
 }
 
 export interface FollowUpHttpEvent {
-    event: 'answered' | 'reinvite' | 'bye' | 'terminated';
+    event: 'answered' | 'reinvite' | 'bye' | 'terminated' | 'transferred';
     callId: string;
     sipCallId: string;
     headers?: SipHeaders;
     sdp?: string;
     status?: number;
     reason?: string;
+    transfer?: SipTransferStatus;
     receivedAt: string;
 }
 
@@ -44,7 +47,7 @@ export interface RejectAction {
 
 export type SipAction = AnswerAction | RejectAction;
 
-export class InvalidHttpActionError extends Error { }
+export class InvalidHttpActionError extends Error {}
 
 export function parseSipActionResponse(input: unknown, options?: { allowReceiverUrl?: boolean }): SipAction {
     if (!input || typeof input !== 'object') {

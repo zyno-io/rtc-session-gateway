@@ -10,6 +10,8 @@ const events = [];
 const waiters = [];
 const connections = new Set();
 let autoAnswer = true;
+let responseSdp;
+const dialogs = new Set();
 
 const server = net.createServer(socket => {
     connections.add(socket);
@@ -54,10 +56,17 @@ async function handleRequest(request) {
         case 'ping':
             return { ok: true, ip: primaryIpv4(), port: server.address().port };
         case 'event.wait':
-            return waitForEvent(requiredString(params.event, 'event'), params.timeoutMs ?? 5_000);
+            return waitForEvent(requiredString(params.event, 'event'), params.timeoutMs ?? 5_000, params.cseq, params.callId);
         case 'configure':
             autoAnswer = params.autoAnswer !== false;
+            responseSdp = params.sdp;
             return { ok: true };
+        case 'refer': {
+            const dialog = [...dialogs].at(-1);
+            if (!dialog) throw new Error('No established SIP dialog');
+            dialog.sendRefer(requiredString(params.target, 'target'));
+            return { ok: true };
+        }
         case 'shutdown':
             setImmediate(() => shutdown(0));
             return { ok: true };
@@ -97,7 +106,7 @@ class SipConnection {
         if (message.method === 'INVITE') {
             this.sendResponse(message, 100, 'Trying');
             this.pendingInvite = message;
-            if (autoAnswer) this.sendResponse(message, 200, 'OK', localSdp(43000));
+            if (autoAnswer) this.sendResponse(message, 200, 'OK', responseSdp || localSdp(43000));
             return;
         }
 
@@ -110,7 +119,28 @@ class SipConnection {
 
         if (message.method === 'BYE') {
             this.sendResponse(message, 200, 'OK');
+            dialogs.delete(this);
         }
+        if (message.method === 'ACK') dialogs.add(this);
+        if (message.method === 'NOTIFY' || message.method === 'UPDATE') this.sendResponse(message, 200, 'OK');
+    }
+
+    sendRefer(target) {
+        const original = this.pendingInvite;
+        const uri = original.headers.contact?.replace(/^<|>$/g, '');
+        if (!uri) throw new Error('Missing gateway Contact');
+        const headers = [
+            `REFER ${uri} SIP/2.0`,
+            `Via: SIP/2.0/TCP ${primaryIpv4()}:${server.address().port};branch=z9hG4bK${randomToken()}`,
+            `From: ${taggedToHeader(original.headers.to, this.dialogTag)}`,
+            `To: ${original.headers.from}`,
+            `Call-ID: ${original.headers['call-id']}`,
+            'CSeq: 2 REFER',
+            'Max-Forwards: 70',
+            `Refer-To: <${target}>`,
+            'Content-Length: 0'
+        ];
+        this.socket.write(headers.join('\r\n') + '\r\n\r\n');
     }
 
     sendResponse(request, status, reason, body = '') {
@@ -130,7 +160,7 @@ class SipConnection {
 }
 
 function pushEvent(event, data) {
-    const index = waiters.findIndex(waiter => waiter.event === event);
+    const index = waiters.findIndex(waiter => matchesEvent(event, data, waiter));
     if (index >= 0) {
         const [waiter] = waiters.splice(index, 1);
         clearTimeout(waiter.timer);
@@ -140,8 +170,15 @@ function pushEvent(event, data) {
     events.push({ event, data });
 }
 
-function waitForEvent(event, timeoutMs) {
-    const index = events.findIndex(candidate => candidate.event === event);
+function matchesEvent(event, data, filter) {
+    return (
+        event === filter.event && (!filter.cseq || data.headers.cseq === filter.cseq) && (!filter.callId || data.headers['call-id'] === filter.callId)
+    );
+}
+
+function waitForEvent(event, timeoutMs, cseq, callId) {
+    const filter = { event, cseq, callId };
+    const index = events.findIndex(candidate => matchesEvent(candidate.event, candidate.data, filter));
     if (index >= 0) {
         const [candidate] = events.splice(index, 1);
         return Promise.resolve(candidate.data);
@@ -150,9 +187,9 @@ function waitForEvent(event, timeoutMs) {
         const timer = setTimeout(() => {
             const waiterIndex = waiters.findIndex(waiter => waiter.timer === timer);
             if (waiterIndex >= 0) waiters.splice(waiterIndex, 1);
-            reject(new Error(`timed out waiting ${timeoutMs}ms for SIP ${event}`));
+            reject(new Error(`timed out waiting ${timeoutMs}ms for SIP ${event}; queued events: ${events.map(item => item.event).join(', ')}`));
         }, timeoutMs);
-        waiters.push({ event, resolve, reject, timer });
+        waiters.push({ ...filter, resolve, reject, timer });
     });
 }
 

@@ -51,16 +51,27 @@ async function handleRequest(request) {
             return { ok: true };
         case 'peer.packets':
             return requiredPeer(params.peerId).received;
+        case 'peer.sdes': {
+            const peer = requiredPeer(params.peerId);
+            peer.sdesKey ??= randomBytes(30);
+            return { crypto: `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${peer.sdesKey.toString('base64')}` };
+        }
         case 'peer.secure': {
             const peer = requiredPeer(params.peerId);
             const match = /a=crypto:(\d+) AES_CM_128_HMAC_SHA1_80 inline:([A-Za-z0-9+/=]+)/.exec(params.sdp);
             if (!match) throw new Error('backend did not offer AES_CM_128_HMAC_SHA1_80');
             const remote = Buffer.from(match[2], 'base64');
             if (remote.length !== 30) throw new Error('invalid SDES key length');
-            const local = randomBytes(30);
+            const local = peer.sdesKey ?? randomBytes(30);
+            peer.sdesKey = local;
             peer.srtp = new SrtpSession({
                 profile: ProtectionProfileAes128CmHmacSha1_80,
-                keys: { localMasterKey: local.subarray(0, 16), localMasterSalt: local.subarray(16), remoteMasterKey: remote.subarray(0, 16), remoteMasterSalt: remote.subarray(16) }
+                keys: {
+                    localMasterKey: local.subarray(0, 16),
+                    localMasterSalt: local.subarray(16),
+                    remoteMasterKey: remote.subarray(0, 16),
+                    remoteMasterSalt: remote.subarray(16)
+                }
             });
             return { crypto: `a=crypto:${match[1]} AES_CM_128_HMAC_SHA1_80 inline:${local.toString('base64')}` };
         }
@@ -132,12 +143,12 @@ async function sendDtmf(peer, params) {
     if (!Number.isInteger(payloadType) || payloadType < 0 || payloadType > 127) throw new Error('payloadType must be 0-127');
     if (!Number.isInteger(durationMs) || durationMs < 40 || durationMs > 10_000) throw new Error('durationMs must be 40-10000');
 
-    const totalDuration = Math.floor(durationMs * clockRate / 1000);
+    const totalDuration = Math.floor((durationMs * clockRate) / 1000);
     const timestamp = peer.timestamp >>> 0;
     const volume = 10;
     const packets = [
         { marker: true, end: false, duration: Math.floor(totalDuration / 3) },
-        { marker: false, end: false, duration: Math.floor(totalDuration * 2 / 3) },
+        { marker: false, end: false, duration: Math.floor((totalDuration * 2) / 3) },
         { marker: false, end: false, duration: totalDuration },
         { marker: false, end: true, duration: totalDuration },
         { marker: false, end: true, duration: totalDuration },
@@ -145,15 +156,20 @@ async function sendDtmf(peer, params) {
     ];
 
     for (const item of packets) {
-        await sendRaw(peer, host, port, buildDtmfPacket(peer, {
-            event,
-            payloadType,
-            marker: item.marker,
-            end: item.end,
-            duration: item.duration,
-            volume,
-            timestamp
-        }));
+        await sendRaw(
+            peer,
+            host,
+            port,
+            buildDtmfPacket(peer, {
+                event,
+                payloadType,
+                marker: item.marker,
+                end: item.end,
+                duration: item.duration,
+                volume,
+                timestamp
+            })
+        );
         await sleep(Number(params.intervalMs ?? 20));
     }
     peer.timestamp = (timestamp + totalDuration) >>> 0;
@@ -171,7 +187,7 @@ function sendPacket(peer, host, port, params = {}) {
 
 function sendRaw(peer, host, port, packet) {
     return new Promise((resolve, reject) => {
-        peer.socket.send(packet, port, host, err => err ? reject(err) : resolve());
+        peer.socket.send(packet, port, host, err => (err ? reject(err) : resolve()));
     });
 }
 
@@ -296,7 +312,7 @@ async function closeAudioServer() {
 function createToneWav() {
     const sampleRate = 8000;
     const durationMs = 300;
-    const samples = Math.floor(sampleRate * durationMs / 1000);
+    const samples = Math.floor((sampleRate * durationMs) / 1000);
     const dataSize = samples * 2;
     const buffer = Buffer.alloc(44 + dataSize);
     buffer.write('RIFF', 0);
@@ -313,7 +329,7 @@ function createToneWav() {
     buffer.write('data', 36);
     buffer.writeUInt32LE(dataSize, 40);
     for (let i = 0; i < samples; i++) {
-        const sample = Math.round(Math.sin(2 * Math.PI * 440 * i / sampleRate) * 14000);
+        const sample = Math.round(Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 14000);
         buffer.writeInt16LE(sample, 44 + i * 2);
     }
     return buffer;
