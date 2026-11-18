@@ -18,6 +18,8 @@ export interface ActiveCall {
     /** Same for `peerDialog`; an outbound leg has no observed source, so its configured destination host is the fallback. */
     peerAddress?: string;
     peerHost?: string;
+    /** Addresses the destination host resolved to when the handoff committed. */
+    peerAddresses?: string[];
     callId: string;
     sipCallId: string;
     routeUrl: string;
@@ -143,6 +145,7 @@ export function snapshotCall(call: ActiveCall): ActiveCallSnapshot {
         remoteHost: _remoteHost,
         peerAddress: _peerAddress,
         peerHost: _peerHost,
+        peerAddresses: _peerAddresses,
         ...snapshot
     } = call;
     return snapshot;

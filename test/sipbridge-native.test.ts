@@ -1374,3 +1374,89 @@ test('native handoff: offerless destination, carrier cutover, paired BYE and a f
         await fixture.close();
     }
 });
+
+test('native handoff: a BYE during an outstanding offerless re-INVITE reaches the peer after its owed ACK', native, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const media = {
+        assertHandoffMedia() {},
+        async prepareHandoff() {
+            return [];
+        },
+        releaseHandoff() {},
+        async destroySession() {}
+    };
+    const gateway = new SipGateway(
+        loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' }),
+        registry,
+        {
+            async postJson(_url: string, body: { event: string }) {
+                return body.event === 'invite' ? { action: 'answer', sdp } : {};
+            }
+        } as never,
+        undefined,
+        undefined,
+        undefined,
+        { mediaController: media as never }
+    );
+    const carrier = await sipPeer(fixture.sipPort);
+    const center = await scriptedUa();
+    const answerOk = (wire: string, body: string) => {
+        const get = (name: string) => new RegExp('^' + name + ':\\s*(.+)$', 'im').exec(wire)?.[1].trim() ?? '';
+        carrier.socket.send(
+            `SIP/2.0 200 OK\r\nVia: ${get('Via')}\r\nFrom: ${get('From')}\r\nTo: ${get('To')}\r\nCall-ID: ${get('Call-ID')}\r\nCSeq: ${get('CSeq')}\r\nContact: <sip:caller@127.0.0.1:${carrier.port};transport=udp>\r\n${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+            fixture.sipPort,
+            '127.0.0.1'
+        );
+    };
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        carrier.send('INVITE', 1, '', offerSdp);
+        await until(() => carrier.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
+        const remoteTag = /^To:.*;tag=([^;\r\n]+)/im.exec(carrier.messages.find(message => message.startsWith('SIP/2.0 200'))!)![1];
+        carrier.send('ACK', 1, remoteTag, '', 'z9hG4bK-ack');
+        await until(() => registry.size === 1);
+        const transfer = gateway.transfer(
+            {
+                sessionId: registry.list()[0].callId,
+                mediaSessionId: 'media',
+                transferId: 't1',
+                requestUri: `sip:center@127.0.0.1:${center.port};transport=udp`
+            },
+            undefined
+        );
+        await until(() => center.count('INVITE') === 1);
+        center.reply(center.find('INVITE'), 200, 'OK', offerSdp.replace('30000', '45000'));
+        await until(() => carrier.messages.some(message => message.startsWith('INVITE ')));
+        answerOk(
+            carrier.messages.find(message => message.startsWith('INVITE '))!,
+            answerSdp
+        );
+        await transfer;
+        await until(() => center.count('ACK') === 1);
+
+        carrier.send('INVITE', 2, remoteTag, '', 'z9hG4bK-offerless');
+        await until(() => center.count('INVITE') === 2);
+        // The peer has not answered yet; the carrier hangs up.
+        carrier.send('BYE', 3, remoteTag, '', 'z9hG4bK-bye');
+        await new Promise(resolve => setTimeout(resolve, 500));
+        assert.equal(center.count('BYE'), 0, 'no BYE while the offer is outstanding');
+        center.reply(center.find('INVITE', 1), 200, 'OK', offerSdp.replace('30000', '45002'));
+        await until(() => center.count('BYE') === 1);
+        const methods = center.received.map(message => message.method);
+        assert.ok(methods.lastIndexOf('ACK') > methods.indexOf('INVITE', 2) || methods.filter(m => m === 'ACK').length === 2);
+        assert.ok(methods.lastIndexOf('ACK') < methods.indexOf('BYE'), 'wire order: ACK before BYE: ' + methods.join(','));
+        center.reply(center.find('BYE'), 200, 'OK');
+        await until(() => registry.size === 0);
+    } catch (error) {
+        console.error(fixture.logs);
+        console.error(center.received.map(message => message.wire));
+        throw error;
+    } finally {
+        await gateway.shutdown();
+        carrier.close();
+        center.close();
+        await fixture.close();
+    }
+});
