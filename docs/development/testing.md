@@ -35,7 +35,9 @@ verifies its revision label and schema receipt, and runs
 synthetic certificates. It covers inbound and outbound calls, CANCEL, re-INVITE,
 BYE, non-admitting bootstrap, stale signaling, TLS name and client URI
 rejection, reconnect without replay, state-authority change and digest
-authentication. `yarn test` skips this file. Registry access is described in
+authentication. It also covers late-offer outbound dialogs, offerless re-INVITEs
+in both directions with the peer's ACK answer, in-dialog REFER and NOTIFY, UPDATE,
+and a complete external handoff with relay. `yarn test` skips this file. Registry access is described in
 [local E2E](./local-e2e.md).
 
 These suites and the [Compose E2E](./local-e2e.md) run real sipbridge and

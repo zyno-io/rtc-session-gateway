@@ -30,6 +30,13 @@ Sent when a SIP dialog is answered.
 
 Sent as a gateway-initiated request when the remote side sends a re-INVITE that requires an application SDP answer.
 
+## `sip.transferred`
+
+Sent to the owning control connection (or HTTP receiver as `transferred`) when a
+`sip.transfer` commits. `data` is the transfer status: `transferId`, `logicalCallId`,
+`state`, `startedAt`, `committedAt`, `destinationSipCallId` and finalized `recordings`.
+The command result carries the same status; the event covers a lost response.
+
 ## `sip.bye`
 
 Sent when the remote side sends BYE.

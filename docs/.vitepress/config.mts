@@ -49,6 +49,7 @@ export default defineConfig({
                     { text: 'Local E2E', link: '/development/local-e2e' },
                     { text: 'Native SIP Implementation', link: '/development/native-sipbridge-plan' },
                     { text: 'SIP Firewall Plan', link: '/development/sip-firewall-plan' },
+                    { text: 'External SIP Handoff', link: '/development/sip-handoff-plan' },
                     { text: 'Retired Cross-Cluster Plan', link: '/development/cross-cluster-plan' },
                     { text: 'Roadmap', link: '/roadmap' },
                     { text: 'Documentation Plan', link: '/documentation-plan' }

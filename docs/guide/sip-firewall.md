@@ -59,7 +59,9 @@ infrastructure allowlists win at both the gateway and the sidecar. A manual CIDR
 overlapping even one allowlisted address is refused.
 
 Unknown-`Replaces` observations are opt-in (`SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES`,
-default off) and apply only where the gateway handles Replaces itself.
+default off). Malformed `Replaces` headers and `Replaces` from an address that is
+neither peer of the matched call are scored normally; see
+[external handoff](../development/sip-handoff-plan.md#referral-return-and-deduplication).
 
 ### The source IP must reach sipbridge
 
@@ -104,7 +106,7 @@ unsupported. Packet logging is disabled; named kernel counters remain available.
 | --------------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------- |
 | `SIP_FIREWALL_MODE`                     | `shadow`               | `off`, `shadow` or `enforce`. Shadow scores without applying blocks.                                |
 | `SIP_FIREWALL_ALLOWLIST_JSON`           | `[]`                   | Trusted IPv4/IPv6 addresses or CIDRs.                                                               |
-| `SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES` | `false`                | Score unknown or invalid `Replaces` observations where the gateway handles them.                    |
+| `SIP_FIREWALL_OBSERVE_UNKNOWN_REPLACES` | `false`                | Score unknown-dialog `Replaces` observations (opt-in).                    |
 | `SIP_FIREWALL_ROUTE_GRACE_MS`           | `300000`               | Do not score no-route 404s while no owner is connected or for this long after an owner disconnects. |
 | `SIP_FIREWALL_THRESHOLD`                | `10`                   | Positive integer score threshold.                                                                   |
 | `SIP_FIREWALL_HALF_LIFE_MS`             | `600000`               | Score decay half-life.                                                                              |

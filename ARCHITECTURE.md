@@ -18,6 +18,13 @@ file supplies endpoint metadata; it does not proxy control or grant call ownersh
   protocol authority; cached snapshots are command references, not a second FSM.
 - `sip-gateway.ts`: owner routing, inbound policy, the outbound API, the call
   registry, application events and cleanup. It delegates SIP semantics to sipbridge.
+- `sip-sdp.ts`, `sip-handoff-contract.ts`: pure SDP relay, `Replaces`/`Refer-To`
+  parsing and the public handoff contract. In `sip-gateway.ts`, `transfer()`
+  dials a late-offer destination, cuts the carrier over and then relays between two
+  `NativeDialog`s (offerless re-INVITE answers arrive through sipbridge's
+  `sip.reinvite-ack.v1`). The registry links the legs as one logical call; a leg
+  with an uncertain native outcome is fenced and never commanded again. See the
+  [handoff design](docs/development/sip-handoff-plan.md).
 - `sip-firewall.ts`, `firewall-*.ts`: in-memory abuse score and block list, the
   operator/snapshot API and the optional snapshot publisher. `sip-gateway.ts`
   installs a source policy that sipbridge's request-decision path runs for each

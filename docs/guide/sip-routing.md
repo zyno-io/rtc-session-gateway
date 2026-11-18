@@ -50,4 +50,33 @@ For carriers that challenge outbound requests with SIP digest authentication, in
 
 ## Follow-Up Events
 
-Answered, re-INVITE, BYE, and terminated events are delivered to the owning WebSocket connection or to the HTTP receiver URL selected during the INVITE response.
+Answered, re-INVITE, BYE, terminated and transferred events are delivered to the owning WebSocket connection or to the HTTP receiver URL selected during the INVITE response.
+
+## External Handoff and Return
+
+Use [`sip.transfer`](../reference/control-protocol.md#external-sip-handoff) to transfer an
+established caller to a call-center URI. The gateway dials the destination without SDP,
+stops every call recording, negotiates direct remote media, releases rtpbridge, and keeps
+both SIP dialogs. The application should finalize its handling episode as transferred
+and archive the returned recording metadata without sending BYE to the caller.
+
+While handed off, the gateway relays re-INVITE, UPDATE and offerless re-INVITE between
+the two peers, ends both dialogs when either party hangs up, and keeps working if the
+application connection or rtpbridge stops. Planned drain waits for handed-off calls.
+
+A return uses the application's ordinary inbound address. A REFER on a live known
+dialog or an authorized exact `Replaces` match preserves the logical call identity.
+`Replaces` authorization requires the source address of either established peer of
+that call; a malformed or unauthorized request is refused (`400`/`403`) and scored by
+the [SIP firewall](./sip-firewall.md). Unknown references receive `481`. An INVITE
+without that correlation starts a new inbound call, including when its caller number
+matches an earlier conversation.
+
+If a finalized call returns, create a linked handling episode with a fresh recording.
+Leave its earlier timestamps and archive intact. No special SIP address, custom header,
+or partner integration is required.
+
+This gateway resolves returns only against dialogs it holds (one gateway, one
+sipbridge). In-dialog requests such as REFER must arrive on the dialog's established
+transport connection; a REFER on a new TCP connection is refused with `403`.
+See the [handoff design](../development/sip-handoff-plan.md).
