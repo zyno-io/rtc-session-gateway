@@ -9,7 +9,8 @@ import { SipGateway } from '../src/sip-gateway';
 import { CallRegistry } from '../src/call-registry';
 import { createSocket } from 'node:dgram';
 import { randomUUID } from 'node:crypto';
-import { SipbridgeSignaling } from '../src/sipbridge-signaling';
+import { NativeOperationError, SipbridgeSignaling } from '../src/sipbridge-signaling';
+import { SipbridgeControlNotSentError } from '../src/sipbridge/client';
 import { nativeFixture, sipPeer, udpUas, until } from './support/native-fixture';
 
 const sdp = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=RTC\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n';
@@ -474,6 +475,7 @@ test(
             for (const peer of (signaling as any).peers.values()) peer.client.close();
             await until(() => connections >= 2);
             assert.equal(registry.size, 0);
+            assert.equal(contextCount(signaling), 0);
             const fresh = await dial();
             // sipbridge redelivers the old term's lifecycle events for roughly two minutes; they must not disturb this session.
             await new Promise(resolve => setTimeout(resolve, 18000));
@@ -585,6 +587,206 @@ test('a request on a different flow is refused immediately', native, async () =>
         await gateway.shutdown();
         peer.close();
         other.close();
+        await fixture.close();
+    }
+});
+
+async function rawSender(sipPort: number) {
+    const socket = createSocket('udp4');
+    await new Promise<void>(resolve => socket.bind(0, '127.0.0.1', resolve));
+    const port = socket.address().port;
+    const messages: string[] = [];
+    socket.on('message', bytes => messages.push(bytes.toString()));
+    function send(method: string, user = 'support') {
+        const body = method === 'INVITE' ? sdp : '';
+        const wire = `${method} sip:${user}@localhost SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:${port};branch=z9hG4bK-${randomUUID()};rport\r\nMax-Forwards: 70\r\nFrom: <sip:caller@localhost>;tag=${randomUUID()}\r\nTo: <sip:${user}@localhost>\r\nCall-ID: ${randomUUID()}@probe\r\nCSeq: 1 ${method}\r\nContact: <sip:caller@127.0.0.1:${port};transport=udp>\r\n${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${body.length}\r\n\r\n${body}`;
+        socket.send(wire, sipPort, '127.0.0.1');
+    }
+    return { messages, send, close: () => socket.close() };
+}
+const routes = '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]';
+
+test('first requests present() would not answer are refused, so out-of-dialog BYEs hold no context', { ...native, timeout: 60000 }, async () => {
+    const fixture = await nativeFixture();
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: routes });
+    const signaling = new SipbridgeSignaling(config);
+    const gateway = new SipGateway(
+        config,
+        new CallRegistry(),
+        {
+            async postJson() {
+                return { action: 'reject', status: 486 };
+            }
+        } as never,
+        signaling
+    );
+    const peer = await rawSender(fixture.sipPort);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        const count = (prefix: string) => peer.messages.filter(message => message.startsWith(prefix)).length;
+        // Under sipbridge's per-window native context limit (128); each must be refused and released.
+        for (let i = 0; i < 100; i++) {
+            peer.send('BYE');
+            if (i % 5 === 4) await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        await until(() => count('SIP/2.0 481') >= 100, 20000);
+        peer.send('INFO');
+        await until(() => count('SIP/2.0 481') >= 101);
+        peer.send('MESSAGE');
+        await until(() => count('SIP/2.0 405') >= 1);
+        assert.equal(contextCount(signaling), 0);
+        peer.send('INVITE');
+        await until(() => count('SIP/2.0 486') >= 1);
+        assert.equal(contextCount(signaling), 0);
+    } finally {
+        await gateway.shutdown();
+        peer.close();
+        await fixture.close();
+    }
+});
+
+test('a current-term terminal event that precedes the outbound context record fails the attempt promptly', native, async () => {
+    const fixture = await nativeFixture();
+    const config = loadConfig(fixture.tls);
+    const signaling = new SipbridgeSignaling(config);
+    const gateway = new SipGateway(
+        config,
+        new CallRegistry(),
+        {
+            async postJson() {
+                return {};
+            }
+        } as never,
+        signaling
+    );
+    const uas = await udpUas(sdp);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        const peer = [...(signaling as any).peers.values()][0];
+        const client = peer.client;
+        const request = client.request.bind(client);
+        client.reply = async () => undefined;
+        // Deliver the FAILED event before openDialog records the context from the openUac result.
+        client.request = async (payload: any, budget?: number) => {
+            const envelope = await request(payload, budget);
+            if (payload.$case === 'command' && payload.command.action?.$case === 'openUac' && envelope.payload?.$case === 'result') {
+                await (signaling as any).receive(peer, client, {
+                    correlationId: randomUUID(),
+                    sessionId: '',
+                    remainingBudgetMs: 0,
+                    payload: {
+                        $case: 'dialogEvent',
+                        dialogEvent: { kind: 6, snapshot: envelope.payload.result.snapshot, error: 'early failure', operationId: '' }
+                    }
+                });
+            }
+            return envelope;
+        };
+        const started = Date.now();
+        await assert.rejects(
+            gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' })
+        );
+        assert.ok(Date.now() - started < 5000, 'attempt took ' + (Date.now() - started) + 'ms');
+    } finally {
+        await gateway.shutdown();
+        uas.close();
+        await fixture.close();
+    }
+});
+
+test('uncertain first requests expire, not-sent failures are definite, and capacity is checked before an INVITE is sent', native, async () => {
+    const fixture = await nativeFixture();
+    const config = loadConfig(fixture.tls);
+    const signaling = new SipbridgeSignaling(config);
+    const gateway = new SipGateway(
+        config,
+        new CallRegistry(),
+        {
+            async postJson() {
+                return {};
+            }
+        } as never,
+        signaling
+    );
+    const uas = await udpUas(sdp);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        await gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' });
+        const contexts = (signaling as any).contexts as Map<string, any>;
+        const live = [...contexts.values()][0];
+        const uncertain = {
+            ...live,
+            first: true,
+            dialog: undefined,
+            uncertain: false,
+            snapshot: { ...live.snapshot, context: { ...live.snapshot.context, id: 'uncertain' } }
+        };
+        contexts.set('uncertain', uncertain);
+        (signaling as any).fence(uncertain);
+        assert.equal(uncertain.uncertain, true);
+        assert.ok(uncertain.expiresAt > Date.now());
+        uncertain.expiresAt = Date.now() - 1;
+        await until(() => uncertain.ended);
+        const client = live.peer.client;
+        const request = client.request;
+        client.request = async () => {
+            throw new SipbridgeControlNotSentError('control operation capacity');
+        };
+        await assert.rejects(signaling.command(live, { $case: 'cancel', cancel: {} }), (error: unknown) => {
+            assert.ok(error instanceof NativeOperationError);
+            assert.equal(error.uncertain, false);
+            assert.equal(error.unavailable, true);
+            return true;
+        });
+        assert.equal(live.uncertain, false);
+        client.request = request;
+        for (let i = 0; contexts.size < 1024; i++)
+            contexts.set('filler' + i, { ...live, snapshot: { ...live.snapshot, context: { ...live.snapshot.context, id: 'filler' + i } } });
+        const invites = () => uas.messages.filter(wire => wire.startsWith('INVITE ')).length;
+        const before = invites();
+        await assert.rejects(
+            signaling.openDialog({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, headers: {} } as never).completed
+        );
+        assert.equal(invites(), before);
+    } finally {
+        await gateway.shutdown();
+        uas.close();
+        await fixture.close();
+    }
+});
+
+test('a full receipt table evicts the oldest receipts instead of refusing messages', native, async () => {
+    const fixture = await nativeFixture();
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: routes });
+    const signaling = new SipbridgeSignaling(config);
+    signaling.acceptingIngress = () => false;
+    const gateway = new SipGateway(
+        config,
+        new CallRegistry(),
+        {
+            async postJson() {
+                return {};
+            }
+        } as never,
+        signaling
+    );
+    const peer = await rawSender(fixture.sipPort);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        const events = (signaling as any).events as Map<string, unknown>;
+        for (let i = 0; i < 8192; i++) events.set('old' + i, { fingerprint: 'x', expires: Date.now() + 100000 });
+        peer.send('INVITE');
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 503')), 3000);
+        assert.ok(events.size <= 8192);
+        assert.equal(events.has('old0'), false);
+        assert.equal(contextCount(signaling), 0);
+    } finally {
+        await gateway.shutdown();
+        peer.close();
         await fixture.close();
     }
 });

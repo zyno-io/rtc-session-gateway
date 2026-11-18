@@ -48,7 +48,9 @@ policy and a deferred or final status), event receipts, application probes and
 ephemeral credential lookup. It has no flow-adoption support: a request on a
 different flow than its context is refused with 403. sipbridge handles unknown
 contexts itself; RTC keeps only local context ownership, reference, sequence and
-policy state, and refuses unsupported methods. sipbridge keeps
+policy state. A first request is admitted only if RTC will answer it (INVITE,
+OPTIONS); other first requests are refused at decision time (481 for BYE and
+other in-dialog-only methods, 405 for the rest), so no context is left behind. sipbridge keeps
 transaction, dialog, ACK, CANCEL, timer and write semantics.
 
 Commands serialize per context with command-time delivery admission. UNKNOWN

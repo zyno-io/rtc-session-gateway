@@ -84,6 +84,9 @@ export interface SipbridgeControlDeadlineDiagnostic {
     callIdHash?: string;
 }
 
+/** A request that failed local checks before anything was written; its outcome is definitely "not sent". */
+export class SipbridgeControlNotSentError extends Error {}
+
 /** Local diagnostics only; the request's outcome remains unknown. */
 export class SipbridgeControlDeadlineError extends Error {
     readonly diagnostic: Readonly<SipbridgeControlDeadlineDiagnostic>;
@@ -396,12 +399,18 @@ export class SipbridgeControlClient {
     }
 
     private async send(envelope: Envelope): Promise<void> {
-        if (this.stopped || this.socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('sipbridge session closed'));
-        const frame = encodeSipbridgeFrame(envelope, this.bound);
+        if (this.stopped || this.socket.readyState !== WebSocket.OPEN)
+            return Promise.reject(new SipbridgeControlNotSentError('sipbridge session closed'));
+        let frame: string;
+        try {
+            frame = encodeSipbridgeFrame(envelope, this.bound);
+        } catch (error) {
+            throw new SipbridgeControlNotSentError(error instanceof Error ? error.message : 'invalid sipbridge frame');
+        }
         // No application queue: session control messages are small and bounded.
         if (this.pendingWrites >= 256 || this.socket.bufferedAmount + Buffer.byteLength(frame) > 1024 * 1024) {
             this.stop('write-capacity');
-            return Promise.reject(new Error('sipbridge write capacity'));
+            return Promise.reject(new SipbridgeControlNotSentError('sipbridge write capacity'));
         }
         this.pendingWrites++;
         try {
@@ -422,13 +431,14 @@ export class SipbridgeControlClient {
     }
 
     async request(payload: NonNullable<Envelope['payload']>, budgetMs = sipbridgeOperationBudget(payload)): Promise<Envelope> {
-        if (!this.ack?.capabilities.includes(SIPBRIDGE_STAGING_CAPABILITY)) throw new Error('application protocol not negotiated');
+        if (!this.ack?.capabilities.includes(SIPBRIDGE_STAGING_CAPABILITY))
+            throw new SipbridgeControlNotSentError('application protocol not negotiated');
         if (budgetMs > 2000 && !this.ack.capabilities.includes(SIPBRIDGE_COMMAND_BUDGET_CAPABILITY))
-            throw new Error('extended command budget not negotiated');
+            throw new SipbridgeControlNotSentError('extended command budget not negotiated');
         if (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > sipbridgeOperationBudget(payload))
-            throw new Error('invalid control operation budget');
+            throw new SipbridgeControlNotSentError('invalid control operation budget');
         for (const [id, until] of this.expired) if (until <= performance.now()) this.expired.delete(id);
-        if (this.pending.size >= 128 || this.expired.size >= 1024) throw new Error('control operation capacity');
+        if (this.pending.size >= 128 || this.expired.size >= 1024) throw new SipbridgeControlNotSentError('control operation capacity');
         const id = randomUUID();
         const startedAt = performance.now();
         const context = controlContext(payload);

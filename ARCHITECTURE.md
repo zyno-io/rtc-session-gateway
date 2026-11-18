@@ -62,7 +62,10 @@ key and CA files are re-read for each new connection. The negotiated sipbridge
 instance ID must equal the catalog entry ID. Framing is strict text JSON
 preserving uint64 strings, bytes, oneofs and size bounds; compression and redirects
 are disabled. Heartbeats, pending RPCs, write buffers, event receipts and reconnect
-backoff are bounded. An unknown peer message fails the session.
+backoff are bounded; a full receipt table evicts its oldest receipts. Transport
+violations (bad framing, a wrong-direction message, a mismatched heartbeat or
+result) fail the session. An unsupported or invalid application message is dropped
+without closing it, since closing ends every call of the session's term.
 
 `/healthz` is process-local. `/readyz` requires an admitting native session (as
 above) and a non-draining lifecycle, plus admitting media when `RTPBRIDGE_REQUIRED`

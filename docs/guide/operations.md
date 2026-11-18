@@ -67,7 +67,7 @@ calls held under the old authority; RTC does not migrate them.
 
 **Warning:** with memory-state sipbridge, any loss of the gateway's control session
 to that sipbridge (network drop, certificate rotation that forces a reconnect, a
-gateway restart) ends every call on that sipbridge, because sipbridge expires the
+gateway restart) ends every call this gateway process holds on that sipbridge, because sipbridge expires the
 session's application term and sends BYE for its calls. Reconnecting does not
 restore them. Treat control-session stability as call availability. See sipbridge's
 [memory-core](https://github.com/zyno-io/sipbridge/blob/main/docs/memory-core.md) notes.

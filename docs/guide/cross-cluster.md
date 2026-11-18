@@ -66,8 +66,8 @@ Native contexts are bound to sipbridge's state authority, RTC's process epoch an
 the application lease term. Reconnects use a higher connection attempt and never
 replay mutations. A sipbridge state-authority change, such as a restart with
 memory state, ends the old contexts. With memory-state sipbridge, losing the
-control session also ends every call on that sipbridge (it expires the session's
-term and sends BYE), so cross-cluster links must keep that session stable.
+control session also ends every call this gateway process holds on that sipbridge
+(it expires the session's term and sends BYE), so cross-cluster links must keep that session stable.
 Unknown outcomes return `SIGNALING_UNKNOWN`
 and must not be replayed; an unavailable session returns `SIGNALING_UNAVAILABLE`.
 Drain refuses new work and keeps retained native and media sessions until the
