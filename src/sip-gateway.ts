@@ -4,8 +4,10 @@ import {
     type IncomingSipRequest,
     type NativeDialog,
     type OutboundAttempt,
-    type SipResponse
+    type SipResponse,
+    type SipSource
 } from './sipbridge-signaling';
+import type { SipMessage } from './sipbridge/generated/sipbridge-control';
 import { randomUUID } from 'node:crypto';
 
 import type { ActiveCall } from './call-registry';
@@ -23,6 +25,7 @@ import {
 import { type GatewayHttpClient, HttpPostError } from './http-client';
 import { BaseLogger } from './logger';
 import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
+import type { SipFirewall } from './sip-firewall';
 import { acceptsSipHost, getSipUser, matchRoute, stripSipUri } from './routing';
 
 export class CallNotFoundError extends Error {}
@@ -73,12 +76,42 @@ export class SipGateway {
         signaling?: SipbridgeSignaling,
         private controlHub?: ControlHub,
         private lifecycle?: GatewayLifecycle,
-        mediaReady: () => boolean = () => true
+        options: { media?: () => boolean; firewall?: SipFirewall } = {}
     ) {
+        const mediaReady = options.media ?? (() => true);
+        this.firewall = options.firewall;
         this.signaling = signaling ?? new SipbridgeSignaling(config);
         this.signaling.applicationReady = () =>
             (!config.ROUTES_REQUIRED || config.ROUTES.length + (controlHub?.routeCount ?? 0) > 0) && (!config.RTPBRIDGE_REQUIRED || mediaReady());
         this.signaling.isDraining = () => lifecycle?.isDraining ?? false;
+        if (this.firewall) this.signaling.sourcePolicy = (message, source) => this.admitSource(message, source);
+    }
+    private readonly firewall?: SipFirewall;
+    /**
+     * Source admission for fresh requests, run by the signaling layer before any owner/RTC state exists.
+     * A banned source is refused for any method; only INVITEs for unknown hosts or without a route are scored.
+     */
+    private admitSource(message: SipMessage, source: SipSource | undefined): number | undefined {
+        const firewall = this.firewall;
+        if (!firewall || !source) return undefined;
+        if (firewall.shouldReject(source.ip)) return 403;
+        if (message.method !== 'INVITE') return undefined;
+        const destinationUri = stripSipUri(message.uri);
+        const destinationUser = getSipUser(destinationUri);
+        const header = (...names: string[]) => message.headers.find(entry => names.includes(entry.name.toLowerCase()))?.value ?? '';
+        const transaction = header('call-id', 'i') + ':' + header('cseq');
+        if (!acceptsSipHost(destinationUri, this.config.SIP_ALLOWED_DOMAINS)) {
+            firewall.observe(source.ip, destinationUser, 'unknown-host', transaction);
+            return 404;
+        }
+        if (
+            !this.controlHub?.findRoute({ destinationUri, destinationUser }) &&
+            !matchRoute(this.config.ROUTES, { destinationUri, destinationUser })
+        ) {
+            firewall.observe(source.ip, destinationUser, 'no-route', transaction);
+            return 404;
+        }
+        return undefined;
     }
     get isConnected() {
         return this.signaling.isConnected;

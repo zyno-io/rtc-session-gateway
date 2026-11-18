@@ -183,9 +183,9 @@ export async function nativeFixture() {
         }
     };
 }
-export async function sipPeer(sipPort: number) {
+export async function sipPeer(sipPort: number, host = '127.0.0.1') {
     const socket = createSocket('udp4');
-    await new Promise<void>(resolve => socket.bind(0, '127.0.0.1', resolve));
+    await new Promise<void>(resolve => socket.bind(0, host, resolve));
     const port = socket.address().port;
     const callId = randomUUID() + '@rtc.test';
     const tag = randomUUID();
@@ -196,7 +196,7 @@ export async function sipPeer(sipPort: number) {
     });
     function send(method: string, cseq = 1, toTag = '', sdp = '', viaBranch = branch) {
         const body = sdp;
-        const wire = `${method} sip:support@localhost SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:${port};branch=${viaBranch};rport\r\nMax-Forwards: 70\r\nFrom: <sip:caller@localhost>;tag=${tag}\r\nTo: <sip:support@localhost>${toTag ? ';tag=' + toTag : ''}\r\nCall-ID: ${callId}\r\nCSeq: ${cseq} ${method}\r\nContact: <sip:caller@127.0.0.1:${port};transport=udp>\r\n${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+        const wire = `${method} sip:support@localhost SIP/2.0\r\nVia: SIP/2.0/UDP ${host}:${port};branch=${viaBranch};rport\r\nMax-Forwards: 70\r\nFrom: <sip:caller@localhost>;tag=${tag}\r\nTo: <sip:support@localhost>${toTag ? ';tag=' + toTag : ''}\r\nCall-ID: ${callId}\r\nCSeq: ${cseq} ${method}\r\nContact: <sip:caller@${host}:${port};transport=udp>\r\n${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
         socket.send(wire, sipPort, '127.0.0.1');
     }
     return {

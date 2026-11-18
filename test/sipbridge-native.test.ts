@@ -8,6 +8,8 @@ import { loadConfig } from '../src/config';
 import { SipGateway } from '../src/sip-gateway';
 import { CallRegistry } from '../src/call-registry';
 import { createSocket } from 'node:dgram';
+import { networkInterfaces } from 'node:os';
+import { loadFirewallConfig, SipFirewall } from '../src/sip-firewall';
 import { randomUUID } from 'node:crypto';
 import { NativeOperationError, SipbridgeSignaling } from '../src/sipbridge-signaling';
 import { SipbridgeControlNotSentError } from '../src/sipbridge/client';
@@ -853,3 +855,110 @@ test(
         }
     }
 );
+
+// Loopback sources are never scored or banned, so these tests send from a non-loopback local address.
+const externalAddress = Object.values(networkInterfaces())
+    .flat()
+    .find(entry => entry && entry.family === 'IPv4' && !entry.internal)?.address;
+const firewallNative = { ...native, skip: native.skip || (externalAddress ? false : 'No non-loopback IPv4 address available') };
+
+test('native firewall refuses a banned source for INVITE and other fresh methods without owner calls or RTC state', firewallNative, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL_MODE: 'enforce' }));
+    firewall.ban(externalAddress, 60, 'test');
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+    const signaling = new SipbridgeSignaling(config);
+    let posts = 0;
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson() {
+                posts++;
+                return { action: 'answer', sdp };
+            }
+        } as never,
+        signaling,
+        undefined,
+        undefined,
+        { firewall }
+    );
+    const peer = await sipPeer(fixture.sipPort, externalAddress);
+    const options = await sipPeer(fixture.sipPort, externalAddress);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        peer.send('INVITE', 1, '', sdp);
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 403') && /CSeq: 1 INVITE/i.test(message)), 4000);
+        options.send('MESSAGE', 1, '', '', 'z9hG4bK-message');
+        await until(() => options.messages.some(message => message.startsWith('SIP/2.0 403') && /CSeq: 1 MESSAGE/i.test(message)), 4000);
+        assert.equal(posts, 0);
+        assert.equal(registry.size, 0);
+        assert.equal((signaling as unknown as { contexts: Map<string, unknown> }).contexts.size, 0);
+        assert.equal(firewall.counters.observations, 0);
+    } catch (error) {
+        console.error(fixture.logs, peer.messages, options.messages);
+        throw error;
+    } finally {
+        await gateway.shutdown();
+        peer.close();
+        options.close();
+        await fixture.close();
+    }
+});
+
+test('native firewall scores each unrouted INVITE once, then refuses the banned scanner', firewallNative, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL_MODE: 'enforce', SIP_FIREWALL_THRESHOLD: '2' }));
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"other","url":"https://owner.test/sip"}]' });
+    const signaling = new SipbridgeSignaling(config);
+    let posts = 0;
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson() {
+                posts++;
+                return {};
+            }
+        } as never,
+        signaling,
+        undefined,
+        undefined,
+        { firewall }
+    );
+    const peer = await sipPeer(fixture.sipPort, externalAddress);
+    const status = (status: number, cseq: number) =>
+        peer.messages.filter(message => message.startsWith('SIP/2.0 ' + status) && new RegExp('CSeq: ' + cseq + ' INVITE', 'i').test(message)).length;
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        peer.send('INVITE', 1, '', sdp, 'z9hG4bK-scan1');
+        await until(() => status(404, 1) > 0, 4000);
+        peer.send('INVITE', 1, '', sdp, 'z9hG4bK-scan1');
+        await new Promise(resolve => setTimeout(resolve, 500));
+        assert.equal(firewall.counters.observations, 1, 'a retransmission is not scored twice');
+        peer.send('INVITE', 2, '', sdp, 'z9hG4bK-scan2');
+        await until(() => status(404, 2) > 0, 4000);
+        assert.equal(firewall.counters.observations, 2);
+        assert.equal(firewall.counters.bans, 0);
+        peer.send('INVITE', 3, '', sdp, 'z9hG4bK-scan3');
+        await until(() => status(404, 3) > 0, 4000);
+        assert.equal(firewall.counters.bans, 1);
+        peer.send('INVITE', 4, '', sdp, 'z9hG4bK-scan4');
+        await until(() => status(403, 4) > 0, 4000);
+        assert.equal(firewall.counters.observations, 3, 'a banned source is refused without further scoring');
+        assert.equal(posts, 0);
+        assert.equal(registry.size, 0);
+        assert.equal((signaling as unknown as { contexts: Map<string, unknown> }).contexts.size, 0);
+    } catch (error) {
+        console.error(fixture.logs, peer.messages);
+        throw error;
+    } finally {
+        await gateway.shutdown();
+        peer.close();
+        await fixture.close();
+    }
+});

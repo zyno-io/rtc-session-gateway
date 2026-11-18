@@ -70,8 +70,17 @@ export interface IncomingSipRequest {
     callId: string;
     body: string;
     headers: Record<string, string>;
+    /** Source observed by sipbridge for this request; absent when the flow is unknown. */
+    source?: SipSource;
     get(name: string): string | undefined;
 }
+export interface SipSource {
+    ip: string;
+    port: number;
+    transport: string;
+}
+/** Admission policy for fresh requests: returns a SIP status to deny with, or undefined to admit. */
+export type SourcePolicy = (message: SipMessage, source: SipSource | undefined) => number | undefined;
 export interface SipResponse {
     finalResponseSent: boolean;
     respond(status: number, options?: { body?: string; headers?: Record<string, string> }): Promise<void>;
@@ -100,6 +109,10 @@ interface Context {
     /** First-request context that has not become a dialog; bounded if its outcome is uncertain. */
     first?: boolean;
     expiresAt?: number;
+}
+function sourceOf(request: RequestPresented): SipSource | undefined {
+    const flow = request.flow;
+    return flow?.sourceIp ? { ip: flow.sourceIp, port: flow.sourcePort, transport: flow.transport } : undefined;
 }
 export class NativeDialog extends EventEmitter {
     constructor(
@@ -160,6 +173,8 @@ export class SipbridgeSignaling extends EventEmitter {
     onInvite?: (request: IncomingSipRequest, response: SipResponse) => Promise<void>;
     applicationReady: () => boolean = () => true;
     acceptingIngress: (message: SipMessage) => boolean = () => true;
+    /** Source-based admission (firewall); runs for fresh requests after the 503 not-admitting check. */
+    sourcePolicy?: SourcePolicy;
     isDraining: () => boolean = () => false;
     constructor(private config: GatewayConfig) {
         super();
@@ -586,6 +601,10 @@ export class SipbridgeSignaling extends EventEmitter {
     private admission(request: RequestPresented, fresh: boolean, full: boolean): number | undefined {
         const message = request.message!;
         if (fresh && (full || !this.isConnected || !this.applicationReady() || this.isDraining() || !this.acceptingIngress(message))) return 503;
+        if (fresh && this.sourcePolicy) {
+            const status = this.sourcePolicy(message, sourceOf(request));
+            if (status) return status;
+        }
         // REGISTER and SUBSCRIBE need a final decision; this application serves neither.
         if (message.method === 'REGISTER' || message.method === 'SUBSCRIBE') return 405;
         // A tagged or answered request for a context RTC no longer tracks belongs to a forgotten dialog, never a new call.
@@ -657,6 +676,7 @@ export class SipbridgeSignaling extends EventEmitter {
             callId: request.snapshot!.callId,
             body: Buffer.from(message.body).toString('utf8'),
             headers,
+            source: sourceOf(request),
             get: name => headers[name.toLowerCase()]
         };
         const response: SipResponse = {
