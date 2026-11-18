@@ -13,7 +13,7 @@ import { loadFirewallConfig, SipFirewall } from '../src/sip-firewall';
 import { randomUUID } from 'node:crypto';
 import { NativeOperationError, SipbridgeSignaling } from '../src/sipbridge-signaling';
 import { SipbridgeControlNotSentError } from '../src/sipbridge/client';
-import { nativeFixture, sipPeer, udpUas, until } from './support/native-fixture';
+import { nativeFixture, scriptedUa, sipPeer, udpUas, until } from './support/native-fixture';
 
 const sdp = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=RTC\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n';
 test('native memory SIP accepts, ACKs and remotely terminates an inbound dialog over mTLS control', native, async () => {
@@ -1094,6 +1094,172 @@ test('native firewall leaves a forgotten-dialog re-INVITE to the 481 refusal, un
     } finally {
         await gateway.shutdown();
         peer.close();
+        await fixture.close();
+    }
+});
+
+const offerSdp = sdp.replace('20000', '30000');
+const answerSdp = sdp.replace('20000', '40000');
+
+async function signalingFixture() {
+    const fixture = await nativeFixture();
+    const signaling = new SipbridgeSignaling(loadConfig(fixture.tls));
+    await signaling.start();
+    await until(() => signaling.isConnected);
+    return { fixture, signaling };
+}
+
+test('native late-offer UAC: empty INVITE, 2xx offer, caller-supplied ACK answer', native, async () => {
+    const { fixture, signaling } = await signalingFixture();
+    const ua = await scriptedUa();
+    try {
+        const provisional: number[] = [];
+        const attempt = signaling.openDialog({ requestUri: `sip:callee@127.0.0.1:${ua.port};transport=udp`, sdp: '' } as never);
+        attempt.onProvisional = status => provisional.push(status);
+        await until(() => ua.count('INVITE') === 1);
+        const invite = ua.find('INVITE');
+        assert.equal(invite.body, '');
+        ua.reply(invite, 180, 'Ringing', offerSdp);
+        ua.reply(invite, 200, 'OK', offerSdp);
+        const dialog = await attempt.completed;
+        assert.equal(dialog.remoteSdp, offerSdp);
+        assert.equal(ua.count('ACK'), 0, 'native ACK is withheld until the application supplies the answer');
+        assert.ok(dialog.localTag && dialog.remoteTag && dialog.sipCallId);
+        await dialog.ackAnswer(answerSdp);
+        await until(() => ua.count('ACK') === 1);
+        assert.equal(ua.find('ACK').body, answerSdp);
+        assert.match(ua.find('ACK').wire, /Content-Type: application\/sdp/i);
+        assert.ok(provisional.includes(180));
+        // Outbound (UAC) contexts have no observed peer source; callers fall back to the configured destination host.
+        assert.equal(dialog.peerSource, undefined);
+        await dialog.bye();
+        await until(() => ua.count('BYE') === 1);
+    } catch (error) {
+        console.error(fixture.logs);
+        console.error(ua.received.map(message => message.wire));
+        throw error;
+    } finally {
+        ua.close();
+        await signaling.stop();
+        await fixture.close();
+    }
+});
+
+test('native offerless re-INVITE we send returns the 2xx offer and takes the ACK answer', native, async () => {
+    const { fixture, signaling } = await signalingFixture();
+    const ua = await scriptedUa();
+    try {
+        const attempt = signaling.openDialog({ requestUri: `sip:callee@127.0.0.1:${ua.port};transport=udp`, sdp: offerSdp } as never);
+        await until(() => ua.count('INVITE') === 1);
+        ua.reply(ua.find('INVITE'), 200, 'OK', answerSdp);
+        const dialog = await attempt.completed;
+        await until(() => ua.count('ACK') === 1);
+        const pending = dialog.reinvite('');
+        await until(() => ua.count('INVITE') === 2);
+        assert.equal(ua.find('INVITE', 1).body, '');
+        ua.reply(ua.find('INVITE', 1), 200, 'OK', offerSdp);
+        assert.equal(await pending, offerSdp);
+        await dialog.ackAnswer(answerSdp);
+        await until(() => ua.count('ACK') === 2);
+        assert.equal(ua.find('ACK', 1).body, answerSdp);
+        assert.equal(dialog.isFenced, false);
+    } catch (error) {
+        console.error(fixture.logs);
+        console.error(ua.received.map(message => message.wire));
+        throw error;
+    } finally {
+        ua.close();
+        await signaling.stop();
+        await fixture.close();
+    }
+});
+
+async function inboundDialog(fixture: Awaited<ReturnType<typeof nativeFixture>>, signaling: SipbridgeSignaling) {
+    const peer = await sipPeer(fixture.sipPort);
+    const dialogs: import('../src/sipbridge-signaling').NativeDialog[] = [];
+    signaling.onInvite = async (_request, response) => {
+        const dialog = await response.answer(sdp);
+        dialog.activate();
+        dialogs.push(dialog);
+    };
+    peer.send('INVITE', 1, '', offerSdp);
+    await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
+    const remoteTag = /^To:.*;tag=([^;\r\n]+)/im.exec(peer.messages.find(message => message.startsWith('SIP/2.0 200'))!)![1];
+    peer.send('ACK', 1, remoteTag, '', 'z9hG4bK-ack');
+    await until(() => dialogs.length === 1);
+    return { peer, remoteTag, dialog: dialogs[0] };
+}
+
+test('native peer offerless re-INVITE: the ACK answer is delivered to the dialog with its CSeq', native, async () => {
+    const { fixture, signaling } = await signalingFixture();
+    try {
+        const { peer, remoteTag, dialog } = await inboundDialog(fixture, signaling);
+        const acks: { inviteCseq: number; body: string }[] = [];
+        dialog.on('ack', ack => acks.push(ack));
+        const waited = Promise.withResolvers<string>();
+        dialog.on('request', async (request, response) => {
+            const wait = dialog.awaitPeerAck(request.cseq, 5000);
+            await response.respond(200, { body: offerSdp, headers: { 'Content-Type': 'application/sdp' } });
+            wait.then(waited.resolve, waited.reject);
+        });
+        peer.send('INVITE', 2, remoteTag, '', 'z9hG4bK-reinvite');
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200') && /CSeq: 2 INVITE/i.test(message)));
+        const ok = peer.messages.find(message => message.startsWith('SIP/2.0 200') && /CSeq: 2 INVITE/i.test(message))!;
+        assert.ok(ok.endsWith(offerSdp));
+        peer.send('ACK', 2, remoteTag, answerSdp, 'z9hG4bK-reinvite-ack');
+        assert.equal(await waited.promise, answerSdp);
+        assert.deepEqual(acks, [{ inviteCseq: 2, body: answerSdp }]);
+        peer.close();
+    } catch (error) {
+        console.error(fixture.logs);
+        throw error;
+    } finally {
+        await signaling.stop();
+        await fixture.close();
+    }
+});
+
+test('native REFER is presented to the dialog and answered 202 followed by an in-dialog NOTIFY; UPDATE is relayed', native, async () => {
+    const { fixture, signaling } = await signalingFixture();
+    try {
+        const { peer, remoteTag, dialog } = await inboundDialog(fixture, signaling);
+        peer.autoOk.add('NOTIFY').add('UPDATE');
+        assert.equal(dialog.peerSource?.ip, '127.0.0.1');
+        assert.equal(dialog.peerSource?.port, peer.port);
+        const seen: string[] = [];
+        dialog.on('request', async (request, response) => {
+            seen.push(request.method);
+            if (request.method === 'REFER') {
+                assert.match(request.get('refer-to') ?? '', /sip:target@example\.test/);
+                await response.respond(202);
+                await dialog.request('NOTIFY', {
+                    headers: { Event: 'refer', 'Subscription-State': 'terminated;reason=noresource', 'Content-Type': 'message/sipfrag' },
+                    body: 'SIP/2.0 200 OK\r\n'
+                });
+            } else if (request.method === 'UPDATE') {
+                await response.respond(200, { body: answerSdp, headers: { 'Content-Type': 'application/sdp' } });
+            }
+        });
+        peer.send('REFER', 2, remoteTag, '', 'z9hG4bK-refer', 'Refer-To: <sip:target@example.test>\r\n');
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 202')));
+        await until(() => peer.messages.some(message => message.startsWith('NOTIFY ')));
+        const notify = peer.messages.find(message => message.startsWith('NOTIFY '))!;
+        assert.match(notify, /Event: refer/i);
+        assert.match(notify, /Content-Type: message\/sipfrag/i);
+        assert.ok(notify.endsWith('SIP/2.0 200 OK\r\n'));
+        peer.send('UPDATE', 3, remoteTag, offerSdp, 'z9hG4bK-update');
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200') && /CSeq: 3 UPDATE/i.test(message)));
+        assert.deepEqual(seen, ['REFER', 'UPDATE']);
+        const ok = peer.messages.find(message => message.startsWith('SIP/2.0 200') && /CSeq: 3 UPDATE/i.test(message))!;
+        assert.ok(ok.endsWith(answerSdp));
+        await dialog.request('UPDATE', { body: offerSdp, headers: { 'Content-Type': 'application/sdp' } });
+        await until(() => peer.messages.some(message => message.startsWith('UPDATE ')));
+        peer.close();
+    } catch (error) {
+        console.error(fixture.logs);
+        throw error;
+    } finally {
+        await signaling.stop();
         await fixture.close();
     }
 });

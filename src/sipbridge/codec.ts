@@ -13,6 +13,7 @@ export const SIPBRIDGE_REQUEST_DECISION_CAPABILITY = 'sip.request-decision.v1';
 export const SIPBRIDGE_NATIVE_COMPLETION_CAPABILITY = 'sip.native-completion.v1';
 export const SIPBRIDGE_COMMAND_BUDGET_CAPABILITY = 'sip.command-budget.v1';
 export const SIPBRIDGE_COMMAND_ADMISSION_CAPABILITY = 'sip.command-admission.v1';
+export const SIPBRIDGE_REINVITE_ACK_CAPABILITY = 'sip.reinvite-ack.v1';
 export const SIPBRIDGE_LOCAL_CHALLENGE_CAPABILITY = 'sip.local-challenge.v1';
 export const SIPBRIDGE_COMMAND_BUDGET_MS = 40_000;
 export const SIPBRIDGE_CONTROL_BUDGET_MS = 2000;

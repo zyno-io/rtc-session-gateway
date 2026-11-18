@@ -191,17 +191,29 @@ export async function sipPeer(sipPort: number, host = '127.0.0.1') {
     const tag = randomUUID();
     const branch = 'z9hG4bK-' + randomUUID();
     const messages: string[] = [];
-    socket.on('message', bytes => {
-        messages.push(bytes.toString());
+    // In-dialog requests from the gateway that this peer answers 200 automatically (a native client transaction waits for it).
+    const autoOk = new Set<string>();
+    socket.on('message', (bytes, remote) => {
+        const wire = bytes.toString();
+        messages.push(wire);
+        const method = wire.split(' ')[0];
+        if (!autoOk.has(method)) return;
+        const get = (name: string) => new RegExp('^' + name + ':\\s*(.+)$', 'im').exec(wire)?.[1].trim() ?? '';
+        socket.send(
+            `SIP/2.0 200 OK\r\nVia: ${get('Via')}\r\nFrom: ${get('From')}\r\nTo: ${get('To')}\r\nCall-ID: ${get('Call-ID')}\r\nCSeq: ${get('CSeq')}\r\nContent-Length: 0\r\n\r\n`,
+            remote.port,
+            remote.address
+        );
     });
-    function send(method: string, cseq = 1, toTag = '', sdp = '', viaBranch = branch) {
+    function send(method: string, cseq = 1, toTag = '', sdp = '', viaBranch = branch, extraHeaders = '') {
         const body = sdp;
-        const wire = `${method} sip:support@localhost SIP/2.0\r\nVia: SIP/2.0/UDP ${host}:${port};branch=${viaBranch};rport\r\nMax-Forwards: 70\r\nFrom: <sip:caller@localhost>;tag=${tag}\r\nTo: <sip:support@localhost>${toTag ? ';tag=' + toTag : ''}\r\nCall-ID: ${callId}\r\nCSeq: ${cseq} ${method}\r\nContact: <sip:caller@${host}:${port};transport=udp>\r\n${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+        const wire = `${method} sip:support@localhost SIP/2.0\r\nVia: SIP/2.0/UDP ${host}:${port};branch=${viaBranch};rport\r\nMax-Forwards: 70\r\nFrom: <sip:caller@localhost>;tag=${tag}\r\nTo: <sip:support@localhost>${toTag ? ';tag=' + toTag : ''}\r\nCall-ID: ${callId}\r\nCSeq: ${cseq} ${method}\r\nContact: <sip:caller@${host}:${port};transport=udp>\r\n${extraHeaders}${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
         socket.send(wire, sipPort, '127.0.0.1');
     }
     return {
         socket,
         messages,
+        autoOk,
         send,
         callId,
         tag,
@@ -271,6 +283,34 @@ export async function udpUas(answerSdp: string, answer = true, auth?: { username
     return {
         port,
         messages,
+        close() {
+            socket.close();
+        }
+    };
+}
+/** A scriptable UDP user agent: records requests and lets a test reply to them explicitly. */
+export async function scriptedUa() {
+    const socket = createSocket('udp4');
+    await new Promise<void>(resolve => socket.bind(0, '127.0.0.1', resolve));
+    const port = socket.address().port;
+    const received: { wire: string; method: string; port: number; address: string; body: string }[] = [];
+    socket.on('message', (bytes, remote) => {
+        const wire = bytes.toString();
+        if (wire.startsWith('SIP/2.0')) return;
+        received.push({ wire, method: wire.split(' ')[0], port: remote.port, address: remote.address, body: wire.split('\r\n\r\n')[1] ?? '' });
+    });
+    const header = (wire: string, name: string) => new RegExp('^' + name + ':\\s*(.+)$', 'im').exec(wire)?.[1].trim() ?? '';
+    return {
+        port,
+        received,
+        find: (method: string, index = 0) => received.filter(message => message.method === method)[index],
+        count: (method: string) => received.filter(message => message.method === method).length,
+        header,
+        reply(request: { wire: string; port: number; address: string }, status: number, reason: string, body = '', extra = '') {
+            const to = header(request.wire, 'To');
+            const bytes = `SIP/2.0 ${status} ${reason}\r\nVia: ${header(request.wire, 'Via')}\r\nFrom: ${header(request.wire, 'From')}\r\nTo: ${to}${to.includes(';tag=') ? '' : ';tag=uas-tag'}\r\nCall-ID: ${header(request.wire, 'Call-ID')}\r\nCSeq: ${header(request.wire, 'CSeq')}\r\nContact: <sip:uas@127.0.0.1:${port};transport=udp>\r\n${extra}${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+            socket.send(bytes, request.port, request.address);
+        },
         close() {
             socket.close();
         }

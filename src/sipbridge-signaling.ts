@@ -10,7 +10,8 @@ import {
     SIPBRIDGE_COMMAND_ADMISSION_CAPABILITY,
     SIPBRIDGE_COMMAND_BUDGET_CAPABILITY,
     SIPBRIDGE_CONTINUITY_CAPABILITY,
-    SIPBRIDGE_REQUEST_DECISION_CAPABILITY
+    SIPBRIDGE_REQUEST_DECISION_CAPABILITY,
+    SIPBRIDGE_REINVITE_ACK_CAPABILITY
 } from './sipbridge/codec';
 import {
     Command,
@@ -37,11 +38,18 @@ const capabilities = [
     SIPBRIDGE_COMMAND_ADMISSION_CAPABILITY,
     SIPBRIDGE_COMMAND_BUDGET_CAPABILITY,
     SIPBRIDGE_CONTINUITY_CAPABILITY,
-    SIPBRIDGE_REQUEST_DECISION_CAPABILITY
+    SIPBRIDGE_REQUEST_DECISION_CAPABILITY,
+    SIPBRIDGE_REINVITE_ACK_CAPABILITY
 ];
 // Methods present() always answers for a first request, and methods valid only inside a dialog.
 const ANSWERED_FIRST_METHODS = ['INVITE', 'OPTIONS'];
-const DIALOG_ONLY_METHODS = ['BYE', 'ACK', 'CANCEL', 'INFO', 'UPDATE', 'PRACK'];
+const DIALOG_ONLY_METHODS = ['BYE', 'ACK', 'CANCEL', 'INFO', 'UPDATE', 'PRACK', 'REFER'];
+// In-dialog requests presented to the application dialog; everything else keeps its native default.
+const DIALOG_REQUEST_METHODS = ['INVITE', 'UPDATE', 'REFER'];
+const ALLOW = 'INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, REFER';
+// Upper bound on waiting for a peer's ACK that completes a relayed offerless re-INVITE.
+export const PEER_ACK_WAIT_MS = 10_000;
+const MAX_BUFFERED_ACKS = 8;
 const MAX_CONTEXTS = 1024;
 const MAX_RECEIPTS = 8192;
 // sipbridge redelivers an unacknowledged lifecycle event for about two minutes.
@@ -69,6 +77,8 @@ export interface IncomingSipRequest {
     uri: string;
     callId: string;
     body: string;
+    /** CSeq number of the request (0 when absent or malformed). */
+    cseq: number;
     headers: Record<string, string>;
     /** Source observed by sipbridge for this request; absent when the flow is unknown. */
     source?: SipSource;
@@ -111,6 +121,9 @@ interface Context {
     /** First-request context that has not become a dialog; bounded if its outcome is uncertain. */
     first?: boolean;
     expiresAt?: number;
+    onProvisional?: (status: number) => void;
+    /** Source of the first request of an inbound context; sipbridge reports no delivery flow in snapshots or for outbound contexts. */
+    peerSource?: SipSource;
 }
 function sourceOf(request: RequestPresented): SipSource | undefined {
     const flow = request.flow;
@@ -122,8 +135,18 @@ export class NativeDialog extends EventEmitter {
         private owner: SipbridgeSignaling
     ) {
         super();
+        this.setMaxListeners(0);
+        this.once('ended', () => {
+            for (const [cseq, waiter] of this.ackWaiters) {
+                clearTimeout(waiter.timer);
+                this.ackWaiters.delete(cseq);
+                waiter.reject(new NativeOperationError('Dialog ended while waiting for ACK'));
+            }
+        });
     }
     private attached = Promise.withResolvers<void>();
+    private ackWaiters = new Map<number, { resolve: (body: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+    private bufferedAcks = new Map<number, string>();
     activate() {
         this.attached.resolve();
     }
@@ -133,8 +156,26 @@ export class NativeDialog extends EventEmitter {
     get isEnded() {
         return this.state.ended;
     }
+    /** True after an uncertain outcome: no further command may be sent, not even BYE. */
+    get isFenced() {
+        return this.state.uncertain;
+    }
     get sipCallId() {
         return this.state.snapshot.callId;
+    }
+    /** Tag of this side of the dialog (To tag for inbound, From tag for outbound). */
+    get localTag() {
+        return this.state.snapshot.localTag;
+    }
+    get remoteTag() {
+        return this.state.snapshot.remoteTag;
+    }
+    /**
+     * Network source sipbridge observed for the peer's initial request. Inbound dialogs only: snapshots carry no
+     * delivery flow and outbound (UAC) contexts have no observed source, so this is undefined for them.
+     */
+    get peerSource(): SipSource | undefined {
+        return this.state.peerSource;
     }
     get localSdp() {
         return Buffer.from(this.state.snapshot.localSdp).toString('utf8');
@@ -142,10 +183,29 @@ export class NativeDialog extends EventEmitter {
     get remoteSdp() {
         return Buffer.from(this.state.snapshot.remoteSdp).toString('utf8');
     }
+    /**
+     * Sends a re-INVITE. With an empty body it is offerless: the result is the peer's 2xx offer and the caller
+     * must complete the exchange with ackAnswer().
+     */
     async reinvite(sdp: string, headers?: Record<string, string>) {
         const snapshot = await this.owner.command(this.state, {
             $case: 'dialogRequest',
             dialogRequest: { method: 'INVITE', body: Buffer.from(sdp), headers: nativeHeaders(headers) }
+        });
+        return Buffer.from(snapshot.remoteSdp).toString('utf8');
+    }
+    /** Sends the ACK answer for a late-offer 2xx (an initial late-offer UAC or an offerless re-INVITE we sent). */
+    async ackAnswer(sdp: string, headers?: Record<string, string>) {
+        await this.owner.command(this.state, {
+            $case: 'dialogRequest',
+            dialogRequest: { method: 'ACK', body: Buffer.from(sdp), headers: nativeHeaders(headers) }
+        });
+    }
+    /** Sends an in-dialog request (UPDATE, NOTIFY, INFO, ...). */
+    async request(method: string, options: { body?: string; headers?: Record<string, string> } = {}) {
+        const snapshot = await this.owner.command(this.state, {
+            $case: 'dialogRequest',
+            dialogRequest: { method, body: Buffer.from(options.body ?? ''), headers: nativeHeaders(options.headers) }
         });
         return Buffer.from(snapshot.remoteSdp).toString('utf8');
     }
@@ -155,9 +215,52 @@ export class NativeDialog extends EventEmitter {
             dialogRequest: { method: 'BYE', body: Buffer.alloc(0), headers: nativeHeaders(headers) }
         });
     }
+    /** Called by signaling when the peer's ACK to its own re-INVITE (CSeq `inviteCseq`) was accepted natively. */
+    deliverAck(inviteCseq: number, body: string) {
+        this.emit('ack', { inviteCseq, body });
+        const waiter = this.ackWaiters.get(inviteCseq);
+        if (waiter) {
+            clearTimeout(waiter.timer);
+            this.ackWaiters.delete(inviteCseq);
+            waiter.resolve(body);
+            return;
+        }
+        this.bufferedAcks.set(inviteCseq, body);
+        while (this.bufferedAcks.size > MAX_BUFFERED_ACKS) this.bufferedAcks.delete(this.bufferedAcks.keys().next().value!);
+    }
+    /**
+     * Resolves with the body of the peer's ACK to its re-INVITE `inviteCseq`. Register before answering the
+     * re-INVITE; an ACK that already arrived is returned immediately. Rejects after `timeoutMs` or when the dialog ends.
+     */
+    awaitPeerAck(inviteCseq: number, timeoutMs = PEER_ACK_WAIT_MS): Promise<string> {
+        const buffered = this.bufferedAcks.get(inviteCseq);
+        if (buffered !== undefined) {
+            this.bufferedAcks.delete(inviteCseq);
+            return Promise.resolve(buffered);
+        }
+        if (this.state.ended) return Promise.reject(new NativeOperationError('Dialog ended'));
+        if (this.ackWaiters.has(inviteCseq)) return Promise.reject(new Error('ACK wait already registered'));
+        return new Promise<string>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.ackWaiters.delete(inviteCseq);
+                reject(new NativeOperationError('Timed out waiting for peer ACK'));
+            }, timeoutMs);
+            this.ackWaiters.set(inviteCseq, { resolve, reject, timer });
+        });
+    }
+    /** Abandons a wait registered with awaitPeerAck (e.g. when the 2xx could not be sent). */
+    cancelPeerAckWait(inviteCseq: number) {
+        const waiter = this.ackWaiters.get(inviteCseq);
+        if (!waiter) return;
+        clearTimeout(waiter.timer);
+        this.ackWaiters.delete(inviteCseq);
+        waiter.reject(new NativeOperationError('ACK wait cancelled'));
+    }
 }
 export interface OutboundAttempt {
     cancel(): Promise<void>;
+    /** Observes provisional response statuses; provisional SDP is never exposed. */
+    onProvisional?: (status: number) => void;
     completed: Promise<NativeDialog>;
 }
 /** Application references only. All SIP reducers, transport writes and timers remain native. */
@@ -497,6 +600,7 @@ export class SipbridgeSignaling extends EventEmitter {
             if (marker.dispatched) return;
             marker.dispatched = true;
             const state = this.remember(peer, client, request.snapshot, full ? 'transient' : 'enforce');
+            if (fresh) state.peerSource = sourceOf(request);
             const task = this.decide(state, request, fresh, full).then(admitted => (admitted ? this.present(state, request, fresh) : undefined));
             // A first request that leaves present() without a final response (e.g. not-sent failures) must still expire.
             if (fresh) void task.finally(() => this.expireUnanswered(state)).catch(() => undefined);
@@ -527,6 +631,10 @@ export class SipbridgeSignaling extends EventEmitter {
             if (!created && prior.fingerprint !== fingerprint) throw new Error('Native event replay mismatch');
             await client.reply(frame.correlationId, { $case: 'result', result: emptyResult() });
             if (!created) return;
+            if (event.kind === DialogEvent_Kind.PROVISIONAL) state.onProvisional?.(event.message?.status ?? 0);
+            // Message presence distinguishes a peer re-INVITE ACK from the initial ACK (sip.reinvite-ack.v1).
+            if (event.kind === DialogEvent_Kind.ACKNOWLEDGED && event.message && state.dialog)
+                state.dialog.deliverAck(event.inviteCseq, Buffer.from(event.message.body).toString('utf8'));
             if (event.kind === DialogEvent_Kind.ANSWERED) {
                 state.dialog ??= new NativeDialog(state, this);
                 state.deferred?.resolve(state.dialog);
@@ -640,7 +748,7 @@ export class SipbridgeSignaling extends EventEmitter {
                     principalId: admitted ? state.snapshot.principalId : '',
                     bindingId: admitted ? state.snapshot.bindingId : '',
                     status,
-                    headers: status === 405 ? nativeHeaders({ Allow: 'INVITE, ACK, CANCEL, BYE, OPTIONS' }) : [],
+                    headers: status === 405 ? nativeHeaders({ Allow: ALLOW }) : [],
                     body: Buffer.alloc(0)
                 };
                 try {
@@ -677,6 +785,7 @@ export class SipbridgeSignaling extends EventEmitter {
             uri: message.uri,
             callId: request.snapshot!.callId,
             body: Buffer.from(message.body).toString('utf8'),
+            cseq: Number.parseInt(headers['cseq'] ?? '', 10) || 0,
             headers,
             source: sourceOf(request),
             get: name => headers[name.toLowerCase()]
@@ -710,7 +819,7 @@ export class SipbridgeSignaling extends EventEmitter {
                 return state.dialog;
             }
         };
-        if (state.dialog && message.method === 'INVITE') {
+        if (state.dialog && DIALOG_REQUEST_METHODS.includes(message.method)) {
             let timer: NodeJS.Timeout | undefined;
             try {
                 await Promise.race([
@@ -719,16 +828,18 @@ export class SipbridgeSignaling extends EventEmitter {
                         timer = setTimeout(() => reject(new Error('Application dialog attachment deadline')), 2000);
                     })
                 ]);
-                state.dialog.emit('request', incoming, response);
+                // Without a handler an in-dialog UPDATE/REFER would hang; INVITE keeps its attachment-bounded path.
+                if (message.method !== 'INVITE' && state.dialog.listenerCount('request') === 0)
+                    await response.respond(405, { headers: { Allow: ALLOW } });
+                else state.dialog.emit('request', incoming, response);
             } finally {
                 clearTimeout(timer);
             }
         } else if (message.method === 'INVITE') {
             if (this.onInvite) await this.onInvite(incoming, response);
             else await response.respond(503);
-        } else if (message.method === 'OPTIONS') await response.respond(200, { headers: { Allow: 'INVITE, ACK, CANCEL, BYE, OPTIONS' } });
-        else if (!['ACK', 'CANCEL', 'BYE'].includes(message.method))
-            await response.respond(405, { headers: { Allow: 'INVITE, ACK, CANCEL, BYE, OPTIONS' } });
+        } else if (message.method === 'OPTIONS') await response.respond(200, { headers: { Allow: ALLOW } });
+        else if (!['ACK', 'CANCEL', 'BYE'].includes(message.method)) await response.respond(405, { headers: { Allow: ALLOW } });
     }
     private enqueue<T>(state: Context, work: () => Promise<T>): Promise<T> {
         if ((state.pendingCommands ?? 0) >= 8) throw new NativeOperationError('Native context command capacity');
@@ -841,6 +952,7 @@ export class SipbridgeSignaling extends EventEmitter {
                     throw new NativeOperationError(result.error || 'Outbound native command refused');
                 if (!result.snapshot) throw new NativeOperationError('Outbound native context unavailable', true);
                 state = this.remember(peer, client, result.snapshot!, 'force');
+                state.onProvisional = status => attempt.onProvisional?.(status);
                 if (credentialId) state.credentials = { id: credentialId };
                 if (![OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(result.certainty))
                     throw new NativeOperationError('Outbound native outcome unknown', true);
@@ -875,13 +987,14 @@ export class SipbridgeSignaling extends EventEmitter {
             }
         })();
         void completed.catch(() => undefined);
-        return {
+        const attempt: OutboundAttempt = {
             completed,
             cancel: async () => {
                 cancelled = true;
                 if (state && !state.ended) await this.command(state, { $case: 'cancel', cancel: {} });
             }
         };
+        return attempt;
     }
     async stop() {
         this.stopped = true;
