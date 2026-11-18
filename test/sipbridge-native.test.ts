@@ -1225,6 +1225,10 @@ test('native REFER is presented to the dialog and answered 202 followed by an in
         const { peer, remoteTag, dialog } = await inboundDialog(fixture, signaling);
         peer.autoOk.add('NOTIFY').add('UPDATE');
         assert.equal(dialog.peerSource?.ip, '127.0.0.1');
+        // Replaces orientation: to-tag is this gateway's tag, from-tag the peer's.
+        assert.equal(dialog.localTag, remoteTag);
+        assert.equal(dialog.remoteTag, peer.tag);
+        assert.equal(dialog.sipCallId, peer.callId);
         assert.equal(dialog.peerSource?.port, peer.port);
         const seen: string[] = [];
         dialog.on('request', async (request, response) => {
@@ -1260,6 +1264,113 @@ test('native REFER is presented to the dialog and answered 202 followed by an in
         throw error;
     } finally {
         await signaling.stop();
+        await fixture.close();
+    }
+});
+
+test('native handoff: offerless destination, carrier cutover, paired BYE and a fully relayed offerless re-INVITE', native, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const log: string[] = [];
+    const media = {
+        assertHandoffMedia() {},
+        async prepareHandoff() {
+            log.push('stop-recording');
+            return [];
+        },
+        releaseHandoff() {},
+        async destroySession() {
+            log.push('delete-media');
+        }
+    };
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson(_url: string, body: { event: string }) {
+                return body.event === 'invite' ? { action: 'answer', sdp } : {};
+            }
+        } as never,
+        undefined,
+        undefined,
+        undefined,
+        { mediaController: media as never }
+    );
+    const carrier = await sipPeer(fixture.sipPort);
+    const center = await scriptedUa();
+    const answerOk = (wire: string, body: string) => {
+        const get = (name: string) => new RegExp('^' + name + ':\\s*(.+)$', 'im').exec(wire)?.[1].trim() ?? '';
+        carrier.socket.send(
+            `SIP/2.0 200 OK\r\nVia: ${get('Via')}\r\nFrom: ${get('From')}\r\nTo: ${get('To')}\r\nCall-ID: ${get('Call-ID')}\r\nCSeq: ${get('CSeq')}\r\nContact: <sip:caller@127.0.0.1:${carrier.port};transport=udp>\r\n${body ? 'Content-Type: application/sdp\r\n' : ''}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+            fixture.sipPort,
+            '127.0.0.1'
+        );
+    };
+    const gatewayRequests = (method: string) => carrier.messages.filter(message => message.startsWith(method + ' '));
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        carrier.send('INVITE', 1, '', offerSdp);
+        await until(() => carrier.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
+        const remoteTag = /^To:.*;tag=([^;\r\n]+)/im.exec(carrier.messages.find(message => message.startsWith('SIP/2.0 200'))!)![1];
+        carrier.send('ACK', 1, remoteTag, '', 'z9hG4bK-ack');
+        await until(() => registry.size === 1);
+        const call = registry.list()[0];
+
+        const transfer = gateway.transfer(
+            {
+                sessionId: call.callId,
+                mediaSessionId: 'media',
+                transferId: 'transfer-1',
+                requestUri: `sip:center@127.0.0.1:${center.port};transport=udp`
+            },
+            undefined
+        );
+        await until(() => center.count('INVITE') === 1);
+        assert.equal(center.find('INVITE').body, '', 'the destination is dialed offerless');
+        center.reply(center.find('INVITE'), 180, 'Ringing', offerSdp);
+        center.reply(center.find('INVITE'), 200, 'OK', offerSdp.replace('30000', '45000'));
+        await until(() => gatewayRequests('INVITE').length === 1);
+        assert.deepEqual(log, ['stop-recording'], 'recording is stopped before the carrier sees destination SDP');
+        assert.match(gatewayRequests('INVITE')[0], /m=audio 45000/);
+        answerOk(gatewayRequests('INVITE')[0], answerSdp);
+        const status = await transfer;
+        assert.equal(status.state, 'completed');
+        await until(() => center.count('ACK') === 1);
+        assert.equal(center.find('ACK').body.includes('m=audio 40000'), true, 'the destination is ACKed with the carrier answer');
+        await until(() => gatewayRequests('INVITE').length === 1 && log.includes('delete-media'));
+        assert.equal(registry.list()[0].ownership, 'handed-off');
+
+        // Offerless re-INVITE from the carrier: full relay through the destination leg.
+        carrier.send('INVITE', 2, remoteTag, '', 'z9hG4bK-offerless');
+        await until(() => center.count('INVITE') === 2);
+        assert.equal(center.find('INVITE', 1).body, '');
+        center.reply(center.find('INVITE', 1), 200, 'OK', offerSdp.replace('30000', '45002'));
+        await until(() => carrier.messages.some(message => message.startsWith('SIP/2.0 200') && /CSeq: 2 INVITE/i.test(message)));
+        const relayed = carrier.messages.find(message => message.startsWith('SIP/2.0 200') && /CSeq: 2 INVITE/i.test(message))!;
+        assert.match(relayed, /m=audio 45002/);
+        carrier.send('ACK', 2, remoteTag, answerSdp.replace('40000', '40002'), 'z9hG4bK-offerless-ack');
+        await until(() => center.count('ACK') === 2);
+        assert.match(center.find('ACK', 1).body, /m=audio 40002/);
+        assert.equal(registry.size, 1);
+
+        // Carrier BYE ends the destination leg exactly once.
+        carrier.send('BYE', 3, remoteTag, '', 'z9hG4bK-bye');
+        await until(() => center.count('BYE') === 1);
+        center.reply(center.find('BYE'), 200, 'OK');
+        await until(() => registry.size === 0);
+        await new Promise(resolve => setTimeout(resolve, 300));
+        assert.equal(center.count('BYE'), 1);
+    } catch (error) {
+        console.error(fixture.logs);
+        console.error(carrier.messages);
+        console.error(center.received.map(message => message.wire));
+        throw error;
+    } finally {
+        await gateway.shutdown();
+        carrier.close();
+        center.close();
         await fixture.close();
     }
 });

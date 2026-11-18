@@ -87,3 +87,27 @@ export function parseReplaces(value: string): ReplacesIdentity {
     if (!callId.trim() || !toTag || !fromTag || /[\s\r\n]/.test(callId + toTag + fromTag)) throw new Error('Invalid Replaces header');
     return { callId: callId.trim(), toTag, fromTag, earlyOnly: values.has('early-only') };
 }
+
+export interface ReferTarget {
+    uri: string;
+    replaces?: ReplacesIdentity;
+}
+
+/**
+ * Parses a Refer-To value (name-addr or addr-spec) into its SIP URI and an optional Replaces identity.
+ * The URI keeps its headers off so it can be used as a route destination. Throws on malformed input.
+ */
+export function parseReferTarget(value: string): ReferTarget {
+    const trimmed = value.trim();
+    const uri = (/<([^>]+)>/.exec(trimmed)?.[1] ?? trimmed.split(';')[0]).trim();
+    const match = /^(sips?):([^\s?<>]+)(?:\?(.*))?$/i.exec(uri);
+    if (!match || !match[2].replace(/^[^@]*@/, '').split(/[;:]/)[0]) throw new Error('Invalid SIP target');
+    let replaces: ReplacesIdentity | undefined;
+    for (const header of (match[3] ?? '').split('&').filter(Boolean)) {
+        const [name, ...rest] = header.split('=');
+        if (name.toLowerCase() !== 'replaces') continue;
+        if (replaces) throw new Error('Duplicate Replaces header');
+        replaces = parseReplaces(decodeURIComponent(rest.join('=')));
+    }
+    return { uri: `${match[1].toLowerCase()}:${match[2]}`, replaces };
+}

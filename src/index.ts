@@ -70,7 +70,8 @@ async function run() {
     if (mediaServers) mediaServers.isCallActive = callId => registry.hasCallOrReservation(callId) || !!media?.get(callId);
     gateway = new SipGateway(Config, registry, new AxiosGatewayHttpClient(), undefined, controlHub, lifecycle, {
         media: () => !!mediaServers?.readiness.eligibleBackends,
-        firewall
+        firewall,
+        mediaController: media
     });
     controlHub.on('disconnect', connectionId => {
         const cleanup = async () => {

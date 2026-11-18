@@ -3,7 +3,7 @@ import http from 'node:http';
 
 import type { FileEndpointCatalog } from './endpoint-catalog';
 
-import { CallRegistry } from './call-registry';
+import { CallRegistry, snapshotCall } from './call-registry';
 import { GatewayConfig } from './config';
 import { ControlHub } from './control-hub';
 import { ControlServer } from './control-server';
@@ -26,9 +26,11 @@ import { CommandNotImplementedError, CommandValidationError, SessionCommandHandl
 import type { SipFirewall } from './sip-firewall';
 import type { FirewallPublisher } from './firewall-publisher';
 import { bearerMatches } from './firewall-auth';
+import type { SipTransferParams, SipTransferStatus } from './sip-handoff-contract';
 
 export interface GatewayController {
     isConnected: boolean;
+    transfer?(params: SipTransferParams, controlConnectionId?: string): Promise<SipTransferStatus>;
     createOutbound(params: OutboundSipCallParams): Promise<OutboundSipCallResult>;
     cancelOutbound?(outboundAttemptId: string, controlConnectionId?: string): Promise<{ ok: true }>;
     reinvite(callId: string, sdp: string, headers?: Record<string, string>): Promise<{ sdp: string }>;
@@ -209,6 +211,13 @@ export function createHttpApp(
 
     app.use(httpBearerAuth(authConfig));
 
+    app.post(
+        '/calls/:callId/transfer',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('sip.transfer', { ...(req.body ?? {}), sessionId: req.params.callId }));
+        })
+    );
+
     app.get('/routing/status', (_req, res) => {
         res.send({
             acceptNew: admitting(),
@@ -231,15 +240,13 @@ export function createHttpApp(
             res.status(404).send({ error: 'Call not found' });
             return;
         }
-        const { dialog: _dialog, ...snapshot } = call;
-        res.send(snapshot);
+        res.send(snapshotCall(call));
     });
 
     app.get('/sessions/:sessionId', (req, res) => {
         const call = registry.get(req.params.sessionId);
         if (call) {
-            const { dialog: _dialog, ...snapshot } = call;
-            res.send(snapshot);
+            res.send(snapshotCall(call));
             return;
         }
         const mediaSession = media?.get(req.params.sessionId);

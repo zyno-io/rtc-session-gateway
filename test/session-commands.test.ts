@@ -94,6 +94,45 @@ test('session commands require complete outbound SIP auth credentials', async ()
     );
 });
 
+test('SIP handoff commands require identities and retain requester ownership through HTTP and WebSocket dispatch', async () => {
+    const calls: Array<{ params: unknown; owner: string | undefined }> = [];
+    const status = {
+        transferId: 'transfer-1',
+        logicalCallId: 'logical-1',
+        state: 'completed' as const,
+        startedAt: new Date().toISOString(),
+        committedAt: new Date().toISOString(),
+        recordings: []
+    };
+    const gateway: GatewayController = {
+        ...fakeGateway,
+        async transfer(params, owner) {
+            calls.push({ params, owner });
+            return status;
+        }
+    };
+    const commands = new SessionCommandHandler(new CallRegistry(), gateway);
+    const params = { sessionId: 'source', mediaSessionId: 'media', requestUri: 'sip:center@example.test', transferId: 'transfer-1' };
+    for (const field of ['sessionId', 'mediaSessionId', 'requestUri', 'transferId']) {
+        await assert.rejects(commands.execute('sip.transfer', { ...params, [field]: undefined }), new RegExp(`${field} is required`));
+    }
+    await assert.rejects(commands.execute('sip.transfer', { ...params, auth: { username: 'user' } }), /auth.password/);
+    await commands.execute('sip.transfer', params, { controlConnectionId: 'owner' });
+    assert.equal(calls[0].owner, 'owner');
+    const server = http.createServer(createHttpApp(new CallRegistry(), gateway));
+    await listen(server);
+    try {
+        const response = await postJson(server, '/calls/source/transfer', { ...params, sessionId: 'wrong-source' });
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body, status);
+        assert.equal((calls[1].params as typeof params).sessionId, 'source');
+        assert.equal(calls[1].owner, undefined);
+    } finally {
+        server.close();
+    }
+});
+
+
 test('session commands cancel a pending outbound SIP attempt on its control connection', async () => {
     const cancellations: unknown[][] = [];
     const gateway: GatewayController = {
