@@ -13,6 +13,7 @@
         "docs:build": "vitepress build docs",
         "docs:dev": "vitepress dev docs --host 0.0.0.0",
         "docs:preview": "vitepress preview docs --host 0.0.0.0",
+        "build:firewall-sidecar-image": "docker build -f firewall-sidecar/Dockerfile -t rtc-session-gateway-firewall-sidecar .",
         "e2e:compose": "node scripts/run-compose-e2e.mjs",
         "format": "oxfmt",
         "start": "node .",
