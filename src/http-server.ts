@@ -23,6 +23,9 @@ import {
 } from './media-session-service';
 import { acceptsSipHost, getSipUser, matchRoute } from './routing';
 import { CommandNotImplementedError, CommandValidationError, SessionCommandHandler } from './session-commands';
+import type { SipFirewall } from './sip-firewall';
+import type { FirewallPublisher } from './firewall-publisher';
+import { bearerMatches } from './firewall-auth';
 
 export interface GatewayController {
     isConnected: boolean;
@@ -63,7 +66,9 @@ export class HttpServer {
         private media?: GatewayMediaController,
         private lifecycle?: GatewayLifecycle,
         private mediaReady: () => boolean = () => true,
-        private mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined
+        private mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined,
+        private firewall?: SipFirewall,
+        private firewallPublisher?: FirewallPublisher
     ) {}
 
     start() {
@@ -76,7 +81,9 @@ export class HttpServer {
             this.controlHub,
             this.lifecycle,
             this.mediaReady,
-            this.mediaStatus
+            this.mediaStatus,
+            this.firewall,
+            this.firewallPublisher
         );
         const server = http.createServer(app);
         this.server = server;
@@ -119,7 +126,9 @@ export function createHttpApp(
     controlHub?: ControlHub,
     lifecycle?: GatewayLifecycle,
     mediaReady: () => boolean = () => true,
-    mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined
+    mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined,
+    firewall?: SipFirewall,
+    firewallPublisher?: FirewallPublisher
 ) {
     const logger = BaseLogger.child({ ns: 'Http' });
     const app = express();
@@ -132,7 +141,7 @@ export function createHttpApp(
         (!sipRouteConfig?.ROUTES_REQUIRED || routeCount() > 0);
     app.use(express.json({ limit: '2mb' }));
     app.use((req, _res, next) => {
-        if (req.url !== '/healthz') logger.info({ method: req.method, url: req.url }, 'Request');
+        if (req.url !== '/healthz') logger.info({ method: req.method, url: req.path }, 'Request');
         next();
     });
 
@@ -143,6 +152,48 @@ export function createHttpApp(
     app.get('/readyz', (_req, res) => {
         const ready = admitting();
         res.status(ready ? 200 : 503).send({ ok: ready, draining: lifecycle?.isDraining ?? false });
+    });
+
+    // Firewall routes use their own credentials and must work independently of control auth and draining.
+    app.use('/firewall', (req, res, next) => {
+        const token = req.method === 'GET' && req.path === '/snapshot' ? firewall?.config.snapshotToken : firewall?.config.adminToken;
+        if (!firewall || !bearerMatches(req.headers.authorization, token)) {
+            res.status(401).send({ error: 'Unauthorized' });
+            return;
+        }
+        next();
+    });
+    app.get('/firewall/snapshot', (_req, res) => {
+        res.send(firewall!.snapshot());
+    });
+    app.get('/firewall/status', (_req, res) => {
+        res.send({ ...firewall!.status(), publisher: firewallPublisher?.status });
+    });
+    app.get('/firewall/blocks', (req, res) => {
+        const offset = Number(req.query.offset ?? 0);
+        const limit = Number(req.query.limit ?? 100);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+            res.status(400).send({ error: 'Invalid pagination' });
+            return;
+        }
+        const blocks = firewall!.blocks();
+        res.send({ blocks: blocks.slice(offset, offset + limit), total: blocks.length });
+    });
+    app.post('/firewall/blocks', (req, res) => {
+        try {
+            firewall!.ban(req.body?.target, req.body?.ttlSeconds, req.body?.reason);
+            res.send({ ok: true });
+        } catch (error) {
+            res.status(400).send({ error: error instanceof Error ? error.message : 'Invalid ban' });
+        }
+    });
+    app.delete('/firewall/blocks', (req, res) => {
+        try {
+            firewall!.unblock(req.query.target);
+            res.send({ ok: true });
+        } catch {
+            res.status(400).send({ error: 'Invalid target' });
+        }
     });
 
     app.use((_req, res, next) => {
