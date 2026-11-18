@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { SipStreamPeer } from './support/sip-stream-peer.mjs';
+import { prepareNativeCertificates as prepareNativeCerts, signalingCatalogSection } from './support/native-fixtures.mjs';
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -140,51 +141,7 @@ function prepareFixtures() {
 }
 
 function prepareNativeCertificates() {
-    const openssl = args => execFileSync('openssl', args, { cwd: fixturesDirectory, stdio: 'ignore' });
-    openssl([
-        'req',
-        '-x509',
-        '-newkey',
-        'rsa:2048',
-        '-nodes',
-        '-keyout',
-        'native-ca.key',
-        '-out',
-        'native-ca.crt',
-        '-days',
-        '2',
-        '-subj',
-        '/CN=RTC native E2E CA'
-    ]);
-    for (const kind of ['server', 'client']) {
-        openssl(['req', '-newkey', 'rsa:2048', '-nodes', '-keyout', `native-${kind}.key`, '-out', `native-${kind}.csr`, '-subj', '/CN=RTC E2E']);
-        writeFileSync(
-            `${fixturesDirectory}/native-${kind}.ext`,
-            kind === 'server'
-                ? 'subjectAltName=DNS:sipbridge-e2e,IP:10.89.42.30\nextendedKeyUsage=serverAuth\n'
-                : 'subjectAltName=URI:spiffe://rtc/e2e/controller\nextendedKeyUsage=clientAuth\n'
-        );
-        openssl([
-            'x509',
-            '-req',
-            '-in',
-            `native-${kind}.csr`,
-            '-CA',
-            'native-ca.crt',
-            '-CAkey',
-            'native-ca.key',
-            '-CAcreateserial',
-            '-out',
-            `native-${kind}.crt`,
-            '-days',
-            '2',
-            '-extfile',
-            `native-${kind}.ext`
-        ]);
-        chmodSync(`${fixturesDirectory}/native-${kind}.key`, 0o644);
-        chmodSync(`${fixturesDirectory}/native-${kind}.crt`, 0o644);
-    }
-    chmodSync(`${fixturesDirectory}/native-ca.crt`, 0o644);
+    prepareNativeCerts(fixturesDirectory, { ip: '10.89.42.30' });
 }
 function writeCatalog(admission, changed = true) {
     catalogAdmission = [...admission];
@@ -193,17 +150,7 @@ function writeCatalog(admission, changed = true) {
     const validUntil = new Date(Date.now() + 30000).toISOString();
     const value = {
         schemaVersion: 2,
-        signaling: {
-            revision: 'a'.repeat(64),
-            validUntil,
-            backends: [
-                {
-                    id: 'sipbridge-e2e',
-                    acceptNew: true,
-                    control: { url: 'wss://10.89.42.30:8443/v1/control', tlsServerName: 'sipbridge-e2e' }
-                }
-            ]
-        },
+        signaling: signalingCatalogSection({ ip: '10.89.42.30' }),
         media: {
             revision: mediaRevision,
             validUntil,

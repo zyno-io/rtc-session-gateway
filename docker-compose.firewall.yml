@@ -1,0 +1,123 @@
+# Real-packet firewall E2E: gateway + sipbridge + nftables sidecar sharing sipbridge's network namespace.
+# Run with `yarn e2e:firewall` (requires SIPBRIDGE_IMAGE; see dependencies/sipbridge-runtime.json).
+services:
+  sipbridge:
+    image: ${SIPBRIDGE_IMAGE:?Set SIPBRIDGE_IMAGE to the qualified native runtime}
+    environment:
+      SIPBRIDGE_STATE_BACKEND: memory
+    command:
+      - --instance
+      - sipbridge-e2e
+      - --control-listen
+      - 0.0.0.0:8443
+      - --admin-listen
+      - 0.0.0.0:8800
+      - --sip-listen
+      - 0.0.0.0:5061
+      - --sip-plain-listen
+      - ${FIREWALL_SIP_LISTEN:-[::]:5060}
+      - --advertise
+      - 10.89.43.2:5061
+      - --advertise-plain
+      - 10.89.43.2:5060
+      - --contact
+      - sip:sipbridge@10.89.43.2:5060;transport=tcp
+      - --control-cert
+      - /fixtures/native-server.crt
+      - --control-key
+      - /fixtures/native-server.key
+      - --sip-cert
+      - /fixtures/native-server.crt
+      - --sip-key
+      - /fixtures/native-server.key
+      - --client-ca
+      - /fixtures/native-ca.crt
+      - --allowed-client-uri
+      - spiffe://rtc/e2e/controller
+      - --allow-register=false
+      - --allow-subscribe=false
+    volumes:
+      - ${FIREWALL_FIXTURES}:/fixtures:ro
+    networks:
+      default:
+        ipv4_address: 10.89.43.2
+        ipv6_address: fd42:7263:1::2
+      outside:
+        ipv6_address: fd42:7263:2::2
+  gateway:
+    build:
+      context: .
+      target: e2e
+    depends_on:
+      - sipbridge
+    environment:
+      HTTP_PORT: '3001'
+      CONTROL_AUTH_MODE: none
+      RTC_ENDPOINTS_FILE: /fixtures/endpoints.json
+      SIPBRIDGE_TLS_CERT_FILE: /fixtures/native-client.crt
+      SIPBRIDGE_TLS_KEY_FILE: /fixtures/native-client.key
+      SIPBRIDGE_TLS_CA_FILE: /fixtures/native-ca.crt
+      SIP_ALLOWED_DOMAINS_JSON: '["firewall.test"]'
+      SIP_FIREWALL_MODE: enforce
+      SIP_FIREWALL_THRESHOLD: '2'
+      SIP_FIREWALL_BAN_TTLS_SEC: '30'
+      SIP_FIREWALL_ALLOWLIST_JSON: '["10.89.43.31"]'
+      SIP_FIREWALL_ADMIN_TOKEN: e2e-admin
+      SIP_FIREWALL_SNAPSHOT_TOKEN: e2e-reader
+      SIP_FIREWALL_PUBLISHER_URL: https://sipbridge:9098/v1/snapshot
+      SIP_FIREWALL_PUBLISHER_TOKEN: e2e-publisher
+      SIP_FIREWALL_PUBLISHER_CA_FILE: /fixtures/native-ca.crt
+    volumes:
+      - ${FIREWALL_FIXTURES}:/fixtures:ro
+    networks:
+      default:
+        ipv4_address: 10.89.43.20
+        ipv6_address: fd42:7263:1::20
+  firewall:
+    build:
+      context: .
+      dockerfile: firewall-sidecar/Dockerfile
+      target: firewall-sidecar
+    network_mode: service:sipbridge
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    environment:
+      SIP_FIREWALL_LISTEN_HOST: 0.0.0.0
+      SIP_FIREWALL_RECEIVER_TOKEN: e2e-publisher
+      SIP_FIREWALL_TLS_CERT_FILE: /fixtures/native-server.crt
+      SIP_FIREWALL_TLS_KEY_FILE: /fixtures/native-server.key
+      # The gateway must never be banned from sipbridge or the receiver.
+      FIREWALL_PROTECTED_CIDRS: 10.89.43.20/32,fd42:7263:1::20/128
+    volumes:
+      - ${FIREWALL_FIXTURES}:/fixtures:ro
+  attacker:
+    build: { context: ., target: e2e }
+    command: [node, -e, 'setInterval(()=>{},1000000)']
+    networks:
+      default:
+        ipv4_address: 10.89.43.30
+        ipv6_address: fd42:7263:1::30
+      # IPv6 scans come from a prefix of their own: automatic IPv6 bans cover a /64, which must never
+      # contain the gateway (a protected address) or an allowlisted carrier.
+      outside:
+        ipv6_address: fd42:7263:2::30
+  carrier:
+    build: { context: ., target: e2e }
+    command: [node, -e, 'setInterval(()=>{},1000000)']
+    networks:
+      default:
+        ipv4_address: 10.89.43.31
+        ipv6_address: fd42:7263:1::31
+networks:
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.89.43.0/24
+        - subnet: fd42:7263:1::/64
+  outside:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.89.44.0/24
+        - subnet: fd42:7263:2::/64
