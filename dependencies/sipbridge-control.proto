@@ -133,7 +133,7 @@ message InboundAuthPolicy {
 }
 
 // Short-lived issuance policy, not an account credential or authentication proof.
-// The signing key is a purpose/epoch-scoped derivation, never the trusted SRPC key.
+// Use a purpose/epoch-scoped signing key, never a shared application master key.
 message DigestChallengePolicy {
   string realm = 1;
   string authentication_epoch = 2;
@@ -259,6 +259,11 @@ message FlowClosed { FlowRef flow = 1; }
 message DialogEvent {
   enum Kind { UNSPECIFIED = 0; PROVISIONAL = 1; ANSWERED = 2; ACKNOWLEDGED = 3; CANCELLED = 4; ENDED = 5; FAILED = 6; SUBSCRIPTION_EXPIRED = 7; }
   Kind kind = 1; ContextSnapshot snapshot = 2; SipMessage message = 3; string operation_id = 4; string error = 5;
+  // Only with sip.reinvite-ack.v1: message-bearing ACKNOWLEDGED for an accepted
+  // peer re-INVITE ACK. Message presence distinguishes it from an initial ACK;
+  // invite_cseq is the correlation value and may be zero.
+  // Initial ACKNOWLEDGED remains snapshot-only and leaves this field zero.
+  uint32 invite_cseq = 6;
 }
 message ContextInspect { ContextRef context = 1; }
 

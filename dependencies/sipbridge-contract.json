@@ -1,34 +1,34 @@
 {
     "repository": "https://github.com/zyno-io/sipbridge",
     "source": "dependencies/sipbridge-control.proto",
-    "schema_sha256": "cf48454294dda7578a2172f0fc012aad829a7747e357bfeaa23a0688816bc09d",
+    "schema_sha256": "aa21438374a1e098d159bd2e4c16ce9def0b4281959f30caa691d169a8fe3eea",
     "protoc": "3.21.12",
     "protoc_gen_go": "1.36.12",
     "ts_proto": "2.18.3",
-    "generated_go_sha256": "b814b7166d72fff3af42164a6d3e9e57de29448c0da36373f03856286893074a",
-    "generated_ts_sha256": "de402b1956ee4f082799fab7b9d11463cc14813e7ac90167d2bf43627fc8d807",
-    "generated_json_validation_sha256": "42da9bcb9a23b535938e62ff6bc630783f9a4e2f48f8b19cd4adef7aa32282ec",
-    "json_cases_sha256": "2e1f5e094cf9eec60f74e35e5e0d42705f8f05283d6d8640337775ed759e8cc7",
+    "generated_go_sha256": "9db9708e7d7f31e67fa7f9912c5493203d3dbddbe65fe7e1cdcd81caf9b4febd",
+    "generated_ts_sha256": "67a886969060a6ec85204af1250b89c476f6130acd8153254978900539e1007d",
+    "generated_json_validation_sha256": "690c29b7e373228e65881670ec9a9b31027dc107a0c5f2855b4b2e09fd2d5e74",
+    "json_cases_sha256": "3191fc1b3f6bf4701028721920d3f3c90ac9fc81b232a21e8db8ebd0eed84773",
     "digest_challenge_case_sha256": "01647794997aa864eab906cccfdacb010673b25d1c2ea6922a3a733878c26004",
     "wire_encoding": "json",
     "subprotocol": "sipbridge.control.json.v1",
-    "sipbridgeRevision": "4aa860c71919ae5149b0acb465b0c96b3b3704a0",
+    "sipbridgeRevision": "e3f6d83e3a9e316877bc115d9a9c401f3c3be897",
     "files": {
         "schema": {
             "path": "dependencies/sipbridge-control.proto",
-            "sha256": "cf48454294dda7578a2172f0fc012aad829a7747e357bfeaa23a0688816bc09d"
+            "sha256": "aa21438374a1e098d159bd2e4c16ce9def0b4281959f30caa691d169a8fe3eea"
         },
         "sipbridge-control.ts": {
             "path": "src/sipbridge/generated/sipbridge-control.ts",
-            "sha256": "de402b1956ee4f082799fab7b9d11463cc14813e7ac90167d2bf43627fc8d807"
+            "sha256": "67a886969060a6ec85204af1250b89c476f6130acd8153254978900539e1007d"
         },
         "sipbridge-json.ts": {
             "path": "src/sipbridge/generated/sipbridge-json.ts",
-            "sha256": "42da9bcb9a23b535938e62ff6bc630783f9a4e2f48f8b19cd4adef7aa32282ec"
+            "sha256": "690c29b7e373228e65881670ec9a9b31027dc107a0c5f2855b4b2e09fd2d5e74"
         },
         "json-cases": {
             "path": "dependencies/sipbridge-json-cases.json",
-            "sha256": "2e1f5e094cf9eec60f74e35e5e0d42705f8f05283d6d8640337775ed759e8cc7"
+            "sha256": "3191fc1b3f6bf4701028721920d3f3c90ac9fc81b232a21e8db8ebd0eed84773"
         }
     }
 }
