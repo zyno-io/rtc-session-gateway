@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { addressRange, overlaps, sourceIp, type AddressRange } from './firewall-address';
+import { addressRange, blockRange, overlaps, overlapsLoopback, sourceIp, type AddressRange } from './firewall-address';
 import { FIREWALL_MAX_ALLOWS, FIREWALL_MAX_BLOCKS, FIREWALL_MAX_TTL_MS, type FirewallSnapshot } from './firewall-contract';
 
 export interface SipFirewallConfig {
@@ -91,6 +91,8 @@ export class SipFirewall extends EventEmitter {
     private readonly records = new Map<string, ScoreRecord>();
     private readonly automatic = new Map<string, FirewallBlock>();
     private readonly manual = new Map<string, FirewallBlock>();
+    // Parsed once at creation; kept out of block objects so snapshots/API output never serialize it.
+    private readonly manualRanges = new WeakMap<FirewallBlock, AddressRange>();
     private readonly markers = new Map<string, number>();
     private readonly allow: AddressRange[];
     private recordCursor?: MapIterator<[string, ScoreRecord]>;
@@ -121,9 +123,12 @@ export class SipFirewall extends EventEmitter {
         if (this.isAllowed(ip)) return false;
         const range = addressRange(ip);
         const now = this.now();
-        const auto = this.automatic.get(ip);
+        const auto = this.automatic.get(scoreKey(ip));
         if (auto && auto.expiresAt > now) return true;
-        for (const block of this.manual.values()) if (block.expiresAt > now && overlaps(range, addressRange(block.target))) return true;
+        for (const block of this.manual.values()) {
+            const manualRange = this.manualRanges.get(block);
+            if (block.expiresAt > now && manualRange && overlaps(range, manualRange)) return true;
+        }
         return false;
     }
 
@@ -136,7 +141,10 @@ export class SipFirewall extends EventEmitter {
             this.counters.invalidSources++;
             return;
         }
-        if (this.isAllowed(ip) || this.shouldReject(ip)) return;
+        // Loopback is never scored; IPv6 sources are scored and banned per /64 so rotating within a prefix accumulates.
+        if (overlapsLoopback(addressRange(ip))) return;
+        const key = scoreKey(ip);
+        if (this.isAllowed(key) || this.shouldReject(ip)) return;
         const now = this.now();
         if (transactionId) {
             const key = createHash('sha256').update(ip).update('\0').update(transactionId).digest('hex');
@@ -147,14 +155,14 @@ export class SipFirewall extends EventEmitter {
             }
             this.markers.set(key, now + 60_000);
         }
-        let record = this.records.get(ip);
+        let record = this.records.get(key);
         if (!record) {
             if (this.records.size >= this.config.maxRecords) {
                 this.counters.skipped++;
                 return;
             }
             record = { score: 0, updatedAt: now, tier: 0, lastBan: 0 };
-            this.records.set(ip, record);
+            this.records.set(key, record);
         }
         if (record.lastBan && now - record.lastBan > FIREWALL_MAX_TTL_MS) record.tier = 0;
         let dialTarget = target ?? '';
@@ -174,19 +182,19 @@ export class SipFirewall extends EventEmitter {
             return;
         }
         this.pruneBlocks(now);
-        if (!this.automatic.has(ip) && this.manual.size + this.automatic.size >= this.config.maxBlocks) {
+        if (!this.automatic.has(key) && this.manual.size + this.automatic.size >= this.config.maxBlocks) {
             this.counters.skipped++;
             return;
         }
         const tier = Math.min(record.tier, this.config.banTtlsSec.length - 1);
         const block: FirewallBlock = {
-            target: ip,
+            target: key,
             expiresAt: now + this.config.banTtlsSec[tier] * 1000,
             kind: 'automatic',
             reason: reason.slice(0, 128),
             tier
         };
-        this.automatic.set(ip, block);
+        this.automatic.set(key, block);
         record.tier = Math.min(tier + 1, this.config.banTtlsSec.length - 1);
         record.lastBan = now;
         record.score = 0;
@@ -196,7 +204,9 @@ export class SipFirewall extends EventEmitter {
 
     ban(target: unknown, ttlSeconds: unknown, reason: unknown): void {
         if (this.config.mode !== 'enforce') throw new Error('Manual bans require enforce mode');
-        const normalized = addressRange(target).target;
+        const range = blockRange(target);
+        const normalized = range.target;
+        if (overlapsLoopback(range)) throw new Error('Target overlaps loopback');
         if (
             typeof ttlSeconds !== 'number' ||
             !Number.isSafeInteger(ttlSeconds) ||
@@ -211,20 +221,28 @@ export class SipFirewall extends EventEmitter {
         this.pruneBlocks(this.now());
         if (!this.manual.has(normalized) && this.manual.size + this.automatic.size >= this.config.maxBlocks)
             throw new Error('Firewall block capacity reached');
-        this.manual.set(normalized, {
+        const block: FirewallBlock = {
             target: normalized,
             expiresAt: this.now() + ttlSeconds * 1000,
             reason,
             kind: 'manual'
-        });
+        };
+        this.manualRanges.set(block, range);
+        this.manual.set(normalized, block);
         this.changed();
     }
 
     unblock(target: unknown): void {
-        const normalized = addressRange(target).target;
+        const range = addressRange(target);
+        const normalized = range.target;
         this.manual.delete(normalized);
         this.automatic.delete(normalized);
         this.records.delete(normalized);
+        if (range.family === 6 && range.prefix === 128) {
+            const key = scoreKey(normalized);
+            this.automatic.delete(key);
+            this.records.delete(key);
+        }
         this.changed();
     }
 
@@ -313,4 +331,10 @@ export class SipFirewall extends EventEmitter {
         this.revision++;
         this.emit('change');
     }
+}
+
+/** Automatic scoring granularity: IPv4 /32, IPv6 /64 (a single subscriber can rotate through a whole /64). */
+function scoreKey(ip: string): string {
+    const range = addressRange(ip);
+    return range.family === 6 ? addressRange(ip + '/64').target : ip;
 }

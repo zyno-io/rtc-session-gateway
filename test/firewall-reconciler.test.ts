@@ -152,3 +152,85 @@ test('overlapping manual CIDR and automatic host converge without native interva
     await reconciler.reconcile();
     assert.deepEqual(backend.calls.slice(-2), ['remove 192.0.2.0/24', 'add 192.0.2.1 10']);
 });
+
+test('one failing target is isolated: others apply, unrelated entries are not removed, pass reports failure', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expires = new Date(start + 10000).toISOString();
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.1', expiresAt: expires }]));
+    await reconciler.reconcile();
+    const originalAdd = backend.add.bind(backend);
+    backend.add = async (target, ttl) => {
+        if (target === '198.51.100.0/24') throw new Error('rejected');
+        return originalAdd(target, ttl);
+    };
+    reconciler.accept(
+        snapshot(2, [
+            { target: '192.0.2.1', expiresAt: expires },
+            { target: '198.51.100.0/24', expiresAt: expires },
+            { target: '203.0.113.5', expiresAt: expires }
+        ])
+    );
+    await assert.rejects(reconciler.reconcile(), /rejected/);
+    assert.ok(backend.calls.includes('add 203.0.113.5 10'));
+    assert.ok(!backend.calls.some(call => call.startsWith('remove')));
+    assert.equal(reconciler.state.active, 2);
+    assert.equal(reconciler.state.lastError, 'rejected');
+    assert.equal(reconciler.state.appliedRevision, 1);
+});
+
+test('a failing removal leaves the entry mirrored and still applies other changes', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expires = new Date(start + 10000).toISOString();
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.1', expiresAt: expires }]));
+    await reconciler.reconcile();
+    backend.remove = async target => {
+        backend.calls.push('remove ' + target);
+        throw new Error('no remove');
+    };
+    reconciler.accept(snapshot(2, [{ target: '203.0.113.5', expiresAt: expires }]));
+    await assert.rejects(reconciler.reconcile());
+    assert.ok(backend.calls.includes('add 203.0.113.5 10'));
+    assert.equal(reconciler.state.active, 2);
+});
+
+test('loopback and sidecar-protected CIDRs are never installed, regardless of snapshot allowlist', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start, ['10.0.0.0/8']);
+    const expires = new Date(start + 10000).toISOString();
+    reconciler.accept(
+        snapshot(1, [
+            { target: '127.0.0.1', expiresAt: expires },
+            { target: '10.1.2.3', expiresAt: expires },
+            { target: '::1', expiresAt: expires },
+            { target: '192.0.2.1', expiresAt: expires }
+        ])
+    );
+    await reconciler.reconcile();
+    assert.deepEqual(backend.calls, ['reset', 'add 192.0.2.1 10']);
+});
+
+test('snapshots with /0 or overly broad block targets are rejected', () => {
+    const expires = new Date(start + 10000).toISOString();
+    for (const target of ['0.0.0.0/0', '::ffff:0:0/96', '::/0', '128.0.0.0/7', '8000::/15'])
+        assert.throws(() => new FirewallReconciler(new Backend(), () => start).accept(snapshot(1, [{ target, expiresAt: expires }])), /too broad/);
+    assert.doesNotThrow(() => new FirewallReconciler(new Backend(), () => start).accept({ ...snapshot(1, []), allowlist: ['0.0.0.0/0'] }));
+});
+
+test('a silent owner whose last snapshot is stale can be replaced by an instance with an earlier startedAt', () => {
+    let now = start;
+    const reconciler = new FirewallReconciler(new Backend(), () => now);
+    reconciler.accept(snapshot(1));
+    now = start + 30_000;
+    const earlier = (): FirewallSnapshot => ({
+        ...snapshot(0, []),
+        instanceId: 'owner-b',
+        startedAt: new Date(start - 1000).toISOString(),
+        generatedAt: new Date(now).toISOString()
+    });
+    assert.throws(() => reconciler.accept(earlier()), /Superseded/);
+    now = start + 61_000;
+    reconciler.accept(earlier());
+    assert.equal(reconciler.state.instanceId, 'owner-b');
+});

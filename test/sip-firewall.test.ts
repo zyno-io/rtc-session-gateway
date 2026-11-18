@@ -154,3 +154,53 @@ test('unknown-Replaces observations are ignored unless explicitly enabled', () =
     on.observe('192.0.2.1', 'scan', 'unknown-replaces', 'r', true);
     assert.equal(on.counters.observations, 1);
 });
+
+test('bans reject /0, overly broad and loopback-overlapping targets; allowlists may stay broad', () => {
+    const firewall = new SipFirewall(config(), () => start);
+    for (const target of ['0.0.0.0/0', '::ffff:0:0/96', '::/0', '128.0.0.0/7', '8000::/15'])
+        assert.throws(() => firewall.ban(target, 60, 'broad'), /too broad/);
+    for (const target of ['127.0.0.1', '127.0.0.0/8', '::1', '::ffff:127.0.0.1', '::/16'])
+        assert.throws(() => firewall.ban(target, 60, 'loopback'), /loopback/);
+    assert.doesNotThrow(() => firewall.ban('192.0.0.0/8', 60, 'ok'));
+    assert.doesNotThrow(() => firewall.ban('2001::/16', 60, 'ok'));
+    assert.doesNotThrow(() => new SipFirewall(config({ allowlist: ['0.0.0.0/0'] }), () => start));
+});
+
+test('loopback sources are never scored or banned automatically', () => {
+    const firewall = new SipFirewall(config({ threshold: 1 }), () => start);
+    firewall.observe('127.0.0.1', 'scan', 'no-route');
+    firewall.observe('::1', 'scan', 'no-route');
+    assert.equal(firewall.status().records, 0);
+    assert.equal(firewall.blocks().length, 0);
+});
+
+test('IPv6 sources are scored and auto-banned per /64; IPv4 stays per host', () => {
+    const firewall = new SipFirewall(config({ threshold: 3 }), () => start);
+    firewall.observe('2001:db8:1:2::1', 'scan', 'no-route');
+    firewall.observe('2001:db8:1:2:aaaa::2', 'scan', 'no-route');
+    assert.equal(firewall.status().records, 1);
+    assert.equal(firewall.shouldReject('2001:db8:1:2::3'), false);
+    firewall.observe('2001:db8:1:2:ffff:ffff:ffff:ffff', 'scan', 'no-route');
+    assert.deepEqual(
+        firewall.blocks().map(block => block.target),
+        ['2001:db8:1:2:0:0:0:0/64']
+    );
+    assert.equal(firewall.shouldReject('2001:db8:1:2:1234::9'), true);
+    assert.equal(firewall.shouldReject('2001:db8:1:3::1'), false);
+    assert.equal(firewall.snapshot().blocks[0].target, '2001:db8:1:2:0:0:0:0/64');
+    firewall.unblock('2001:db8:1:2::77');
+    assert.equal(firewall.shouldReject('2001:db8:1:2::1'), false);
+    const v4 = new SipFirewall(config({ threshold: 2 }), () => start);
+    v4.observe('192.0.2.1', 'scan', 'no-route');
+    v4.observe('192.0.2.2', 'scan', 'no-route');
+    assert.equal(v4.status().records, 2);
+});
+
+test('manual bans do not leak parsed ranges into serialized output and still match', () => {
+    const firewall = new SipFirewall(config(), () => start);
+    firewall.ban('192.0.2.0/24', 60, 'range');
+    assert.equal(firewall.shouldReject('192.0.2.50'), true);
+    assert.doesNotThrow(() => JSON.stringify(firewall.blocks()));
+    assert.doesNotThrow(() => JSON.stringify(firewall.snapshot()));
+    assert.deepEqual(Object.keys(firewall.blocks()[0]).sort(), ['expiresAt', 'kind', 'reason', 'target']);
+});

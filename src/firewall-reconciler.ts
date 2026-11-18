@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
-import { addressRange, overlaps } from './firewall-address';
+import { addressRange, LOOPBACK_RANGES, overlaps, type AddressRange } from './firewall-address';
 import { parseFirewallSnapshot, type FirewallSnapshot } from './firewall-contract';
+import { BaseLogger } from './logger';
+
+const logger = BaseLogger.child({ ns: 'FirewallReconciler' });
+const OWNER_STALE_MS = 60_000;
 
 export interface FirewallBackend {
     reset(): Promise<void>;
@@ -25,10 +29,16 @@ export class FirewallReconciler {
         lastError: undefined as string | undefined
     };
 
+    private readonly protectedRanges: AddressRange[];
+
+    /** `protectedCidrs` are sidecar-local and never overridable by a snapshot; loopback is always included. */
     constructor(
         private readonly backend: FirewallBackend,
-        private readonly now: () => number = Date.now
-    ) {}
+        private readonly now: () => number = Date.now,
+        protectedCidrs: string[] = []
+    ) {
+        this.protectedRanges = [...LOOPBACK_RANGES, ...protectedCidrs.map(addressRange)];
+    }
 
     accept(value: unknown): void {
         const snapshot = parseFirewallSnapshot(value, this.now());
@@ -43,7 +53,12 @@ export class FirewallReconciler {
                     (snapshot.revision === this.current.revision && digest !== this.digest)
                 )
                     throw new Error('Conflicting firewall revision');
-            } else if (Date.parse(snapshot.startedAt) <= Date.parse(this.current.startedAt)) throw new Error('Superseded firewall owner');
+            } else if (
+                Date.parse(snapshot.startedAt) <= Date.parse(this.current.startedAt) &&
+                // A stepped clock can make a legitimate new instance look older; a silent owner forfeits fencing.
+                this.now() - Date.parse(this.current.generatedAt) <= OWNER_STALE_MS
+            )
+                throw new Error('Superseded firewall owner');
         }
         this.current = snapshot;
         this.digest = digest;
@@ -85,7 +100,7 @@ export class FirewallReconciler {
                     this.initialized = true;
                 }
                 const snapshot = this.current;
-                const allow = snapshot.allowlist.map(addressRange);
+                const allow = [...snapshot.allowlist.map(addressRange), ...this.protectedRanges];
                 const desired = new Map<string, number>();
                 // Native interval sets cannot represent overlapping CIDRs/hosts independently.
                 // Retain all candidates in the snapshot, but install only the outer active range.
@@ -114,21 +129,44 @@ export class FirewallReconciler {
                     desired.set(block.target, expiresAt);
                     covering = range;
                 }
-                for (const target of this.mirror.keys())
-                    if (!desired.has(target)) {
-                        await this.backend.remove(target);
-                        this.mirror.delete(target);
+                // Each kernel operation is isolated: one rejected target must not abort or wipe the rest.
+                const failures: { target: string; error: unknown }[] = [];
+                const attempt = async (op: 'add' | 'remove', target: string, fn: () => Promise<void>) => {
+                    try {
+                        await fn();
+                        return true;
+                    } catch (error) {
+                        logger.error(
+                            { target, op, err: error instanceof Error ? error.message : String(error) },
+                            'Firewall backend operation failed'
+                        );
+                        failures.push({ target, error });
+                        return false;
                     }
+                };
+                for (const target of [...this.mirror.keys()])
+                    if (!desired.has(target) && (await attempt('remove', target, () => this.backend.remove(target)))) this.mirror.delete(target);
                 for (const [target, expiresAt] of desired) {
                     if (this.mirror.get(target) === expiresAt) continue;
                     if (this.mirror.has(target)) {
-                        await this.backend.remove(target);
+                        if (!(await attempt('remove', target, () => this.backend.remove(target)))) continue;
                         this.mirror.delete(target);
                     }
                     const remaining = expiresAt - this.now();
                     if (remaining <= 0) continue;
-                    await this.backend.add(target, Math.ceil(remaining / 1000));
-                    this.mirror.set(target, expiresAt);
+                    if (await attempt('add', target, () => this.backend.add(target, Math.ceil(remaining / 1000)))) this.mirror.set(target, expiresAt);
+                }
+                if (failures.length) {
+                    const first = failures[0].error;
+                    const error = new Error(
+                        failures.length === 1 && first instanceof Error
+                            ? first.message
+                            : `${failures.length} firewall operations failed: ${failures
+                                  .map(f => f.target)
+                                  .slice(0, 5)
+                                  .join(', ')}`
+                    );
+                    throw error;
                 }
                 this.status.appliedAt = new Date(this.now()).toISOString();
                 this.status.appliedInstanceId = snapshot.instanceId;

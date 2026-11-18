@@ -3,6 +3,8 @@ import { isIP } from 'node:net';
 export interface AddressRange {
     target: string;
     family: 4 | 6;
+    /** Prefix length after mapped-IPv6 normalization. */
+    prefix: number;
     first: bigint;
     last: bigint;
 }
@@ -49,6 +51,7 @@ export function addressRange(value: unknown): AddressRange {
     return {
         target: canonical + (prefix === width ? '' : '/' + prefix),
         family: family as 4 | 6,
+        prefix,
         first,
         last
     };
@@ -69,4 +72,21 @@ export function sourceIp(value: unknown): string | undefined {
 
 export function overlaps(left: AddressRange, right: AddressRange): boolean {
     return left.family === right.family && left.first <= right.last && right.first <= left.last;
+}
+
+/** Ban targets must be narrower than this; allowlist entries are not subject to it. */
+export const MIN_BLOCK_PREFIX = { 4: 8, 6: 16 } as const;
+
+export const LOOPBACK_RANGES: readonly AddressRange[] = [addressRange('127.0.0.0/8'), addressRange('::1/128')];
+
+export function overlapsLoopback(range: AddressRange): boolean {
+    return LOOPBACK_RANGES.some(entry => overlaps(range, entry));
+}
+
+/** Parse a block target, rejecting ranges too broad to be a plausible single-source or network ban (including /0). */
+export function blockRange(value: unknown): AddressRange {
+    const range = addressRange(value);
+    if (range.prefix < MIN_BLOCK_PREFIX[range.family])
+        throw new Error(`Block target too broad: minimum prefix is /${MIN_BLOCK_PREFIX[4]} for IPv4 and /${MIN_BLOCK_PREFIX[6]} for IPv6`);
+    return range;
 }

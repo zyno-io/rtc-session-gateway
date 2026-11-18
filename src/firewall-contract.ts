@@ -1,4 +1,4 @@
-import { addressRange } from './firewall-address';
+import { addressRange, blockRange } from './firewall-address';
 
 export const FIREWALL_MAX_BYTES = 2 * 1024 * 1024;
 export const FIREWALL_MAX_BLOCKS = 10_000;
@@ -43,7 +43,7 @@ export function parseFirewallSnapshot(value: unknown, now = Date.now()): Firewal
     const blocks = object.blocks.map(entry => {
         if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid firewall block');
         const block = entry as Record<string, unknown>;
-        const target = addressRange(block.target).target;
+        const target = blockRange(block.target).target;
         const expiresAt = timestamp(block.expiresAt);
         if (Date.parse(expiresAt) > Date.parse(generatedAt) + FIREWALL_MAX_TTL_MS) throw new Error('Invalid firewall expiry');
         return { target, expiresAt };

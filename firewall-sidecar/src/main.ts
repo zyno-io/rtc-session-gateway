@@ -19,7 +19,14 @@ async function main(): Promise<void> {
     const keyFile = process.env.SIP_FIREWALL_TLS_KEY_FILE;
     if (!!certFile !== !!keyFile || (!['127.0.0.1', '::1'].includes(host) && !certFile))
         throw new Error('Non-loopback firewall listener requires TLS certificate and key');
-    const reconciler = new FirewallReconciler(new NftablesFirewallBackend(process.env.SIP_FIREWALL_TABLE ?? 'rtc_sipguard'));
+    const reconciler = new FirewallReconciler(
+        new NftablesFirewallBackend(process.env.SIP_FIREWALL_TABLE ?? 'rtc_sipguard'),
+        Date.now,
+        (process.env.FIREWALL_PROTECTED_CIDRS ?? '')
+            .split(',')
+            .map(entry => entry.trim())
+            .filter(Boolean)
+    );
     const handler = createFirewallHandler(reconciler, token);
     const server =
         certFile && keyFile
