@@ -2425,25 +2425,22 @@ test('a call the app answers with the source endpoint during a transfer is refus
     assert.ok(later.answered);
 });
 
-test('an answer that was already in flight is refused before activation when a transfer reserves the endpoint meanwhile', async () => {
+test('an answer already in flight claims its endpoint: a transfer admitted meanwhile is refused instead of destroying it', async () => {
     const f = await fixture();
     const other = new Dialog('other', 'other-tag', 'other-remote');
     const otherResponse = new Response(other);
     const answerGate = Promise.withResolvers<void>();
     otherResponse.answerGate = answerGate.promise;
-    const dialGate = Promise.withResolvers<void>();
-    f.delayDial(() => dialGate.promise);
     const inbound = f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, otherResponse as never);
     await settle(5);
-    const transfer = f.gateway.transfer(f.params, 'app').catch(err => err);
-    await settle(5);
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /shared with another SIP call/);
     answerGate.resolve();
     await inbound;
     await settle(5);
-    assert.equal(f.registry.get('other'), undefined, 'never activated');
-    assert.equal(other.byes, 1, 'the answered dialog is torn down');
-    dialGate.resolve();
-    await transfer;
+    assert.ok(f.registry.get('other'), 'the in-flight answer is activated');
+    assert.equal(other.byes, 0);
+    assert.equal(f.call.ownership, 'application');
+    assert.ok(!f.log.includes('delete-media'));
 });
 
 test('an application re-INVITE onto a reserved endpoint is refused with a conflict', async () => {
@@ -2577,4 +2574,177 @@ test('a quoted Replaces parameter is never read as the early-only flag', () => {
     assert.equal(parseReplaces('abc@h;to-tag=1;EARLY-ONLY;from-tag=2').earlyOnly, true);
     assert.equal(parseReplaces('abc@h;to-tag=1;from-tag=2;x="a\\";early-only"').earlyOnly, false);
     assert.throws(() => parseReplaces('abc@h;to-tag=1;from-tag=2;x="open'), /quoted|Invalid/);
+});
+
+async function sharedEndpointFixture() {
+    const f = await fixture();
+    const other = new Dialog('other', 'other-tag', 'other-remote');
+    // B answered with the same endpoint as A (10.0.0.3:40000): currently shared.
+    await f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, new Response(other) as never);
+    await turn();
+    assert.equal(f.registry.size, 2);
+    return { f, other };
+}
+
+test('a pending app re-INVITE away from a shared endpoint does not hide the committed one: the transfer is refused', async () => {
+    const { f, other } = await sharedEndpointFixture();
+    const gate = Promise.withResolvers<void>();
+    other.reinviteHook = async () => {
+        await gate.promise;
+        throw new NativeOperationError('SIP non-success response: 488', false, false, 488, false, true);
+    };
+    const reinvite = f.gateway.reinvite('other', sdp('10.0.0.4', 42000)).catch(error => error);
+    await turn();
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /shared with another SIP call/);
+    gate.resolve();
+    await reinvite;
+    assert.ok(!f.log.includes('delete-media'));
+    assert.equal(f.registry.size, 2);
+    assert.match(f.registry.get('other')!.localSdp!, /m=audio 40000 /);
+});
+
+test('a remote re-INVITE answer in flight claims its endpoint before the 200 is written', async () => {
+    const f = await fixture();
+    f.hub.request = async () => ({ action: 'answer', sdp: sdp('10.0.0.4', 42000) }) as never;
+    const other = new Dialog('other', 'other-tag', 'other-remote');
+    await f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, new Response(other) as never);
+    await turn();
+    // B's carrier re-INVITEs and the application answers with A's endpoint; the 200 is slow to be written.
+    f.hub.request = async () => ({ action: 'answer', sdp: sdp('10.0.0.3') }) as never;
+    const gate = Promise.withResolvers<void>();
+    const res = new Response(other);
+    const respond = res.respond.bind(res);
+    res.respond = async (status: number, options?: { body?: string; headers?: Record<string, string> }) => {
+        await gate.promise;
+        return respond(status, options);
+    };
+    other.emit('request', request('INVITE', sdp('10.0.0.9')), res);
+    await settle(5);
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /shared with another SIP call/);
+    gate.resolve();
+    await settle(5);
+    assert.ok(!f.log.includes('delete-media'));
+    assert.match(f.registry.get('other')!.localSdp!, /m=audio 40000 /);
+});
+
+test('a carrier result with an ended snapshot before the BYE event fails the transfer cleanly', async () => {
+    const f = await fixture();
+    f.caller.reinviteHook = async () => {
+        f.caller.isEnded = true;
+        return sdp('10.0.0.1');
+    };
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    await settle();
+    assert.equal(f.events.filter(e => (e as { event: string }).event === 'sip.transferred').length, 0);
+    assert.ok(!f.log.includes('delete-media'));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.center.byes, 1);
+    assert.ok(f.log.indexOf('center:ack') < f.log.indexOf('center:bye'));
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    // The late terminal event finds nothing to end.
+    f.caller.emit('ended', 'bye');
+    await settle();
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a REFER return whose carrier ended on the re-INVITE result reports neither success NOTIFY nor answered', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.caller.reinviteHook = async () => {
+        f.caller.isEnded = true;
+        return sdp('10.0.0.1');
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    const notifies = f.center.requests.filter(r => r.method === 'NOTIFY').map(r => r.body ?? '');
+    assert.ok(!notifies.some(body => body.includes('200 OK')));
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+    assert.equal(f.registry.size, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('a carrier fenced while the failed transfer rejects the destination offer is removed, not restored to the application', async () => {
+    const f = await fixture();
+    f.failRecording();
+    const ack = f.center.ackAnswer.bind(f.center);
+    f.center.ackAnswer = async (answer: string) => {
+        f.caller.fence();
+        await ack(answer);
+    };
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    assert.equal(f.caller.byes, 0, 'a fenced carrier is never commanded');
+    assert.equal(f.center.byes, 1);
+});
+
+test('a transfer rollback answer on a codec the application endpoint does not speak ends the call', async () => {
+    const f = await fixture();
+    f.center.ackFailure = new Error('ACK send rejected');
+    let calls = 0;
+    f.caller.reinviteHook = async () => (++calls === 1 ? sdp('10.0.0.1') : sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 8'));
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+});
+
+test('a return rollback answer on a codec the destination is not sending ends the pair', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    let calls = 0;
+    f.caller.reinviteHook = async () => {
+        if (++calls === 1) {
+            f.hub.isConnected = () => false;
+            return sdp('10.0.0.1');
+        }
+        return sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 8');
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('a rollback after an offerless inbound INVITE keeps the call: the carrier SDP is taken from the native dialog', async () => {
+    const f = await fixture();
+    // The registry holds the empty INVITE body; the carrier's SDP lives only in the native snapshot (learned from the ACK).
+    f.call.remoteSdp = '';
+    f.center.ackFailure = new Error('ACK send rejected');
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.call.ownership, 'application');
+    assert.match(f.call.remoteSdp!, /c=IN IP4 10\.0\.0\.1/);
+});
+
+test('direct-media answers need a real voice codec in common, not telephone-event or comfort noise', () => {
+    const wrap = (body: string) => 'v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\n' + body;
+    const dtmf = 'a=rtpmap:101 telephone-event/8000\r\n';
+    assert.throws(
+        () =>
+            assertDirectMediaAnswer(
+                wrap(`m=audio 5000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n${dtmf}`),
+                wrap(`m=audio 6000 RTP/AVP 18 101\r\na=rtpmap:18 G729/8000\r\n${dtmf}`)
+            ),
+        /Incompatible/
+    );
+    assert.throws(() => assertDirectMediaAnswer(wrap('m=audio 5000 RTP/AVP 0 13\r\n'), wrap('m=audio 6000 RTP/AVP 18 13\r\n')), /Incompatible/);
+    assertDirectMediaAnswer(
+        wrap(`m=audio 5000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n${dtmf}`),
+        wrap(`m=audio 6000 RTP/AVP 0 101 8\r\na=rtpmap:0 PCMU/8000\r\n${dtmf}`)
+    );
+});
+
+test('Replaces parsing: a quote in the Call-ID, generic-param values and a trailing semicolon', () => {
+    assert.equal(parseReplaces('abc"def@host;to-tag=a;from-tag=b').callId, 'abc"def@host');
+    assert.throws(() => parseReplaces('abc@host;to-tag=a;from-tag=b;x=a,b'), /Invalid Replaces parameter/);
+    assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;x="a,b"').toTag, 'a');
+    assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;x=host.example:5060').toTag, 'a');
+    assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;').fromTag, 'b');
+    assert.throws(() => parseReplaces('abc@host;to-tag=a;from-tag=b;;x=1'), /Invalid Replaces parameter/);
 });

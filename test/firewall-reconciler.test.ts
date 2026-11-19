@@ -442,13 +442,14 @@ test('a host unblocked by a newer snapshot during the covering-CIDR removal is n
         reconciler.accept(snapshot(3, []));
         reconciler.schedule();
     };
-    // Revision 2 fails on the CIDR add; revision 3 is applied by the same run, without another trigger.
+    // The pass is abandoned before the obsolete CIDR add; revision 3 is applied by the same run, without another trigger.
     await reconciler.reconcile();
     assert.deepEqual([...backend.installed.keys()], [], 'host stays unblocked');
     assert.equal(backend.calls.filter(call => call.startsWith('add 192.0.2.1 ')).length, 1, 'host was not re-added');
     assert.equal(reconciler.state.appliedRevision, 3);
     assert.equal(reconciler.state.active, 0);
-    assert.equal(reconciler.state.errors, 1, 'the failed pass is still counted');
+    assert.equal(reconciler.state.errors, 0, 'the CIDR add was never attempted, so nothing failed');
+    assert.equal(backend.calls.filter(call => call.startsWith('add 192.0.2.0/24')).length, 0);
 });
 
 test('a covered host unblocked by a newer snapshot while an earlier host is being restored is not restored', async () => {
@@ -487,3 +488,31 @@ test('a covered host unblocked by a newer snapshot while an earlier host is bein
     assert.deepEqual([...backend.installed.keys()], ['192.0.2.1']);
     assert.equal(backend.calls.filter(call => call.startsWith('add 192.0.2.2 ')).length, 1, 'second host was not re-added');
 });
+
+for (const hostStillRequested of [false, true]) {
+    test(`a covering CIDR dropped by a newer revision during the host removal is never added (host ${hostStillRequested ? 'still' : 'no longer'} requested)`, async () => {
+        class Racing extends OverlapBackend {
+            onRemove?: (target: string) => void;
+            async remove(target: string) {
+                await super.remove(target);
+                this.onRemove?.(target);
+            }
+        }
+        const backend = new Racing();
+        const reconciler = new FirewallReconciler(backend, () => start);
+        const hostBlock = { target: '192.0.2.1', expiresAt: new Date(start + 20000).toISOString() };
+        reconciler.accept(snapshot(1, [hostBlock]));
+        await reconciler.reconcile();
+        reconciler.accept(snapshot(2, [{ target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() }]));
+        backend.onRemove = target => {
+            if (target !== '192.0.2.1') return;
+            backend.onRemove = undefined;
+            reconciler.accept(snapshot(3, hostStillRequested ? [hostBlock] : []));
+        };
+        await reconciler.reconcile();
+        assert.equal(backend.calls.filter(call => call.startsWith('add 192.0.2.0/24')).length, 0, 'obsolete CIDR never installed');
+        assert.deepEqual([...backend.installed.keys()], hostStillRequested ? ['192.0.2.1'] : []);
+        assert.equal(reconciler.state.appliedRevision, 3);
+        assert.equal(reconciler.state.active, hostStillRequested ? 1 : 0);
+    });
+}

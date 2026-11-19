@@ -170,16 +170,21 @@ export class FirewallReconciler {
                 };
                 // A mirrored entry covered by a desired target that is not yet installed is replaced inside the add loop
                 // (remove, add, restore on failure) so a failed add never drops protection.
+                // A newer revision accepted mid-pass makes every remaining mutation (planned from this snapshot) suspect:
+                // stop, keep the mirror as it stands, and let the loop restart against the latest revision.
+                const stale = () => this.current !== snapshot;
                 const pendingAdds = [...desired].filter(([target, expiresAt]) => this.mirror.get(target) !== expiresAt).map(([target]) => target);
                 for (const target of [...this.mirror.keys()]) {
                     if (desired.has(target)) continue;
                     const range = rangeFor(target);
                     if (pendingAdds.some(outer => covers(rangeFor(outer), range))) continue;
+                    if (stale()) break;
                     if (await attempt('remove', target, () => this.backend.remove(target))) this.mirror.delete(target);
                 }
                 const installedThisPass: AddressRange[] = [];
                 for (const [target, expiresAt] of desired) {
                     if (this.mirror.get(target) === expiresAt) continue;
+                    if (stale()) break;
                     const range = rangeFor(target);
                     if (installedThisPass.some(outer => covers(outer, range))) continue;
                     // Native interval sets reject overlapping elements: clear covered entries first, restore on failure.
@@ -220,12 +225,19 @@ export class FirewallReconciler {
                     let clearFailed = false;
                     for (const [other] of [...this.mirror]) {
                         if (other === target || !covers(range, rangeFor(other))) continue;
+                        if (stale()) break;
                         if (await attempt('remove', other, () => this.backend.remove(other))) {
                             // Restore only what the current snapshot still requests, with the snapshot's TTL (not the mirror's).
                             const wanted = requested.get(other);
                             if (wanted !== undefined) covered.push([other, wanted]);
                             this.mirror.delete(other);
                         } else clearFailed = true;
+                    }
+                    if (stale()) {
+                        // The range may have been dropped while covered entries were being removed: do not install it, and
+                        // put back whatever the latest snapshot still requests.
+                        await restore();
+                        break;
                     }
                     // Removals above may have outlasted the deadline; never install an already-expired ban.
                     const remainingAtAdd = expiresAt - this.now();
@@ -275,6 +287,11 @@ export class FirewallReconciler {
                         continue;
                     }
                     throw error;
+                }
+                if (stale()) {
+                    // Superseded mid-pass: this snapshot is not reported applied; rerun against the latest revision.
+                    this.pending = true;
+                    continue;
                 }
                 if (recompute) {
                     // A skipped expired covering range hid narrower targets from this pass; run again before reporting applied.

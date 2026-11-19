@@ -76,9 +76,23 @@ function parseMediaSections(sdp: string): MediaSection[] {
     return sections;
 }
 
-/** True when the two sections share a payload type, matched by number or (renumbered dynamic types) by encoding and clock. */
+/** Formats that carry signalling or repair data, never voice (matched by lowercase rtpmap encoding name). */
+const NON_VOICE_ENCODINGS = new Set(['telephone-event', 'cn', 'red', 'ulpfec', 'flexfec', 'flexfec-03', 'rtx']);
+
+/** True when the payload type is a real voice codec: not telephone-event, CN (static PT 13), red, ulpfec, flexfec or rtx. */
+function isVoiceFormat(section: MediaSection, pt: string): boolean {
+    const encoding = section.rtpmap.get(pt)?.split('/')[0];
+    if (encoding) return !NON_VOICE_ENCODINGS.has(encoding);
+    return pt !== '13';
+}
+
+/**
+ * True when the two sections share a real voice codec, matched by payload type number or (renumbered dynamic types) by
+ * encoding and clock. telephone-event and comfort noise alone never make two streams compatible.
+ */
 function sharesFormat(offered: MediaSection, answered: MediaSection): boolean {
     return answered.formats.some(pt => {
+        if (!isVoiceFormat(answered, pt)) return false;
         if (offered.formats.includes(pt)) {
             const left = offered.rtpmap.get(pt);
             const right = answered.rtpmap.get(pt);
@@ -88,6 +102,23 @@ function sharesFormat(offered: MediaSection, answered: MediaSection): boolean {
         const encoding = answered.rtpmap.get(pt);
         return !!encoding && offered.formats.some(other => offered.rtpmap.get(other) === encoding);
     });
+}
+
+/**
+ * True when every stream that is active (port > 0) in both descriptions shares a real voice codec. Used to prove a
+ * restored answer still matches what the other leg is sending.
+ */
+export function sharesVoiceCodec(a: string, b: string): boolean {
+    const left = parseMediaSections(a);
+    const right = parseMediaSections(b);
+    let compared = false;
+    for (const [index, media] of right.entries()) {
+        const other = left[index];
+        if (!other || !(media.port > 0) || !(other.port > 0) || media.type !== 'audio') continue;
+        compared = true;
+        if (!sharesFormat(other, media)) return false;
+    }
+    return compared;
 }
 
 /**
@@ -123,8 +154,9 @@ const ANSWER_DIRECTION: Record<string, string> = {
  * asked for (an answer that turns a bidirectional stream into inactive or one-way leaves the call on hold), and at
  * least one audio stream must remain active. Streams the restore offer declined (port 0) are not compared. Extra
  * payload types are allowed (RFC 3264 6.1); anything that changes the carrier's media address cannot be repaired.
+ * When `otherLegSdp` (the SDP the other leg currently holds) is given, the answer must also share a real voice codec with it.
  */
-export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string) {
+export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string, otherLegSdp?: string) {
     const restored = parseMediaSections(restoreOffer);
     const answered = parseMediaSections(answer);
     const previous = parseMediaSections(previousRemoteSdp);
@@ -142,6 +174,8 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
         if (media.type === 'audio') audioActive = true;
     }
     if (!audioActive) throw new Error('Rollback audio was rejected');
+    // The other leg keeps sending the codec it already negotiated: the restored answer must still accept a real voice codec of it.
+    if (otherLegSdp && !sharesVoiceCodec(otherLegSdp, answer)) throw new Error('Rollback answer shares no voice codec with the other leg');
 }
 
 /** True when two session descriptions send media to a common address and port (an RTP endpoint shared by two calls). */
@@ -219,19 +253,25 @@ function splitOutsideQuotes(value: string, separator: string): string[] {
 }
 
 const TOKEN = /^[A-Za-z0-9\-.!%*_+`'~]+$/;
+/** gen-value = token / host (RFC 3261 25.1): token characters plus the host additions `:` `[` `]`. */
+const TOKEN_OR_HOST = /^[A-Za-z0-9\-.!%*_+`'~:[\]]+$/;
 const QUOTED_STRING = /^"(?:[^"\\\r\n]|\\.)*"$/;
 
 export function parseReplaces(value: string): ReplacesIdentity {
-    const [callId, ...parameters] = splitOutsideQuotes(value, ';');
+    // A Call-ID word may contain a DQUOTE but never `;`, so split it off before any quote-aware parameter parsing.
+    const first = value.indexOf(';');
+    const callId = first < 0 ? value : value.slice(0, first);
+    const parameters = first < 0 ? [] : splitOutsideQuotes(value.slice(first + 1), ';');
     const values = new Map<string, string | undefined>();
-    for (const parameter of parameters) {
+    for (const [position, parameter] of parameters.entries()) {
+        if (!parameter.trim() && position === parameters.length - 1) continue; // tolerate one trailing `;`
         // generic-param = token [ EQUAL gen-value ]; gen-value = token / host / quoted-string
         const separator = parameter.indexOf('=');
         const key = (separator < 0 ? parameter : parameter.slice(0, separator)).trim();
         const generic = separator < 0 ? undefined : parameter.slice(separator + 1).trim();
         if (
             !TOKEN.test(key) ||
-            (generic !== undefined && !generic.startsWith('"') && !/^[^\s"]+$/.test(generic)) ||
+            (generic !== undefined && !generic.startsWith('"') && !TOKEN_OR_HOST.test(generic)) ||
             (generic?.startsWith('"') && !QUOTED_STRING.test(generic))
         ) {
             throw new Error('Invalid Replaces parameter');
