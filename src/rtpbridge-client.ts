@@ -254,12 +254,41 @@ export class RtpbridgeClient extends EventEmitter {
     /** Recordings rtpbridge currently holds for this connection's session (`session.info`). */
     async listSessionRecordings(): Promise<RtpbridgeRecordingInfo[]> {
         const response = await this.sendRequest('session.info', {});
-        if (!Array.isArray(response.recordings)) throw new Error('session.info returned no recordings');
+        if (!Array.isArray(response?.recordings))
+            throw new RtpbridgeRequestError('rtpbridge protocol error: session.info returned no recordings', 'protocol_error');
+        // An unreadable entry makes the inventory unusable for confirming that a recording has stopped.
+        for (const info of response.recordings) {
+            if (
+                typeof info !== 'object' ||
+                info === null ||
+                typeof info.recordingId !== 'string' ||
+                !info.recordingId ||
+                typeof info.filePath !== 'string' ||
+                (info.endpointId != null && typeof info.endpointId !== 'string') ||
+                (info.state !== 'active' && info.state !== 'stopped')
+            ) {
+                throw new RtpbridgeRequestError('rtpbridge protocol error: session.info returned an invalid recording entry', 'protocol_error');
+            }
+        }
         return response.recordings;
     }
 
     async stopRecording(recordingId: string): Promise<RecordingResult> {
-        return this.sendRequest('recording.stop', { recordingId });
+        const reply = await this.sendRequest('recording.stop', { recordingId });
+        // protocol.rs RecordingStopResult: an empty or partial reply cannot confirm the recording stopped.
+        const isNonnegativeInteger = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0;
+        if (
+            typeof reply !== 'object' ||
+            reply === null ||
+            typeof reply.filePath !== 'string' ||
+            !isNonnegativeInteger(reply.durationMs) ||
+            !isNonnegativeInteger(reply.packets) ||
+            !isNonnegativeInteger(reply.droppedPackets) ||
+            !isNonnegativeInteger(reply.stoppedAtEpochMs)
+        ) {
+            throw new RtpbridgeRequestError('rtpbridge protocol error: invalid recording.stop reply', 'protocol_error');
+        }
+        return reply as RecordingResult;
     }
 
     async startVad(endpointId: string, options?: VadOptions): Promise<void> {

@@ -123,10 +123,11 @@ event for the attempt, carrying the invite's `callId`, its `returnAttemptId` and
   ended (whether or not the owner is the call's owner, and including a carrier that hung up or was fenced
   after the application's re-INVITE was accepted but before `sip.answered`): the call's own end event
   (`sip.bye`, or `sip.terminated` with another reason such as `return-carrier-uncertain`) is delivered first
-  and `return-aborted` follows it. `return-failed` means only the attempt failed and the call continues; a
-  later `sip.bye` follows if it ends. An attempt that reached `sip.answered` never also receives a
-  `return-aborted`. `sip.answered` is not held behind the final REFER NOTIFY retries unless the referrer is
-  the retained carrier leg.
+  and `return-aborted` follows it. `return-failed` means the call continues after the failed attempt. If the
+  call then ends, its `sip.bye` or `sip.terminated` follows `return-failed` when both events use the same
+  canonical HTTP receiver URL or the same control connection. An attempt that reached `sip.answered`
+  never also receives a `return-aborted`. `sip.answered` waits for the final REFER NOTIFY retries only when
+  the referrer is the retained carrier leg.
 - For an INVITE/Replaces return the replacement has its own `callId`. If the replaced call ended or the owner
   left before the replacement was answered, the attempt reports `return-failed`; a failure after the
   application answered (including the replaced call ending during the answer) reports `answer-failed`.

@@ -26,7 +26,8 @@ import {
     InvalidHttpActionError,
     isValidTransferId,
     TRANSFER_ID_ERROR,
-    parseSipActionResponse
+    parseSipActionResponse,
+    sameReceiverUrl
 } from './http-contract';
 import { type GatewayHttpClient, HttpPostError } from './http-client';
 import { BaseLogger } from './logger';
@@ -1969,9 +1970,7 @@ export class SipGateway {
         const sendAttemptTerminated = (reason: 'return-aborted' | 'return-failed') => {
             if (!preparedCall) return;
             const owner = preparedCall;
-            // The call's own end event settles first (success or failure; each POST is bounded by the callback timeout), so
-            // an HTTP owner never receives return-aborted before it.
-            const callEnd = this.terminatedDeliveries.get(call) ?? Promise.resolve();
+            const callEnd = this.terminatedDeliveries.get(call);
             let releaseHold = () => {};
             // Only the same HTTP owner's ordering matters: a WS-owned call or one owned by another receiver is never delayed.
             if (
@@ -1979,25 +1978,24 @@ export class SipGateway {
                 this.registry.get(call.callId) === call &&
                 !(call.controlConnectionId && this.controlHub?.isConnected(call.controlConnectionId)) &&
                 !(preparedCall.controlConnectionId && this.controlHub?.isConnected(preparedCall.controlConnectionId)) &&
-                call.receiverUrl === preparedCall.receiverUrl
+                sameReceiverUrl(call.receiverUrl, preparedCall.receiverUrl)
             ) {
                 const hold = Promise.withResolvers<void>();
                 releaseHold = () => hold.resolve();
                 this.trackAnsweredDelivery(call, hold.promise);
             }
-            void callEnd
-                .catch(() => undefined)
-                .then(() =>
-                    this.sendFollowUpEvent(owner, {
-                        event: 'terminated',
-                        callId: call.callId,
-                        sipCallId: call.sipCallId,
-                        reason,
-                        returnAttemptId,
-                        receivedAt: new Date().toISOString()
-                    })
-                )
-                .finally(() => releaseHold());
+            const deliver = () =>
+                this.sendFollowUpEvent(owner, {
+                    event: 'terminated',
+                    callId: call.callId,
+                    sipCallId: call.sipCallId,
+                    reason,
+                    returnAttemptId,
+                    receivedAt: new Date().toISOString()
+                });
+            // Queue return-failed immediately on the owner's connection. For return-aborted, let the call's end delivery settle first.
+            const delivery = callEnd ? callEnd.then(deliver, deliver) : deliver();
+            void delivery.finally(releaseHold).catch(() => undefined);
         };
         try {
             const offer = previousRemoteSdp;

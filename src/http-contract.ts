@@ -94,6 +94,20 @@ export function parseOptionalHeaders(input: unknown): SipHeaders | undefined {
     return headers;
 }
 
+/** Compares canonical receiver URLs, ignoring fragments because HTTP requests omit them. */
+export function sameReceiverUrl(a: string, b: string): boolean {
+    if (a === b) return true;
+    try {
+        const first = new URL(a);
+        const second = new URL(b);
+        first.hash = '';
+        second.hash = '';
+        return first.href === second.href;
+    } catch {
+        return false;
+    }
+}
+
 function parseOptionalReceiverUrl(input: unknown, allowReceiverUrl: boolean) {
     if (input === undefined || input === null) return undefined;
     if (!allowReceiverUrl) throw new InvalidHttpActionError('receiverUrl is not accepted for this response');

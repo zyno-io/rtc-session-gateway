@@ -574,7 +574,7 @@ export class MediaSessionService implements GatewayMediaController {
                 try {
                     await this.stopRecording(recordingId);
                 } catch (err) {
-                    // Not-found or a lost reply: trust rtpbridge's own view of what is still recording.
+                    // Keep tracking the recording until a validated inventory confirms it is inactive.
                     const active = await this.isRecordingActive(session, recordingId);
                     holds();
                     if (active) throw err;
@@ -604,7 +604,8 @@ export class MediaSessionService implements GatewayMediaController {
     /** True if rtpbridge still reports the recording active. Fails closed when state cannot be verified. */
     private async isRecordingActive(session: MediaSessionRecord, recordingId: string) {
         try {
-            return (await session.client.listSessionRecordings()).some(info => info.recordingId === recordingId && info.state === 'active');
+            const recordings = await session.client.listSessionRecordings();
+            return recordings.some(info => info.recordingId === recordingId && info.state === 'active');
         } catch (err) {
             throw new MediaActionConflictError(`Cannot verify recording state for handoff: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -651,7 +652,8 @@ export class MediaSessionService implements GatewayMediaController {
         // Only starts that timed out before this query are covered by it; a later one stays uncertain.
         const covered = this.recordingUncertain.get(session.sessionId);
         try {
-            active = (await session.client.listSessionRecordings()).filter(info => info.state === 'active' && !this.recordings.has(info.recordingId));
+            const recordings = await session.client.listSessionRecordings();
+            active = recordings.filter(info => info.state === 'active' && !this.recordings.has(info.recordingId));
         } catch (err) {
             throw new MediaActionConflictError(`Cannot verify recording state for handoff: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -695,7 +697,16 @@ export class MediaSessionService implements GatewayMediaController {
         const metadata = this.recordings.get(recordingId);
         if (!metadata) throw new MediaEndpointNotFoundError(`Recording ${recordingId} not found`);
         const session = this.requireSession(metadata.sessionId);
-        const result = await session.client.stopRecording(recordingId);
+        let result: RecordingResult;
+        try {
+            result = await session.client.stopRecording(recordingId);
+        } catch (err) {
+            // An unreadable stop reply leaves the outcome unknown: keep the recording tracked and mark the session uncertain.
+            if (err instanceof RtpbridgeRequestError && err.code === 'protocol_error' && this.sessions.get(session.sessionId) === session) {
+                this.recordingUncertain.set(session.sessionId, ++this.uncertainSeq);
+            }
+            throw err;
+        }
         this.recordings.delete(recordingId);
         // The start-validated path is authoritative: rtpbridge's reply may carry a canonical/symlink-resolved one.
         return this.appendFinalizedRecording(session, recordingId, { ...result, filePath: metadata.filePath }, metadata.filePath);

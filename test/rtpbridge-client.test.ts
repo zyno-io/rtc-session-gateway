@@ -103,3 +103,51 @@ test('startRecording rejects a reply without a usable recording id as protocol_e
         wss.close();
     }
 });
+
+test('stopRecording and listSessionRecordings validate replies against the rtpbridge protocol as protocol_error', async () => {
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise(resolve => wss.once('listening', resolve));
+    const port = (wss.address() as { port: number }).port;
+    const client = new RtpbridgeClient({ url: `ws://127.0.0.1:${port}` } as never);
+    try {
+        await (client as unknown as { ready: Promise<void> }).ready;
+        const internals = client as unknown as { sendRequest: (...args: unknown[]) => Promise<unknown> };
+        const protocolError = (err: { code?: string }) => err.code === 'protocol_error';
+        const goodStop = { filePath: '/r/a.pcap', durationMs: 5, packets: 3, droppedPackets: 0, stoppedAtEpochMs: 10 };
+        for (const reply of [
+            {},
+            null,
+            { ...goodStop, filePath: 1 },
+            { ...goodStop, durationMs: '5' },
+            { ...goodStop, packets: undefined },
+            { ...goodStop, droppedPackets: -1 },
+            { ...goodStop, stoppedAtEpochMs: 1.5 }
+        ]) {
+            internals.sendRequest = async () => reply;
+            await assert.rejects(client.stopRecording('rec-1'), protocolError);
+        }
+        internals.sendRequest = async () => goodStop;
+        assert.deepEqual(await client.stopRecording('rec-1'), goodStop);
+
+        const entry = { recordingId: 'rec-1', filePath: '/r/a.pcap', state: 'active' };
+        const badLists = [
+            {},
+            { recordings: [{ ...entry, state: undefined }] },
+            { recordings: [{ ...entry, state: 'paused' }] },
+            { recordings: [{ ...entry, recordingId: 5 }] },
+            { recordings: [{ ...entry, filePath: undefined }] },
+            { recordings: [{ ...entry, endpointId: 5 }] },
+            { recordings: [null] }
+        ];
+        for (const reply of badLists) {
+            internals.sendRequest = async () => reply;
+            await assert.rejects(client.listSessionRecordings(), protocolError);
+        }
+        internals.sendRequest = async () => ({ recordings: [entry, { ...entry, recordingId: 'rec-2', endpointId: null, state: 'stopped' }] });
+        const recordings = await client.listSessionRecordings();
+        assert.equal(recordings.length, 2);
+    } finally {
+        client.close();
+        wss.close();
+    }
+});

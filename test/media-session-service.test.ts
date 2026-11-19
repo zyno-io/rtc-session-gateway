@@ -1517,3 +1517,38 @@ test('handoff skips an untracked recording whose reported path is invalid instea
     const results = await service.prepareHandoff('media-session-1', 'owner', {});
     assert.equal(results.length, 0);
 });
+
+test('a protocol_error stop reply keeps the recording tracked, marks uncertainty and fails the handoff while it is active', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    const original = client.stopRecording.bind(client);
+    client.stopRecording = async () => {
+        throw new RtpbridgeRequestError('rtpbridge protocol error: invalid recording.stop reply', 'protocol_error');
+    };
+    client.sessionRecordings = [{ recordingId: 'rec-1', filePath: '/r/a.pcap', state: 'active' }];
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}));
+    assert.equal((service as any).recordingUncertain.has('media-session-1'), true);
+    assert.equal((service as any).recordings.has('rec-1'), true, 'tracking is kept');
+    client.stopRecording = original;
+    const result = await service.stopRecording('rec-1');
+    assert.equal(result.packets, 10);
+});
+
+test('a protocol_error session.info reply fails the handoff closed', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    client.stopRecording = async () => {
+        throw new RtpbridgeRequestError('lost', 'protocol_error');
+    };
+    client.listSessionRecordings = async () => {
+        throw new RtpbridgeRequestError('rtpbridge protocol error: invalid entry', 'protocol_error');
+    };
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), /Cannot verify recording state/);
+    assert.equal((service as any).recordings.has('rec-1'), true);
+});

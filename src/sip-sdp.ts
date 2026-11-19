@@ -518,6 +518,41 @@ export function parseReplaces(value: string): ReplacesIdentity {
     return { callId: callId.trim(), toTag, fromTag, earlyOnly: values.has('early-only') && values.get('early-only') === undefined };
 }
 
+/**
+ * RFC 3261 25.1: name-addr = [display-name] "<" addr-spec ">", or a bare addr-spec. The display name is a token sequence
+ * or a quoted-string (with backslash escapes), so angle brackets inside quotes are not the address. Throws if malformed.
+ */
+function extractNameAddrUri(value: string): string {
+    const text = value.trim();
+    // Semicolon-delimited parameters on a bare address belong to the header, so their quoted text cannot be the target.
+    if (/^sips?:/i.test(text)) return text.split(';', 1)[0].trimEnd();
+    let index = 0;
+    if (text.startsWith('"')) {
+        index = 1;
+        for (;;) {
+            if (index >= text.length) throw new Error('Unterminated display name');
+            const char = text[index++];
+            if (char === '\\') index++;
+            else if (char === '"') break;
+        }
+    } else {
+        const open = text.indexOf('<');
+        if (open < 0) throw new Error('Invalid SIP target');
+        const name = text.slice(0, open).trim();
+        if (name && !/^[A-Za-z0-9\-.!%*_+`'~]+(?:\s+[A-Za-z0-9\-.!%*_+`'~]+)*$/.test(name)) throw new Error('Invalid display name');
+        index = open;
+    }
+    const address = text.slice(index).trimStart();
+    if (!address.startsWith('<')) throw new Error('Missing addr-spec');
+    const close = address.indexOf('>');
+    if (close < 0) throw new Error('Unterminated addr-spec');
+    const parameters = address.slice(close + 1).trimStart();
+    if (parameters && !parameters.startsWith(';')) throw new Error('Invalid Refer-To parameters');
+    const uri = address.slice(1, close).trim();
+    if (!uri) throw new Error('Empty addr-spec');
+    return uri;
+}
+
 export interface ReferTarget {
     uri: string;
     replaces?: ReplacesIdentity;
@@ -528,13 +563,14 @@ export interface ReferTarget {
  * The URI keeps its headers off so it can be used as a route destination. Throws on malformed input.
  */
 export function parseReferTarget(value: string): ReferTarget {
-    const trimmed = value.trim();
-    const uri = (/<([^>]+)>/.exec(trimmed)?.[1] ?? trimmed.split(';')[0]).trim();
+    const uri = extractNameAddrUri(value);
     const match = /^(sips?):([^\s?<>]+)(?:\?(.*))?$/i.exec(uri);
     if (!match || !match[2].replace(/^[^@]*@/, '').split(/[;:]/)[0]) throw new Error('Invalid SIP target');
     let replaces: ReplacesIdentity | undefined;
     for (const header of (match[3] ?? '').split('&').filter(Boolean)) {
-        const [name, ...rest] = header.split('=');
+        const [rawName, ...rest] = header.split('=');
+        // RFC 3261 19.1.4: header names and values may be percent-encoded; a malformed escape throws (URIError).
+        const name = decodeURIComponent(rawName);
         if (name.toLowerCase() !== 'replaces') continue;
         if (replaces) throw new Error('Duplicate Replaces header');
         replaces = parseReplaces(decodeURIComponent(rest.join('=')));

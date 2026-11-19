@@ -802,6 +802,26 @@ test('Refer-To parsing handles name-addr, addr-spec and encoded Replaces', () =>
     assert.throws(() => parseReferTarget(''), /Invalid SIP target/);
 });
 
+test('Refer-To parsing follows RFC 3261 name-addr: bracketed text in a display name is never the address', () => {
+    assert.equal(parseReferTarget('"<sip:A@x.example>" <sip:B@x.example>').uri, 'sip:B@x.example');
+    assert.equal(parseReferTarget('"say \\"<sip:A@x.example>\\" \\\\" <sip:B@x.example>;tag=1').uri, 'sip:B@x.example');
+    assert.equal(parseReferTarget('Bob Smith <sip:B@x.example>').uri, 'sip:B@x.example');
+    assert.equal(parseReferTarget('sip:B@x.example').uri, 'sip:B@x.example');
+    assert.equal(parseReferTarget('sip:B@x.example;label="display <info>"').uri, 'sip:B@x.example');
+    assert.throws(() => parseReferTarget('"unterminated <sip:A@x.example>'));
+    assert.throws(() => parseReferTarget('"Name" <sip:A@x.example'));
+    assert.throws(() => parseReferTarget('"Name" sip:A@x.example'));
+    assert.throws(() => parseReferTarget('"<sip:A@x.example>" sip:B@x.example'));
+    assert.throws(() => parseReferTarget('<sip:A@x.example>, <sip:B@x.example>'));
+});
+
+test('Refer-To percent-decodes URI header names before matching Replaces and duplicates', () => {
+    const value = 'center%3Bto-tag%3Da%3Bfrom-tag%3Db';
+    assert.equal(parseReferTarget(`<sip:i@x.example?%52eplaces=${value}>`).replaces?.callId, 'center');
+    assert.throws(() => parseReferTarget(`<sip:i@x.example?Replaces=${value}&%72eplaces=${value}>`), /Duplicate/);
+    assert.throws(() => parseReferTarget('<sip:i@x.example?%ZZeplaces=x>'));
+});
+
 test('authorized replacement of a handoff creates one returned call and retires both old legs', async () => {
     const f = await handedOff();
     f.call.peerHost = '10.0.0.2'; // the destination's configured address, as the transfer URI host would resolve
@@ -885,6 +905,14 @@ test('encoded Refer-To Replaces uses standard dialog tags without a special dest
     );
     await turn();
     assert.equal(unknown.status, 481);
+    const encoded = new Response();
+    f.center.emit(
+        'request',
+        request('REFER', '', 44, { 'refer-to': '<sip:inbound@gateway.example?%52eplaces=other%3Bto-tag%3Da%3Bfrom-tag%3Db>' }),
+        encoded
+    );
+    await turn();
+    assert.equal(encoded.status, 481);
 });
 
 test('failed return admission leaves the direct-media conversation intact', async () => {
@@ -4272,40 +4300,42 @@ test('Codex 3: for an HTTP owner the call-level terminated POST settles before t
     assert.deepEqual(started, finished);
 });
 
-test('an HTTP owner never receives bye before a still-in-flight return-failed POST', async () => {
-    const f = await handedOff();
-    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
-    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
-    f.hub.findRoute = () => undefined;
-    f.call.controlConnectionId = undefined;
-    f.call.receiverUrl = 'http://app.example/hook';
-    const started: string[] = [];
-    const finished: string[] = [];
-    const gate = Promise.withResolvers<void>();
-    gateway.httpClient.postJson = async (_url, body) => {
-        const event = body as { event?: string; reason?: string };
-        if (event.event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
-        const label = `${event.event}:${event.reason ?? ''}`;
-        started.push(label);
-        if (event.reason === 'return-failed') await gate.promise;
-        finished.push(label);
-        return {};
-    };
-    f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
-    f.center.emit('request', refer(), new Response());
-    await settle(60);
-    assert.equal(f.registry.size, 1, 'the call continues');
-    assert.deepEqual(started, ['terminated:return-failed']);
-    // The carrier hangs up while the return-failed POST is still in flight: SIP teardown proceeds, the owner's bye waits.
-    f.caller.emit('ended', 'bye');
-    await settle(40);
-    assert.equal(f.registry.size, 0, 'SIP teardown does not wait');
-    assert.deepEqual(started, ['terminated:return-failed'], 'bye is held behind return-failed');
-    gate.resolve();
-    await settle(40);
-    assert.deepEqual(finished.slice(0, 2), ['terminated:return-failed', started[1]]);
-    assert.match(started[1] ?? '', /^(bye|terminated):/);
-});
+for (const receiverUrl of ['http://app.example/hook', 'HTTP://App.Example:80/hook#fragment']) {
+    test(`an HTTP owner at ${receiverUrl} receives bye after the return-failed POST settles`, async () => {
+        const f = await handedOff();
+        const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+        gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+        f.hub.findRoute = () => undefined;
+        f.call.controlConnectionId = undefined;
+        f.call.receiverUrl = receiverUrl;
+        const started: string[] = [];
+        const finished: string[] = [];
+        const gate = Promise.withResolvers<void>();
+        gateway.httpClient.postJson = async (_url, body) => {
+            const event = body as { event?: string; reason?: string };
+            if (event.event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+            const label = `${event.event}:${event.reason ?? ''}`;
+            started.push(label);
+            if (event.reason === 'return-failed') await gate.promise;
+            finished.push(label);
+            return {};
+        };
+        f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
+        f.center.emit('request', refer(), new Response());
+        await settle(60);
+        assert.equal(f.registry.size, 1, 'the call continues');
+        assert.deepEqual(started, ['terminated:return-failed']);
+        // The carrier hangs up while the return-failed POST is still in flight: SIP teardown proceeds, the owner's bye waits.
+        f.caller.emit('ended', 'bye');
+        await settle(40);
+        assert.equal(f.registry.size, 0, 'SIP teardown does not wait');
+        assert.deepEqual(started, ['terminated:return-failed'], 'bye is held behind return-failed');
+        gate.resolve();
+        await settle(40);
+        assert.deepEqual(finished.slice(0, 2), ['terminated:return-failed', started[1]]);
+        assert.match(started[1] ?? '', /^(bye|terminated):/);
+    });
+}
 
 test('R1: a destination referrer whose carrier dialog is gone gets its final NOTIFY before any BYE; the owner events keep their order', async () => {
     const f = await handedOff();
