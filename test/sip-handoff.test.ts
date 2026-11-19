@@ -915,7 +915,8 @@ test('Replaces during a cross-leg operation is refused instead of racing it', as
 test('a refused offerless relay answers the requester and keeps the call: 491 for glare, 488 otherwise', async () => {
     for (const [message, status] of [
         [new NativeOperationError('SIP non-success response: 491', false, false, 491), 491],
-        [new NativeOperationError('SIP 491: INVITE procedure pending'), 491],
+        [new NativeOperationError('SIP 491: INVITE procedure pending', false, false, 491), 491],
+        [new NativeOperationError('SIP 491: INVITE procedure pending'), 488],
         [new NativeOperationError('SIP non-success response: 488', false, false, 488), 488],
         [new NativeOperationError('INVITE procedure pending'), 488],
         [new Error('SIP 491: INVITE procedure pending'), 488]

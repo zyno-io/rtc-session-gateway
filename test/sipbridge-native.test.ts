@@ -1264,6 +1264,71 @@ test('native peer rejection of our re-INVITE rejects with the SIP status, withou
     }
 });
 
+test('native local glare: our re-INVITE during a pending peer re-INVITE is refused with sipStatus 491', native, async () => {
+    const { fixture, signaling } = await signalingFixture();
+    try {
+        const { peer, remoteTag, dialog } = await inboundDialog(fixture, signaling);
+        const held = Promise.withResolvers<{ respond: (status: number) => Promise<unknown> }>();
+        dialog.on('request', (_request, response) => held.resolve(response));
+        peer.send('INVITE', 2, remoteTag, offerSdp, 'z9hG4bK-peer-reinvite');
+        const response = await held.promise;
+        await assert.rejects(
+            dialog.reinvite(offerSdp),
+            (err: unknown) => err instanceof NativeOperationError && err.sipStatus === 491 && !err.dialogGone && !err.uncertain && !err.unavailable
+        );
+        assert.equal(dialog.isFenced, false);
+        await response.respond(488);
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 488')));
+        peer.close();
+    } catch (error) {
+        console.error(fixture.logs);
+        throw error;
+    } finally {
+        await signaling.stop();
+        await fixture.close();
+    }
+});
+
+test(
+    'native unanswered re-INVITE through gateway.reinvite completes at the SIP timeout and ends the call',
+    { ...native, timeout: 60000 },
+    async () => {
+        const fixture = await nativeFixture();
+        const registry = new CallRegistry();
+        const ua = await scriptedUa();
+        const gateway = new SipGateway(loadConfig(fixture.tls), registry, {
+            async postJson() {
+                return {};
+            }
+        } as never);
+        try {
+            await gateway.start();
+            await until(() => gateway.isConnected);
+            const created = gateway.createOutbound({
+                requestUri: `sip:callee@127.0.0.1:${ua.port};transport=udp`,
+                sdp: offerSdp,
+                receiverUrl: 'https://owner.test/sip'
+            });
+            await until(() => ua.count('INVITE') === 1);
+            ua.reply(ua.find('INVITE'), 200, 'OK', answerSdp);
+            const call = await created;
+            await until(() => ua.count('ACK') === 1);
+            // The peer never answers: Timer B (~32s on UDP) completes the re-INVITE with no final status.
+            await assert.rejects(gateway.reinvite(call.sessionId, offerSdp), (err: unknown) => err instanceof InvalidCallStateError);
+            await until(() => ua.count('BYE') >= 1, 5000);
+            assert.equal(registry.size, 0);
+        } catch (error) {
+            console.error(fixture.logs);
+            console.error(ua.received.map(message => message.wire));
+            throw error;
+        } finally {
+            await gateway.shutdown();
+            ua.close();
+            await fixture.close();
+        }
+    }
+);
+
 test('native gateway.reinvite maps a peer 488 to InvalidCallStateError and keeps the registry SDP', native, async () => {
     const fixture = await nativeFixture();
     const registry = new CallRegistry();

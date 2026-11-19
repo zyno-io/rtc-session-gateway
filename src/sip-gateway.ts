@@ -1497,11 +1497,8 @@ function outboundSipLogContext(params: OutboundSipCallParams) {
 
 /** Glare: the peer answered 491, or sipbridge refused locally because an INVITE procedure is already pending. */
 function isGlare(err: unknown) {
-    if (!(err instanceof NativeOperationError)) return false;
-    if (err.sipStatus === 491) return true;
-    // Text fallback: sipbridge currently refuses local glare as NOT_ACCEPTED ("SIP 491: INVITE procedure pending") with no
-    // status. Remove once sipbridge reports sip_status on refusals.
-    return err.sipStatus === 0 && /\b491\b/.test(err.message);
+    // sipbridge reports both as sipStatus: a peer's 491 final (COMPLETED) and its own 491 refusal (NOT_ACCEPTED).
+    return err instanceof NativeOperationError && err.sipStatus === 491;
 }
 
 function normalizeIp(address: string) {

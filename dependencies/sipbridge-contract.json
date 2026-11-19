@@ -12,7 +12,7 @@
     "digest_challenge_case_sha256": "01647794997aa864eab906cccfdacb010673b25d1c2ea6922a3a733878c26004",
     "wire_encoding": "json",
     "subprotocol": "sipbridge.control.json.v1",
-    "sipbridgeRevision": "09e683877965a6f44bdff2006acb18ec3ee184d7",
+    "sipbridgeRevision": "8536cc0031eed0781cc2650023b4483f5c86b7be",
     "files": {
         "schema": {
             "path": "dependencies/sipbridge-control.proto",
