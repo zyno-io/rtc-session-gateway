@@ -449,6 +449,36 @@ export class SipGateway {
         }
     }
 
+    /** RFC 3261 14.1 / RFC 5057: a leg whose dialog the peer reports gone ends the whole call (bye() BYEs every leg once). */
+    private endIfDialogGone(call: ActiveCall, err: unknown, reason = 'dialog-gone') {
+        if (!(err instanceof NativeOperationError) || !err.dialogGone) return;
+        if (this.registry.get(call.callId) !== call) return;
+        this.logger.warn({ callId: call.callId, sipStatus: err.sipStatus, reason }, 'SIP dialog reported gone; ending call');
+        if (call.peerDialog) {
+            void this.bye(call.callId, reason).catch(() => undefined);
+            return;
+        }
+        // Single leg: removal is the token (taken synchronously) so a racing app BYE sees NOT_FOUND, not a conflict.
+        const removed = this.registry.remove(call.callId);
+        if (!removed) return;
+        this.cancelTransferForCall(call.callId);
+        void this.byeLeg(removed.dialog).catch(() =>
+            this.logger.warn({ callId: call.callId, failure: 'dialog-gone-bye-failed' }, 'Failed to terminate SIP dialog')
+        );
+        this.sendTerminated(removed, reason, {});
+    }
+
+    private sendTerminated(removed: ActiveCall, reason: string | undefined, headers: SipHeaders) {
+        void this.sendFollowUpEvent(removed, {
+            event: 'terminated',
+            callId: removed.callId,
+            sipCallId: removed.sipCallId,
+            reason,
+            headers,
+            receivedAt: new Date().toISOString()
+        });
+    }
+
     private assertLiveCall(call: ActiveCall) {
         if (this.registry.get(call.callId) !== call) throw new InvalidCallStateError('Source SIP call ended during handoff');
     }
@@ -474,6 +504,7 @@ export class SipGateway {
             return { sdp: remoteSdp };
         } catch (err) {
             if (err instanceof NativeOperationError && (err.uncertain || err.unavailable)) throw err;
+            this.endIfDialogGone(call, err);
             throw new InvalidCallStateError(errorMessage(err));
         } finally {
             this.modifyingPairs.delete(callId);
@@ -698,6 +729,8 @@ export class SipGateway {
                 await attempt.cancel().catch(() => undefined);
             }
             if (this.registry.get(call.callId) === call && call.ownership === 'transferring') call.ownership = 'application';
+            // After the destination ACK/BYE (I6). A switched or timed-out call is already ended by the paths above.
+            if (!switched && !(expired && carrierPending)) this.endIfDialogGone(call, err);
             // A fenced context cannot be cleaned up by this process; the caller must not replay the transfer.
             if (call.dialog.isFenced || destination?.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             if (err instanceof NativeOperationError && (err.uncertain || err.unavailable)) throw err;
@@ -859,16 +892,7 @@ export class SipGateway {
         });
 
         const removed = this.registry.remove(callId);
-        if (removed) {
-            void this.sendFollowUpEvent(removed, {
-                event: 'terminated',
-                callId,
-                sipCallId: removed.sipCallId,
-                reason,
-                headers: byeHeaders,
-                receivedAt: new Date().toISOString()
-            });
-        }
+        if (removed) this.sendTerminated(removed, reason, byeHeaders);
     }
 
     private cancelTransferForCall(callId: string) {
@@ -1025,6 +1049,7 @@ export class SipGateway {
         } catch (err) {
             this.logger.warn({ callId: call.callId, failure: 'paired-renegotiation-failed' }, errorMessage(err));
             if (!res.finalResponseSent) await res.respond(isGlare(err) ? 491 : 488).catch(() => undefined);
+            if (!peerAccepted) this.endIfDialogGone(call, err);
             // The peer already moved to the new media but the requester never got its answer: the legs disagree.
             if (peerAccepted && this.registry.get(call.callId) === call) await this.bye(call.callId, 'renegotiation-failed').catch(() => undefined);
         }
@@ -1083,6 +1108,7 @@ export class SipGateway {
                 // The peer refused the offerless re-INVITE (glare, 488, ...): nothing changed on either leg.
                 this.ackOwed.delete(peer);
                 if (!res.finalResponseSent) await res.respond(isGlare(err) ? 491 : 488).catch(() => undefined);
+                this.endIfDialogGone(call, err);
                 return;
             }
             if (peerOffer && !peerAcked && !peer.isFenced && !peer.isEnded) {
@@ -1147,6 +1173,7 @@ export class SipGateway {
                     },
                     body: `SIP/2.0 ${status} ${status === 200 ? 'OK' : status === 100 ? 'Trying' : 'Return Failed'}\r\n`
                 })
+                // A 481 to a NOTIFY ends only the implicit REFER subscription (RFC 6665), never the INVITE dialog.
                 .catch(() => undefined);
         };
         const returning = call.ownership === 'handed-off';
@@ -1271,7 +1298,11 @@ export class SipGateway {
                     reason: 'return-failed',
                     receivedAt: new Date().toISOString()
                 });
-            await notify(503, true);
+            // The NOTIFY is enqueued synchronously (commands per leg are serialized), so it precedes any BYE below.
+            const notified = notify(503, true);
+            // A no-op when an earlier path already ended the call.
+            if (!switched) this.endIfDialogGone(call, err);
+            await notified;
         }
     }
 

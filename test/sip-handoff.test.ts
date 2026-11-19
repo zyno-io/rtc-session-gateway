@@ -72,6 +72,8 @@ class Dialog extends EventEmitter {
     }
     async request(method: string, options: { body?: string; headers?: Record<string, string> } = {}) {
         this.requests.push({ method, ...options });
+        const status = method === 'NOTIFY' ? /SIP\/2\.0 (\d+)/.exec(options.body ?? '')?.[1] : undefined;
+        this.log?.push(`${this.name}:${method.toLowerCase()}${status ? `-${status}` : ''}`);
     }
     async bye() {
         this.log?.push(`${this.name}:bye`);
@@ -113,6 +115,7 @@ class Response {
     options?: { body?: string; headers?: Record<string, string> };
     statuses: number[] = [];
     answered?: string;
+    log?: string[];
     constructor(
         private dialog?: Dialog,
         private answerFailure?: Error
@@ -121,7 +124,10 @@ class Response {
         this.status = status;
         this.statuses.push(status);
         this.options = options;
-        if (status >= 200) this.finalResponseSent = true;
+        if (status >= 200) {
+            this.finalResponseSent = true;
+            this.log?.push(`response:${status}`);
+        }
     }
     async answer(offer: string) {
         if (this.answerFailure) throw this.answerFailure;
@@ -1016,4 +1022,129 @@ test('Replaces authorization is re-validated after DNS and never scores a resolu
     f.center.emit('ended', 'bye');
     await pending;
     assert.equal(stale.status, 481);
+});
+
+const gone = () => new NativeOperationError('SIP non-success response: 481', false, false, 481, true);
+
+test('dialog-gone 481 on an offered relay answers the requester and ends the call once', async () => {
+    const f = await handedOff();
+    f.center.reinviteFailure = gone();
+    const response = new Response();
+    response.log = f.log;
+    f.caller.emit('request', request('INVITE', sdp('10.0.0.1')), response);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(response.status, 488);
+    assert.ok(f.log.indexOf('response:488') >= 0 && f.log.indexOf('response:488') < f.log.findIndex(e => e.endsWith(':bye')));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('dialog-gone 481 on an offerless relay answers the requester and ends the call once', async () => {
+    const f = await handedOff();
+    f.center.reinviteFailure = gone();
+    const response = new Response();
+    response.log = f.log;
+    f.caller.emit('request', request('INVITE', '', 43), response);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(response.status, 488);
+    assert.deepEqual(f.center.reinvites, ['']);
+    assert.ok(f.log.indexOf('response:488') >= 0 && f.log.indexOf('response:488') < f.log.findIndex(e => e.endsWith(':bye')));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('a 488 or a local 481 refusal (dialogGone false) keeps the call on every relay path', async () => {
+    for (const failure of [
+        new NativeOperationError('SIP non-success response: 488', false, false, 488),
+        new NativeOperationError('dialog terminating', false, false, 481)
+    ]) {
+        for (const body of [sdp('10.0.0.1'), '']) {
+            const f = await handedOff();
+            f.center.reinviteFailure = failure;
+            const response = new Response();
+            f.caller.emit('request', request('INVITE', body, 44), response);
+            await new Promise(resolve => setTimeout(resolve, 20));
+            assert.equal(f.center.reinvites.length, 1, 'the relay reached the center leg');
+            assert.equal(f.center.reinvites[0] === '', body === '');
+            assert.equal(response.status, 488);
+            assert.equal(f.registry.size, 1);
+            assert.equal(f.caller.byes, 0);
+            assert.equal(f.center.byes, 0);
+        }
+    }
+});
+
+test('dialog-gone 481 on an application reinvite throws InvalidCallStateError and ends the call', async () => {
+    const f = await fixture();
+    f.caller.reinviteFailure = gone();
+    await assert.rejects(f.gateway.reinvite('caller', sdp('10.0.0.3')), /481/);
+    await turn();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    const g = await fixture();
+    g.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
+    await assert.rejects(g.gateway.reinvite('caller', sdp('10.0.0.3')), /488/);
+    await turn();
+    assert.equal(g.registry.size, 1);
+    assert.equal(g.caller.byes, 0);
+});
+
+test('dialog-gone carrier rejection during transfer ACKs the destination, then BYEs it and the carrier once', async () => {
+    const f = await fixture();
+    f.caller.reinviteFailure = gone();
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /481/);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(
+        f.log.filter(entry => /:(ack|bye)$/.test(entry)),
+        ['center:ack', 'center:bye', 'caller:bye']
+    );
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('a non-gone carrier rejection during transfer keeps the call', async () => {
+    const f = await fixture();
+    f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /488/);
+    await turn();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+});
+
+test('dialog-gone carrier rejection on a return ends the whole call once', async () => {
+    const f = await handedOff();
+    f.caller.reinviteFailure = gone();
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+    assert.ok(f.log.indexOf('center:notify-503') >= 0 && f.log.indexOf('center:notify-503') < f.log.indexOf('center:bye'), 'NOTIFY precedes BYE');
+});
+
+test('a NOTIFY 481 on either leg is not dialog-gone and keeps the call', async () => {
+    for (const leg of ['caller', 'center'] as const) {
+        const f = await handedOff();
+        f[leg].request = async () => {
+            throw new NativeOperationError('SIP non-success response: 481', false, false, 481, false);
+        };
+        f[leg].emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+        await new Promise(resolve => setTimeout(resolve, 30));
+        assert.equal(f.caller.byes, 0);
+        // The return itself may legitimately retire the external leg; only the carrier must stay connected.
+        assert.equal(f.registry.size, 1);
+    }
+});
+
+test('a single-leg dialog-gone call is removed synchronously so a racing app BYE sees NOT_FOUND', async () => {
+    const f = await fixture();
+    f.caller.reinviteFailure = gone();
+    await assert.rejects(f.gateway.reinvite('caller', sdp('10.0.0.3')), /481/);
+    assert.equal(f.registry.size, 0);
+    await assert.rejects(f.gateway.bye('caller'), /not found/i);
+    await turn();
+    assert.equal(f.caller.byes, 1);
 });

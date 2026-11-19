@@ -1183,13 +1183,18 @@ test('native peer rejection of our re-INVITE rejects with the SIP status, withou
         ua.reply(ua.find('INVITE'), 200, 'OK', answerSdp);
         const dialog = await attempt.completed;
         await until(() => ua.count('ACK') === 1);
-        for (const [index, status] of [488, 491].entries()) {
+        for (const [index, status] of [488, 491, 481].entries()) {
             const pending = dialog.reinvite(offerSdp);
             await until(() => ua.count('INVITE') === index + 2);
             ua.reply(ua.find('INVITE', index + 1), status, 'Rejected');
             await assert.rejects(
                 pending,
-                (err: unknown) => err instanceof NativeOperationError && err.sipStatus === status && !err.uncertain && !err.unavailable
+                (err: unknown) =>
+                    err instanceof NativeOperationError &&
+                    err.sipStatus === status &&
+                    !err.uncertain &&
+                    !err.unavailable &&
+                    err.dialogGone === (status === 481)
             );
             assert.equal(dialog.isFenced, false);
             assert.equal(dialog.remoteSdp, answerSdp, 'a rejected re-INVITE leaves the remote SDP unchanged');
@@ -1238,6 +1243,45 @@ test('native gateway.reinvite maps a peer 488 to InvalidCallStateError and keeps
         await assert.rejects(pending, (err: unknown) => err instanceof InvalidCallStateError);
         assert.equal(registry.get(call.sessionId)!.remoteSdp, before);
         assert.equal(registry.size, 1);
+    } catch (error) {
+        console.error(fixture.logs);
+        console.error(ua.received.map(message => message.wire));
+        throw error;
+    } finally {
+        await gateway.shutdown();
+        ua.close();
+        await fixture.close();
+    }
+});
+
+test('native peer 481 to our re-INVITE through gateway.reinvite ends the call with a BYE', native, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const ua = await scriptedUa();
+    const gateway = new SipGateway(loadConfig(fixture.tls), registry, {
+        async postJson() {
+            return {};
+        }
+    } as never);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        const created = gateway.createOutbound({
+            requestUri: `sip:callee@127.0.0.1:${ua.port};transport=udp`,
+            sdp: offerSdp,
+            receiverUrl: 'https://owner.test/sip'
+        });
+        await until(() => ua.count('INVITE') === 1);
+        ua.reply(ua.find('INVITE'), 200, 'OK', answerSdp);
+        const call = await created;
+        await until(() => ua.count('ACK') === 1);
+        const pending = gateway.reinvite(call.sessionId, offerSdp);
+        await until(() => ua.count('INVITE') === 2);
+        ua.reply(ua.find('INVITE', 1), 481, 'Call/Transaction Does Not Exist', '');
+        await assert.rejects(pending, (err: unknown) => err instanceof InvalidCallStateError);
+        await until(() => ua.count('BYE') === 1);
+        ua.reply(ua.find('BYE'), 200, 'OK');
+        await until(() => registry.size === 0);
     } catch (error) {
         console.error(fixture.logs);
         console.error(ua.received.map(message => message.wire));

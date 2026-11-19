@@ -69,7 +69,12 @@ export class NativeOperationError extends Error {
         readonly uncertain = false,
         readonly unavailable = false,
         /** The peer's SIP final status when known (0 = none/unknown). */
-        readonly sipStatus = 0
+        readonly sipStatus = 0,
+        /**
+         * RFC 3261 14.1 / RFC 5057: the peer (or silence from it) established that the dialog no longer exists.
+         * Never set for a local refusal.
+         */
+        readonly dialogGone = false
     ) {
         super(message);
     }
@@ -882,18 +887,27 @@ export class SipbridgeSignaling extends EventEmitter {
                     )
                 )
                     throw new NativeOperationError('Native outcome unknown', true);
-                if (result.error || result.certainty === OperationResult_Certainty.NOT_ACCEPTED)
-                    throw new NativeOperationError(result.error || 'Native command refused', false, false, result.sipStatus ?? 0);
-                if (!result.snapshot) throw new NativeOperationError('Native result omitted context', true);
                 if (action.$case === 'dialogRequest' && result.certainty === OperationResult_Certainty.COMPLETED) {
                     const method = action.dialogRequest.method.toUpperCase();
                     const status = result.sipStatus ?? 0;
-                    // A peer's non-2xx final is a definite failure: it neither fences the context nor is uncertain. (Status 0
-                    // is not reached at the pinned sipbridge; it is treated as a failure defensively.) The snapshot above is
-                    // already remembered.
-                    if (method !== 'ACK' && method !== 'BYE' && (status < 200 || status >= 300))
-                        throw new NativeOperationError(`SIP non-success response: ${status}`, false, false, status);
+                    if (method !== 'ACK' && method !== 'BYE') {
+                        // 408/481 (or no response at all) to a re-INVITE, or 481 to an in-dialog request, means the dialog is gone.
+                        // A 481 to NOTIFY/SUBSCRIBE ends only that subscription usage (RFC 6665), not the INVITE dialog.
+                        const dialogGone =
+                            method === 'INVITE'
+                                ? status === 408 || status === 481 || status === 0
+                                : status === 481 && method !== 'NOTIFY' && method !== 'SUBSCRIBE';
+                        if (result.error) throw new NativeOperationError(result.error, false, false, status, dialogGone);
+                        // A peer's non-2xx final is a definite failure: it neither fences the context nor is uncertain. The
+                        // snapshot above is already remembered.
+                        if (status < 200 || status >= 300)
+                            throw new NativeOperationError(`SIP non-success response: ${status}`, false, false, status, dialogGone);
+                    }
                 }
+                // NOT_ACCEPTED is a local refusal (even with a 481 status): never dialog-gone.
+                if (result.error || result.certainty === OperationResult_Certainty.NOT_ACCEPTED)
+                    throw new NativeOperationError(result.error || 'Native command refused', false, false, result.sipStatus ?? 0);
+                if (!result.snapshot) throw new NativeOperationError('Native result omitted context', true);
                 return result.snapshot;
             } catch (error) {
                 if (error instanceof SipbridgeControlNotSentError) throw new NativeOperationError(error.message, false, true);
