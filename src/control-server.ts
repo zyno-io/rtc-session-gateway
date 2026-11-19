@@ -41,9 +41,15 @@ export class ControlServer {
             maxPayload: this.config.CONTROL_MAX_PAYLOAD_BYTES ?? 1_048_576
         });
         server.on('upgrade', (req, socket, head) => {
-            if ((req.url ?? '').split('?')[0] !== this.config.CONTROL_WS_PATH) return;
+            // Node removes its socket error handler at upgrade hand-off: an unhandled reset would crash the process.
+            socket.on('error', () => socket.destroy());
+            if ((req.url ?? '').split('?')[0] !== this.config.CONTROL_WS_PATH) {
+                socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+                socket.destroy();
+                return;
+            }
             if (!this.isAuthorized(req.headers.authorization)) {
-                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
                 socket.destroy();
                 return;
             }

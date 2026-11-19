@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import http from 'node:http';
+import net from 'node:net';
 import { Readable } from 'node:stream';
 import test from 'node:test';
 
@@ -429,3 +430,52 @@ class FakeMediaController implements GatewayMediaController {
         return { deleted: true as const };
     }
 }
+
+test('an upgrade to the wrong path is answered 404 and closed, and a reset does not raise an uncaught exception', async () => {
+    const server = http.createServer((_req, res) => res.end('ok'));
+    new ControlServer(server, { CONTROL_WS_PATH: '/control' }, new ControlHub(1_000), {} as any);
+    await listen(server);
+    const port = (server.address() as any).port;
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown) => uncaught.push(err);
+    process.on('uncaughtException', onUncaught);
+    try {
+        const head = 'GET /other HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n';
+        const normal = net.connect(port, '127.0.0.1');
+        normal.on('error', () => {});
+        normal.write(head);
+        let reply = '';
+        normal.on('data', chunk => (reply += chunk.toString()));
+        await once(normal, 'close');
+        assert.match(reply, /^HTTP\/1\.1 404 Not Found/);
+
+        const reset = net.connect(port, '127.0.0.1');
+        reset.on('error', () => {});
+        await once(reset, 'connect');
+        reset.write(head);
+        await new Promise(resolve => setTimeout(resolve, 50));
+        reset.resetAndDestroy();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        assert.deepEqual(uncaught, []);
+    } finally {
+        process.off('uncaughtException', onUncaught);
+        await new Promise(resolve => server.close(resolve));
+    }
+});
+
+test('upgrade handler installs a socket error listener: a late socket error is absorbed and destroys the socket', () => {
+    const server = new EventEmitter() as unknown as http.Server;
+    new ControlServer(server, { CONTROL_WS_PATH: '/control' }, new ControlHub(1_000), {} as any);
+    const socket = new EventEmitter() as EventEmitter & { write(data: string): void; destroy(): void; destroyed: number };
+    socket.destroyed = 0;
+    socket.write = () => {};
+    socket.destroy = () => {
+        socket.destroyed++;
+    };
+    server.emit('upgrade', { url: '/other', headers: {} }, socket, Buffer.alloc(0));
+    assert.equal(socket.destroyed, 1, 'wrong path closed');
+    assert.ok(socket.listenerCount('error') >= 1, 'error listener installed');
+    // Without a listener EventEmitter throws on 'error'; with the fix the error is absorbed and the socket destroyed again.
+    assert.doesNotThrow(() => socket.emit('error', new Error('ECONNRESET')));
+    assert.equal(socket.destroyed, 2);
+});
