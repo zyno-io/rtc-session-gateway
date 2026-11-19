@@ -157,21 +157,27 @@ export function createHttpApp(
     });
 
     // Firewall routes use their own credentials and must work independently of control auth and draining.
-    app.use('/firewall', (req, res, next) => {
-        const token = req.method === 'GET' && req.path === '/snapshot' ? firewall?.config.snapshotToken : firewall?.config.adminToken;
-        if (!firewall || !bearerMatches(req.headers.authorization, token)) {
-            res.status(401).send({ error: 'Unauthorized' });
-            return;
-        }
-        next();
-    });
-    app.get('/firewall/snapshot', (_req, res) => {
+    // Case-sensitive/strict router: path aliases (/firewall/SNAPSHOT, /firewall/snapshot/) never match a route,
+    // so each route's own auth applies and unmatched paths end in 401 instead of falling through to control auth.
+    const firewallAuth =
+        (tokenOf: () => string | undefined): express.RequestHandler =>
+        (req, res, next) => {
+            if (!firewall || !bearerMatches(req.headers.authorization, tokenOf())) {
+                res.status(401).send({ error: 'Unauthorized' });
+                return;
+            }
+            next();
+        };
+    const snapshotAuth = firewallAuth(() => firewall?.config.snapshotToken);
+    const adminAuth = firewallAuth(() => firewall?.config.adminToken);
+    const firewallRouter = express.Router({ caseSensitive: true, strict: true });
+    firewallRouter.get('/snapshot', snapshotAuth, (_req, res) => {
         res.send(firewall!.snapshot());
     });
-    app.get('/firewall/status', (_req, res) => {
+    firewallRouter.get('/status', adminAuth, (_req, res) => {
         res.send({ ...firewall!.status(), publisher: firewallPublisher?.status });
     });
-    app.get('/firewall/blocks', (req, res) => {
+    firewallRouter.get('/blocks', adminAuth, (req, res) => {
         const offset = Number(req.query.offset ?? 0);
         const limit = Number(req.query.limit ?? 100);
         if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
@@ -181,7 +187,7 @@ export function createHttpApp(
         const blocks = firewall!.blocks();
         res.send({ blocks: blocks.slice(offset, offset + limit), total: blocks.length });
     });
-    app.post('/firewall/blocks', (req, res) => {
+    firewallRouter.post('/blocks', adminAuth, (req, res) => {
         try {
             firewall!.ban(req.body?.target, req.body?.ttlSeconds, req.body?.reason);
             res.send({ ok: true });
@@ -189,7 +195,7 @@ export function createHttpApp(
             res.status(400).send({ error: error instanceof Error ? error.message : 'Invalid ban' });
         }
     });
-    app.delete('/firewall/blocks', (req, res) => {
+    firewallRouter.delete('/blocks', adminAuth, (req, res) => {
         try {
             firewall!.unblock(req.query.target);
             res.send({ ok: true });
@@ -197,6 +203,10 @@ export function createHttpApp(
             res.status(400).send({ error: 'Invalid target' });
         }
     });
+    firewallRouter.use((_req, res) => {
+        res.status(401).send({ error: 'Unauthorized' });
+    });
+    app.use('/firewall', firewallRouter);
 
     app.use((_req, res, next) => {
         try {

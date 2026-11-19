@@ -143,20 +143,71 @@ export class FirewallReconciler {
                         return false;
                     }
                 };
-                for (const target of [...this.mirror.keys()])
-                    if (!desired.has(target) && (await attempt('remove', target, () => this.backend.remove(target)))) this.mirror.delete(target);
+                const covers = (outer: AddressRange, inner: AddressRange) =>
+                    outer.family === inner.family && outer.first <= inner.first && outer.last >= inner.last;
+                const rangeOf = new Map<string, AddressRange>();
+                const rangeFor = (target: string) => {
+                    let range = rangeOf.get(target);
+                    if (!range) rangeOf.set(target, (range = addressRange(target)));
+                    return range;
+                };
+                // A mirrored entry covered by a desired target that is not yet installed is replaced inside the add loop
+                // (remove, add, restore on failure) so a failed add never drops protection.
+                const pendingAdds = [...desired].filter(([target, expiresAt]) => this.mirror.get(target) !== expiresAt).map(([target]) => target);
+                for (const target of [...this.mirror.keys()]) {
+                    if (desired.has(target)) continue;
+                    const range = rangeFor(target);
+                    if (pendingAdds.some(outer => covers(rangeFor(outer), range))) continue;
+                    if (await attempt('remove', target, () => this.backend.remove(target))) this.mirror.delete(target);
+                }
+                const installedThisPass: AddressRange[] = [];
                 for (const [target, expiresAt] of desired) {
                     if (this.mirror.get(target) === expiresAt) continue;
-                    if (this.mirror.has(target)) {
+                    const range = rangeFor(target);
+                    if (installedThisPass.some(outer => covers(outer, range))) continue;
+                    // Native interval sets reject overlapping elements: clear covered entries first, restore on failure.
+                    const covered: [string, number][] = [];
+                    // A TTL refresh replaces the installed element; if the re-add fails the old one is restored.
+                    const installedExpiry = this.mirror.get(target);
+                    if (installedExpiry !== undefined) {
                         if (!(await attempt('remove', target, () => this.backend.remove(target)))) continue;
                         this.mirror.delete(target);
+                        covered.push([target, installedExpiry]);
                     }
                     const remaining = expiresAt - this.now();
-                    if (remaining <= 0) continue;
-                    if (await attempt('add', target, () => this.backend.add(target, Math.ceil(remaining / 1000)))) {
+                    if (remaining <= 0) {
+                        // Nothing to add; an unexpired old entry keeps its protection.
+                        for (const [other, otherExpiry] of covered) {
+                            const left = otherExpiry - this.now();
+                            if (left > 0 && (await attempt('add', other, () => this.backend.add(other, Math.ceil(left / 1000)))))
+                                this.mirror.set(other, otherExpiry);
+                        }
+                        continue;
+                    }
+                    let clearFailed = false;
+                    for (const [other, otherExpiry] of [...this.mirror]) {
+                        if (other === target || !covers(range, rangeFor(other))) continue;
+                        if (await attempt('remove', other, () => this.backend.remove(other))) {
+                            covered.push([other, otherExpiry]);
+                            this.mirror.delete(other);
+                        } else clearFailed = true;
+                    }
+                    const restore = async () => {
+                        for (const [other, otherExpiry] of covered) {
+                            const left = otherExpiry - this.now();
+                            if (left > 0 && (await attempt('add', other, () => this.backend.add(other, Math.ceil(left / 1000)))))
+                                this.mirror.set(other, otherExpiry);
+                        }
+                    };
+                    // A failed clear means the kernel would reject the add as overlapping; keep existing protection.
+                    if (!clearFailed && (await attempt('add', target, () => this.backend.add(target, Math.ceil(remaining / 1000))))) {
                         this.mirror.set(target, expiresAt);
                         this.addFailed.delete(target);
-                    } else this.addFailed.add(target);
+                        installedThisPass.push(range);
+                    } else {
+                        this.addFailed.add(target);
+                        await restore();
+                    }
                 }
                 if (failures.length) {
                     // One bounded summary per pass; per-operation logging could emit thousands of lines every few seconds.

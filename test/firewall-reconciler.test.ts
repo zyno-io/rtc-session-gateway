@@ -101,7 +101,8 @@ test('failed re-add self-heals and a fresh process resets only its backend befor
     await assert.rejects(reconciler.reconcile());
     assert.equal(reconciler.state.active, 0);
     assert.equal(reconciler.state.appliedRevision, 1);
-    assert.equal(reconciler.state.lastError, 'kernel unavailable');
+    // The refresh add and the old-element restore both fail.
+    assert.match(reconciler.state.lastError!, /firewall operations failed: 192\.0\.2\.1/);
     backend.fail = false;
     await reconciler.reconcile();
     assert.equal(reconciler.state.active, 1);
@@ -255,6 +256,83 @@ test('a covering range whose add keeps failing does not permanently drop the nar
     await assert.rejects(reconciler.reconcile(), /rejected/);
     await assert.rejects(reconciler.reconcile(), /rejected/);
     await assert.rejects(reconciler.reconcile(), /rejected/);
-    assert.equal(backend.calls.filter(call => call === 'add 198.51.100.7 10').length, 2);
+    // Initial install plus one same-pass restore per failed covering add: protection is never left dropped.
+    assert.equal(backend.calls.filter(call => call === 'add 198.51.100.7 10').length, 4);
     assert.equal(reconciler.state.active, 1);
+});
+
+test('a failed TTL refresh re-add restores the old element instead of dropping the ban', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    reconciler.accept(snapshot());
+    await reconciler.reconcile();
+    const originalAdd = backend.add.bind(backend);
+    backend.add = async (target, ttl) => {
+        if (ttl === 20) throw new Error('refresh rejected');
+        return originalAdd(target, ttl);
+    };
+    reconciler.accept(snapshot(2, [{ target: '192.0.2.1', expiresAt: new Date(start + 20000).toISOString() }]));
+    await assert.rejects(reconciler.reconcile(), /refresh rejected/);
+    assert.deepEqual(backend.calls.slice(-2), ['remove 192.0.2.1', 'add 192.0.2.1 10'], 'old expiry re-added');
+    assert.equal(reconciler.state.active, 1);
+});
+
+/** Models nftables interval sets: inserting an element that overlaps an installed one is rejected. */
+class OverlapBackend extends Backend {
+    installed = new Map<string, { first: number; last: number }>();
+    failAdds = new Map<string, number>();
+    private span(target: string) {
+        const [ip, bits = '32'] = target.split('/');
+        const base = ip.split('.').reduce((acc, part) => acc * 256 + Number(part), 0);
+        const size = 2 ** (32 - Number(bits));
+        const first = Math.floor(base / size) * size;
+        return { first, last: first + size - 1 };
+    }
+    async add(target: string, ttl: number) {
+        const left = this.failAdds.get(target) ?? 0;
+        if (left > 0) {
+            this.failAdds.set(target, left - 1);
+            throw new Error('transient add failure');
+        }
+        const range = this.span(target);
+        for (const other of this.installed.values()) if (range.first <= other.last && other.first <= range.last) throw new Error('interval overlaps');
+        this.installed.set(target, range);
+        this.calls.push('add ' + target + ' ' + ttl);
+    }
+    async remove(target: string) {
+        this.installed.delete(target);
+        this.calls.push('remove ' + target);
+    }
+}
+
+test('covering CIDR replaces an installed host despite transient add failures; host protection is kept meanwhile', async () => {
+    const backend = new OverlapBackend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const host = { target: '192.0.2.1', expiresAt: new Date(start + 20000).toISOString() };
+    reconciler.accept(snapshot(1, [host]));
+    await reconciler.reconcile();
+    assert.deepEqual([...backend.installed.keys()], ['192.0.2.1']);
+    backend.failAdds.set('192.0.2.0/24', 2);
+    reconciler.accept(snapshot(2, [host, { target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() }]));
+    for (let pass = 0; pass < 2; pass++) {
+        await assert.rejects(reconciler.reconcile(), /transient add failure/);
+        assert.deepEqual([...backend.installed.keys()], ['192.0.2.1'], 'host stays protected after failed CIDR add');
+    }
+    await reconciler.reconcile();
+    assert.deepEqual([...backend.installed.keys()], ['192.0.2.0/24']);
+    assert.equal(reconciler.state.active, 1);
+});
+
+test('a persistently failing covering CIDR never costs the fallback host its protection', async () => {
+    const backend = new OverlapBackend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const host = { target: '192.0.2.1', expiresAt: new Date(start + 20000).toISOString() };
+    reconciler.accept(snapshot(1, [host]));
+    await reconciler.reconcile();
+    backend.failAdds.set('192.0.2.0/24', 100);
+    reconciler.accept(snapshot(2, [host, { target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() }]));
+    for (let pass = 0; pass < 4; pass++) {
+        await assert.rejects(reconciler.reconcile());
+        assert.deepEqual([...backend.installed.keys()], ['192.0.2.1']);
+    }
 });

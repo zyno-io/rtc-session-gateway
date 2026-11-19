@@ -123,3 +123,45 @@ test('sidecar accepts bounded authenticated full snapshots and publisher failure
         api.server.close();
     }
 });
+
+test('firewall path aliases never reach a route under another credential', async () => {
+    for (const snapshotToken of ['reader', undefined]) {
+        const firewall = new SipFirewall({ ...config(), snapshotToken }, () => fixedNow);
+        const api = await listen(
+            createHttpApp(
+                new CallRegistry(),
+                gateway,
+                undefined,
+                { CONTROL_AUTH_MODE: 'none' },
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                firewall
+            )
+        );
+        const call = (path: string, token?: string, method = 'GET') =>
+            fetch(api.root + path, { method, headers: token ? { authorization: 'Bearer ' + token } : {} });
+        try {
+            for (const [path, method] of [
+                ['/firewall/SNAPSHOT', 'GET'],
+                ['/firewall/snapshot/', 'GET'],
+                ['/firewall/snapshot', 'HEAD'],
+                ['/firewall/Status', 'GET'],
+                ['/firewall/nothing', 'GET']
+            ]) {
+                const response = await call(path, 'admin', method);
+                assert.notEqual(response.status, 200, `${method} ${path}`);
+                assert.equal(response.status, 401, `${method} ${path}`);
+            }
+            if (snapshotToken) assert.equal((await call('/firewall/snapshot', 'reader')).status, 200);
+            assert.equal((await call('/firewall/snapshot', 'admin')).status, 401);
+            assert.equal((await call('/firewall/status', 'admin')).status, 200);
+            assert.equal((await call('/firewall/blocks', 'admin')).status, 200);
+        } finally {
+            api.server.closeAllConnections();
+            api.server.close();
+        }
+    }
+});
