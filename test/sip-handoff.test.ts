@@ -1170,14 +1170,13 @@ test('Replaces authorization is re-validated after DNS and never scores a resolu
     );
     assert.equal(failed.status, 503);
     assert.deepEqual(observed, []);
-    // The dialog ends while the (real) lookup is in flight: the stale match must not be used.
-    f.call.peerHost = 'localhost';
+    // The dialog ends during async authorization: the stale match must not be used.
+    f.call.peerHost = '192.0.2.5';
     const stale = new Response();
     const pending = f.gateway.handleInvite(
-        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '127.0.0.1') as never,
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '192.0.2.5') as never,
         stale as never
     );
-    await turn();
     f.center.emit('ended', 'bye');
     await pending;
     assert.equal(stale.status, 481);
@@ -2072,6 +2071,22 @@ test('a REFER return whose carrier answers 200 with rejected audio restores medi
     assert.equal(sentEvents(f, 'sip.answered').length, 0);
 });
 
+test('a REFER return rolls back when the carrier changes its port after the application prepares media', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    const carrierAnswers = [sdp('10.0.0.1', 40002), sdp('10.0.0.1')];
+    f.caller.reinviteHook = async () => carrierAnswers.shift()!;
+
+    f.center.emit('request', refer(), new Response());
+    await settle();
+
+    assert.equal(carrierAnswers.length, 0, 'the new port triggers a rollback');
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+    assert.deepEqual(terminatedReasons(f), ['return-failed']);
+});
+
 test('a Replaces from an equivalent IPv6 spelling of the configured destination is authorized', async () => {
     const f = await handedOff();
     f.call.peerAddress = undefined;
@@ -2273,15 +2288,15 @@ test('a Replaces whose authorizing destination was detached during the lookup is
         return original(...args);
     }) as SipFirewall['observe'];
     const f = await handedOff({ firewall });
-    f.call.peerHost = 'localhost';
+    f.call.peerHost = '192.0.2.5';
     f.call.peerAddress = undefined;
+    f.call.peerAddresses = undefined;
     const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
     const pending = f.gateway.handleInvite(
-        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '127.0.0.1') as never,
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '192.0.2.5') as never,
         response as never
     );
-    await turn();
-    // A REFER return detaches the destination (blind transfer) while its address is being resolved.
+    // A REFER return detaches the destination before the awaited address check completes.
     f.call.ownership = 'returning';
     f.center.emit('ended', 'bye');
     await pending;
@@ -2356,6 +2371,7 @@ test('rollback keeps the security mode and every previously active stream', () =
     const restore = two(40002).replaceAll('10.0.0.1', '10.0.0.3');
     // audio + video previously active: the answer cannot drop video.
     assert.throws(() => assertRollbackAnswer(two(0), two(30002), restore), /active stream/);
+    assert.throws(() => assertRollbackAnswer(two(30002).replace('m=video', 'm=text'), two(30002), restore), /media sections/);
     assertRollbackAnswer(two(30002), two(30002), restore);
     // video previously rejected: staying at 0 is fine.
     assertRollbackAnswer(two(0), two(0), restore);
@@ -2376,6 +2392,7 @@ test('rollback keeps the security mode and every previously active stream', () =
         () => assertRollbackAnswer(two(0, [fp('AA:BB'), 'a=setup:active']), two(0, [fp('AA:BB'), 'a=setup:passive']), restore),
         /fingerprint/
     );
+    assert.throws(() => assertRollbackAnswer(two(0, [fp('AA:BB')]), two(0, [fp('AA:BB'), 'a=setup:passive']), restore), /fingerprint/);
     assertRollbackAnswer(two(0, [fp('AA:BB'), 'a=setup:active']), two(0, [fp('AA:BB'), 'a=setup:actpass']), restore);
 });
 
@@ -3277,6 +3294,31 @@ async function failedReplaceWithRestore(f: Fixture, carrierAnswer: () => Promise
     );
     await settle(10);
 }
+
+test('a failed application-owned Replaces renegotiates a changed local DTLS fingerprint at the same RTP address', async () => {
+    const f = await fixture();
+    const withDtls = (description: string, fingerprint: string, role: string) =>
+        description
+            .replace('RTP/AVP', 'UDP/TLS/RTP/SAVP')
+            .replace('a=sendrecv', `a=fingerprint:sha-256 ${fingerprint}\r\na=setup:${role}\r\na=sendrecv`);
+    const local = withDtls(sdp('10.0.0.3'), 'AA:BB', 'passive');
+    const restored = withDtls(sdp('10.0.0.3'), 'CC:DD', 'passive');
+    const remote = withDtls(sdp('10.0.0.1'), 'EE:FF', 'active');
+    f.caller.localSdp = f.call.localSdp = local;
+    f.caller.remoteSdp = f.call.remoteSdp = remote;
+    assert.equal(preservesMediaParameters(local, local, remote), true);
+    assert.equal(preservesMediaParameters(local, local.replace('setup:passive', 'setup:active'), remote), false);
+    const sessionFingerprint = (description: string, fingerprint: string) =>
+        description.replace('m=audio', `a=fingerprint:sha-256 ${fingerprint}\r\nm=audio`);
+    assert.equal(preservesMediaParameters(sessionFingerprint(local, 'CC:DD'), local, remote), true);
+    assert.equal(preservesMediaParameters(sessionFingerprint(local, 'CC:DD'), sessionFingerprint(restored, 'AA:BB'), remote), false);
+
+    await failedReplaceWithRestore(f, async () => remote, restored);
+
+    assert.equal(f.caller.reinvites.length, 1);
+    assert.match(f.caller.reinvites[0], /a=fingerprint:sha-256 CC:DD/);
+    assert.equal(f.registry.get('caller'), f.call);
+});
 
 test('a replace restore whose carrier answer moved its media port ends the call', async () => {
     const f = await fixture();

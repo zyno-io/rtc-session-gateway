@@ -49,7 +49,7 @@ interface MediaSection {
     fmtp: Map<string, string>;
     /** SDES `suite key-params` of every a=crypto line (the tag is not part of the key identity). */
     crypto: Set<string>;
-    /** Normalized `hash-func value` pairs (lowercase) of the section's and the session's a=fingerprint lines (DTLS-SRTP). */
+    /** Normalized DTLS fingerprints for this stream, inherited from the session if it has none of its own. */
     fingerprints: Set<string>;
     /** a=setup role (lowercase) of the section, else the session; empty when absent. */
     setup: string;
@@ -123,7 +123,7 @@ function parseMediaSections(sdp: string): MediaSection[] {
     }
     for (const section of sections) {
         section.connection ||= sessionConnection;
-        for (const pair of sessionFingerprints) section.fingerprints.add(pair);
+        if (!section.fingerprints.size) section.fingerprints = sessionFingerprints;
         section.setup ||= sessionSetup;
         section.direction ||= sessionDirection || 'sendrecv';
     }
@@ -239,8 +239,8 @@ export function assertDirectMediaAnswer(offer: string, answer: string) {
 }
 
 /**
- * Validates a rollback answer to `restoreOffer`. The restored side keeps sending media to the carrier address it
- * already holds, so every stream both sides still use must keep that address and port, keep the direction the offer
+ * Validates a carrier answer when its other leg still uses the previous carrier SDP. Every stream both sides still use
+ * must keep the carrier address and port the other leg is sending to, keep the direction the offer
  * asked for (an answer that turns a bidirectional stream into inactive or one-way leaves the call on hold), and at
  * least one audio stream must remain active. Streams the restore offer declined (port 0) are not compared. Extra
  * payload types are allowed (RFC 3264 6.1); anything that changes the carrier's media address cannot be repaired.
@@ -255,11 +255,17 @@ const DIRECTION_BITS: Record<string, number> = { inactive: 0, recvonly: 1, sendo
 /** The direction an answerer takes in response to an offered direction (RFC 3264 6.1). */
 const ANSWER_DIRECTION: Record<string, string> = { sendrecv: 'sendrecv', sendonly: 'recvonly', recvonly: 'sendonly', inactive: 'inactive' };
 
+function sameFingerprints(before: MediaSection, after: MediaSection): boolean {
+    return before.fingerprints.size === after.fingerprints.size && [...before.fingerprints].every(pair => after.fingerprints.has(pair));
+}
+
 export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string) {
     const restored = parseMediaSections(restoreOffer);
     const answered = parseMediaSections(answer);
     const previous = parseMediaSections(previousRemoteSdp);
-    if (answered.length !== restored.length) throw new Error('Rollback answer changed the media sections');
+    if (answered.length !== restored.length || answered.some((media, index) => media.type !== restored[index].type)) {
+        throw new Error('Rollback answer changed the media sections');
+    }
     // A stream active in both the restore offer and the previous carrier description cannot be dropped by the answer.
     for (const [index, media] of answered.entries()) {
         if (restored[index].port > 0 && previous[index]?.port > 0 && !(media.port > 0)) throw new Error('Rollback answer rejected an active stream');
@@ -290,12 +296,8 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
         } else if (!media.crypto.size || [...media.crypto].some(key => !before.crypto.has(key))) {
             throw new Error('Rollback changed the SDES crypto keys');
         }
-        // DTLS-SRTP: the fingerprints (and the role, when both sides state one; an actpass offer allows either) must be unchanged.
-        if (
-            media.fingerprints.size !== before.fingerprints.size ||
-            [...media.fingerprints].some(pair => !before.fingerprints.has(pair)) ||
-            (media.setup && before.setup && before.setup !== 'actpass' && media.setup !== before.setup)
-        ) {
+        // A fixed DTLS role and the fingerprints carry over. An earlier actpass offer allowed either fixed role.
+        if (!sameFingerprints(before, media) || (before.setup && before.setup !== 'actpass' && media.setup !== before.setup)) {
             throw new Error('Rollback changed the DTLS fingerprint mode');
         }
         if (media.type === 'audio') audioActive = true;
@@ -409,7 +411,7 @@ function sharedVoice(section: MediaSection, other: MediaSection | undefined): Se
 
 /**
  * True when `next` keeps every media parameter a peer negotiated against `previous`: address/port/protocol, direction,
- * SDES keys, and the voice encodings (with AMR framing) each shares with `remote` (the other side of that negotiation).
+ * SDES keys, DTLS fingerprints and setup role, and the voice encodings (with AMR framing) shared with `remote`.
  * A single-codec answer on the same endpoint for the codec the carrier selected needs no renegotiation.
  */
 export function preservesMediaParameters(previous: string, next: string, remote: string): boolean {
@@ -426,6 +428,7 @@ export function preservesMediaParameters(previous: string, next: string, remote:
         const other = after[index];
         if (media.direction !== other.direction) return false;
         if (media.crypto.size !== other.crypto.size || [...media.crypto].some(key => !other.crypto.has(key))) return false;
+        if (!sameFingerprints(media, other) || media.setup !== other.setup) return false;
         const left = sharedVoice(media, peer[index]);
         const right = sharedVoice(other, peer[index]);
         return left.size === right.size && [...left].every(identity => right.has(identity));

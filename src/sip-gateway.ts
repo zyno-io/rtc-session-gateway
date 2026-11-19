@@ -2054,6 +2054,8 @@ export class SipGateway {
             this.sentSdp.set(call.dialog, localSdp);
             // A 200 that rejects audio is not a successful return: restore through the failure path below.
             assertDirectMediaAnswer(localSdp, answer);
+            // The application already configured its media from the carrier SDP in the return invite.
+            assertRollbackAnswer(answer, offer, localSdp);
             this.assertLiveCall(call);
             if (!this.routeOwnerHolds(routeDestination, controlRoute, httpRoute))
                 throw new InvalidCallStateError('Return owner no longer holds the route');
