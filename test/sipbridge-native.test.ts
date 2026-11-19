@@ -555,6 +555,55 @@ test('rejected first requests leave no contexts and capacity refusals do not clo
     }
 });
 
+test('a flood of refused first requests beyond the context limit does not block the next real call', { ...native, timeout: 90000 }, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+    const signaling = new SipbridgeSignaling(config);
+    let ownerCalls = 0;
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson() {
+                ownerCalls++;
+                return { action: 'reject', status: 486 };
+            }
+        } as never,
+        signaling
+    );
+    const peers: Awaited<ReturnType<typeof sipPeer>>[] = [];
+    const final = (peer: (typeof peers)[number]) => peer.messages.some(message => /^SIP\/2.0 [3-6]/.test(message));
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        // 160 distinct refused calls exceed SIPBRIDGE_MEMORY_MAX_GROUPS (128). Refusals keep their transaction state for
+        // the SIP timers (~32s on UDP), so they must not hold the slots a new call needs. Batches stay under the
+        // per-source limit on requests awaiting a controller decision.
+        for (let batch = 0; batch < 8; batch++) {
+            const group = await Promise.all(Array.from({ length: 20 }, () => sipPeer(fixture.sipPort)));
+            peers.push(...group);
+            for (const peer of group) peer.send('INVITE', 1, '', sdp);
+            await until(() => group.every(final), 10000);
+        }
+        assert.equal(peers.filter(peer => peer.messages.some(message => message.startsWith('SIP/2.0 486'))).length, 160);
+        const real = await sipPeer(fixture.sipPort);
+        peers.push(real);
+        const before = ownerCalls;
+        real.send('INVITE', 1, '', sdp);
+        await until(() => final(real), 5000);
+        assert.ok(
+            real.messages.some(message => message.startsWith('SIP/2.0 486')),
+            'the real call reached the owner: ' + real.messages.map(message => message.split('\r\n')[0]).join(', ')
+        );
+        assert.ok(ownerCalls > before);
+    } finally {
+        await gateway.shutdown();
+        for (const peer of peers) peer.close();
+        await fixture.close();
+    }
+});
+
 test('a request on a different flow is refused immediately', native, async () => {
     const fixture = await nativeFixture();
     const registry = new CallRegistry();
