@@ -209,6 +209,7 @@ async function fixture(
     let dialHook: (() => Promise<void>) | undefined;
     let replacementFailure: Error | undefined;
     let destroyHook: (() => Promise<void>) | undefined;
+    let cancelFailure: Error | undefined;
     const finalized = {
         recordingId: 'recording',
         backendId: 'media-a',
@@ -240,6 +241,7 @@ async function fixture(
                 onProvisional: undefined as undefined | ((status: number) => void),
                 cancel: async () => {
                     cancelled++;
+                    if (cancelFailure) throw cancelFailure;
                 },
                 completed: (async () => {
                     await Promise.resolve();
@@ -327,6 +329,9 @@ async function fixture(
         replacementResponse: (dialog?: Dialog) => new Response(dialog, replacementFailure),
         delayDial: (hook: () => Promise<void>) => {
             dialHook = hook;
+        },
+        failCancel: (error: Error) => {
+            cancelFailure = error;
         }
     };
 }
@@ -894,15 +899,14 @@ test('a refused return re-INVITE needs no restore and leaves the external conver
     assert.equal(f.center.byes, 0);
 });
 
-test('a colliding outbound attempt ID cannot strand a call in transferring', async () => {
+test('internal handoff attempt ids are unique and never derived from the callId', async () => {
     const f = await fixture();
     const attempts = (f.gateway as unknown as { pendingOutboundCalls: Map<string, unknown> }).pendingOutboundCalls;
     attempts.set('handoff:caller', { cancelRequested: false });
-    await assert.rejects(f.gateway.transfer(f.params, 'app'), /already exists/);
-    assert.equal(f.call.ownership, 'application');
-    attempts.delete('handoff:caller');
     f.caller.reinviteHook = async () => sdp('10.0.0.1');
     assert.equal((await f.gateway.transfer(f.params, 'app')).state, 'completed');
+    assert.equal(f.call.ownership, 'handed-off');
+    attempts.delete('handoff:caller');
 });
 
 test('ending the call mid-relay ACKs the waiting peer before its BYE', async () => {
@@ -1742,7 +1746,7 @@ test('a Replaces return publishes sip.answered before the old-leg cleanup wait, 
     assert.ok(names.indexOf('sip.answered') >= 0 && names.indexOf('sip.answered') < names.indexOf('sip.bye'));
 });
 
-test('a Replaces return whose named destination left while the application was consulted is refused with 481', async () => {
+test('a Replaces return whose named destination left while the application was consulted is refused with 603', async () => {
     const f = await handedOff();
     f.call.peerAddress = undefined;
     f.call.peerAddresses = ['10.0.0.2'];
@@ -1761,7 +1765,7 @@ test('a Replaces return whose named destination left while the application was c
     gate.resolve();
     await pending;
     await turn();
-    assert.deepEqual(response.statuses, [481]);
+    assert.deepEqual(response.statuses, [603]);
     assert.equal(response.answered, undefined);
 });
 
@@ -1807,4 +1811,214 @@ test('a cancelled late-offer outbound that the destination still answers is ACKe
         ['center:ack', 'center:bye']
     );
     assert.match(f.center.acks[0], /m=audio 0 /);
+});
+
+const refer = () => request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' });
+const settle = (ms = 30) => new Promise(resolve => setTimeout(resolve, ms));
+const unknownNotify = (dialog: Dialog, match: string) => {
+    dialog.request = async (method: string, options: { body?: string } = {}) => {
+        dialog.requests.push({ method, ...options });
+        if (options.body?.includes(match)) {
+            dialog.isFenced = true;
+            throw new NativeOperationError('Native outcome unknown', true);
+        }
+    };
+};
+
+test('a declined REFER return whose failure NOTIFY is UNKNOWN ends the call: usable carrier BYEd once, fenced destination never commanded', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.hub.request = async () => ({ action: 'reject', status: 486 }) as never;
+    unknownNotify(f.center, '503');
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a fenced progress NOTIFY followed by a declined return ends the call instead of keeping a fenced peer', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.hub.request = async () => ({ action: 'reject', status: 486 }) as never;
+    unknownNotify(f.center, '100 Trying');
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a failed return with a healthy peer 481 on the NOTIFY keeps the pair (subscription-scoped)', async () => {
+    const f = await handedOff();
+    f.hub.request = async () => ({ action: 'reject', status: 486 }) as never;
+    f.center.request = async (method: string, options: { body?: string } = {}) => {
+        f.center.requests.push({ method, ...options });
+        throw new NativeOperationError('SIP non-success response: 481', false, false, 481, false);
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a definitely refused REFER 202 after the destination hung up ends the call: carrier BYEd once, one terminated', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    const gate = Promise.withResolvers<void>();
+    const response = new Response();
+    response.respond = async () => {
+        await gate.promise;
+        throw new NativeOperationError('REFER response refused', false);
+    };
+    f.center.emit('request', refer(), response);
+    await turn();
+    f.center.emit('ended', 'bye');
+    await turn();
+    assert.equal(f.call.peerDialog, undefined);
+    gate.resolve();
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a definitely refused REFER 202 with the destination still attached restores handed-off', async () => {
+    const f = await handedOff();
+    const response = new Response();
+    response.respond = async () => {
+        throw new NativeOperationError('REFER response refused', false);
+    };
+    f.center.emit('request', refer(), response);
+    await settle();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a REFER return whose carrier answers 200 with rejected audio restores media and reports 503', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    let first = true;
+    f.caller.reinviteHook = async () => {
+        if (first) {
+            first = false;
+            return sdp('10.0.0.1', 0);
+        }
+        return sdp('10.0.0.1');
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    // The handoff re-INVITE, the rejected return re-INVITE, then the restore of the destination's media.
+    assert.equal(f.caller.reinvites.length, 3, 'the carrier is restored to its previous media');
+    assert.match(f.caller.reinvites[2], /c=IN IP4 10\.0\.0\.2/);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.center.byes, 0);
+    const notifies = f.center.requests.filter(r => r.method === 'NOTIFY').map(r => r.body ?? '');
+    assert.ok(notifies.some(body => body.includes('503')));
+    assert.ok(!notifies.some(body => body.includes('200 OK')));
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+});
+
+test('a Replaces from an equivalent IPv6 spelling of the configured destination is authorized', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = undefined;
+    f.call.peerHost = '2001:0db8:0:0:0:0:0:1';
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    await f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '2001:db8::1') as never,
+        response as never
+    );
+    assert.ok(!response.statuses.includes(403), `statuses ${response.statuses}`);
+    assert.ok(response.answered, 'the replacement was answered');
+});
+
+test("a reused callId never inherits the previous call's pending transfer or conflicts with it", async () => {
+    for (const transferId of ['transfer-1', 'transfer-2']) {
+        const f = await fixture();
+        const gate = Promise.withResolvers<void>();
+        f.delayDestroy(() => gate.promise);
+        const first = f.gateway.transfer(f.params, 'app');
+        await settle(10);
+        assert.equal(f.call.ownership, 'handed-off');
+        await f.gateway.bye('caller', 'carrier-hangup');
+        const second = new Dialog('caller', 'gateway-tag-2', 'caller-tag-2');
+        second.name = 'caller2';
+        second.log = f.log;
+        await f.gateway.handleInvite(invite() as never, new Response(second) as never);
+        await turn();
+        const callB = f.registry.get('caller')!;
+        assert.notEqual(callB, f.call);
+        second.reinviteHook = async () => sdp('10.0.0.1');
+        const dialsBefore = f.dials();
+        const next = f.gateway.transfer({ ...f.params, transferId }, 'app');
+        await settle(10);
+        assert.equal(f.dials(), dialsBefore + 1, `${transferId}: the new call starts its own transfer`);
+        assert.equal(callB.ownership, 'handed-off');
+        gate.resolve();
+        const [a, b] = await Promise.all([first, next]);
+        assert.notEqual(b.logicalCallId, a.logicalCallId);
+        assert.equal(b.transferId, transferId);
+    }
+});
+
+test('the same call and transferId still share one transfer', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.delayDial(() => gate.promise);
+    const one = f.gateway.transfer(f.params, 'app');
+    const two = f.gateway.transfer(f.params, 'app');
+    await settle(10);
+    gate.resolve();
+    const [a, b] = await Promise.all([one, two]);
+    assert.equal(a.transferId, b.transferId);
+    assert.equal(f.dials(), 1);
+});
+
+test('a CANCEL whose retries ran out leaves setup pending: the destination that answers later is ACKed and BYEd', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.delayDial(() => gate.promise);
+    f.failCancel(new NativeOperationError('cancel refused', false));
+    const outbound = f.gateway.createOutbound({
+        requestUri: 'sip:center@center.example',
+        sdp: '',
+        controlConnectionId: 'app',
+        outboundAttemptId: 'attempt-1'
+    } as never);
+    const rejected = assert.rejects(outbound, /cancelled/);
+    await turn();
+    await turn();
+    await assert.rejects(f.gateway.cancelOutbound('attempt-1', 'app'));
+    gate.resolve();
+    await rejected;
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:bye']
+    );
+});
+
+test('an outbound setup that fails at the native deadline is cancelled once more', async () => {
+    const f = await fixture();
+    f.delayDial(async () => {
+        throw new NativeOperationError('Outbound setup deadline', true);
+    });
+    await assert.rejects(
+        f.gateway.createOutbound({
+            requestUri: 'sip:center@center.example',
+            sdp: '',
+            controlConnectionId: 'app',
+            outboundAttemptId: 'attempt-2'
+        } as never),
+        /deadline/
+    );
+    await turn();
+    assert.equal(f.cancelled(), 1);
+    assert.equal(f.center.byes, 0);
 });

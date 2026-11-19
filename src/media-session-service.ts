@@ -97,6 +97,8 @@ export class MediaSessionService implements GatewayMediaController {
     private activeEndpointActions = new Map<string, ActiveEndpointAction>();
     private sensitiveGatherEndpointIds = new Set<string>();
     private handoffSessions = new Map<string, object>();
+    /** Endpoint creations (webrtc, rtp, bridge) in flight per session; a handoff guard is refused while any is pending. */
+    private endpointCreations = new Map<string, number>();
     /** Sessions where a recording.start timed out locally: rtpbridge may be recording under an id we never learned. */
     private recordingUncertain = new Set<string>();
     private recordingStarts = new Map<string, Set<Promise<unknown>>>();
@@ -182,16 +184,36 @@ export class MediaSessionService implements GatewayMediaController {
 
     async createWebrtcOffer(sessionId: string, params: { direction?: string } = {}) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createWebrtcOffer(sessionId, params);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createWebrtcOffer(sessionId, params));
         this.addEndpoint(session, result.endpointId, 'webrtc', params.direction);
         return result;
     }
 
     async createWebrtcFromOffer(sessionId: string, params: { sdp: string; direction?: string }) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createWebrtcFromOffer(sessionId, params);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createWebrtcFromOffer(sessionId, params));
         this.addEndpoint(session, result.endpointId, 'webrtc', params.direction);
         return result;
+    }
+
+    /**
+     * Runs a backend call that adds an endpoint. Refused while a handoff guard holds any of the sessions (the handoff
+     * validated their endpoint set); counted while in flight so a handoff cannot validate around it.
+     */
+    private async creatingEndpoint<T>(sessionIds: string[], create: () => Promise<T>): Promise<T> {
+        for (const id of sessionIds) {
+            if (this.handoffSessions.has(id)) throw new MediaActionConflictError('Endpoints cannot be added during SIP handoff');
+        }
+        for (const id of sessionIds) this.endpointCreations.set(id, (this.endpointCreations.get(id) ?? 0) + 1);
+        try {
+            return await create();
+        } finally {
+            for (const id of sessionIds) {
+                const remaining = (this.endpointCreations.get(id) ?? 1) - 1;
+                if (remaining > 0) this.endpointCreations.set(id, remaining);
+                else this.endpointCreations.delete(id);
+            }
+        }
     }
 
     async acceptWebrtcAnswer(endpointId: string, params: { sdp: string; offerGeneration?: number }) {
@@ -256,14 +278,14 @@ export class MediaSessionService implements GatewayMediaController {
 
     async createRtpOffer(sessionId: string, params: RtpOfferOptions = {}) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createRtpOffer(sessionId, params);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createRtpOffer(sessionId, params));
         if (this.addEndpoint(session, result.endpointId, 'rtp', params.direction)) this.rtpLocalSdp.set(result.endpointId, result.sdpOffer);
         return result;
     }
 
     async createRtpFromOffer(sessionId: string, params: { sdp: string; direction?: string }) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createRtpFromOffer(sessionId, params);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createRtpFromOffer(sessionId, params));
         if (this.addEndpoint(session, result.endpointId, 'rtp', params.direction)) this.rtpLocalSdp.set(result.endpointId, result.sdpAnswer);
         return result;
     }
@@ -315,7 +337,9 @@ export class MediaSessionService implements GatewayMediaController {
             throw new MediaActionConflictError('Cannot bridge media sessions on different rtpbridge backends');
         }
 
-        const result = await session.client.bridgeSession(params.targetSessionId, { direction });
+        const result = await this.creatingEndpoint([session.sessionId, target.sessionId], () =>
+            session.client.bridgeSession(params.targetSessionId, { direction })
+        );
         const currentSession = this.sessions.get(sessionId);
         const currentTarget = this.sessions.get(params.targetSessionId);
         if (currentSession !== session || currentTarget !== target) {
@@ -504,6 +528,8 @@ export class MediaSessionService implements GatewayMediaController {
 
     async prepareHandoff(sessionId: string, ownerConnectionId: string | undefined, token: object) {
         this.assertHandoffMedia(sessionId, ownerConnectionId);
+        // An endpoint being created now could land after validation and be destroyed with the session.
+        if (this.endpointCreations.get(sessionId)) throw new MediaActionConflictError('Handoff refused while a media endpoint is being created');
         this.handoffSessions.set(sessionId, token);
         const results = this.handoffRecordings.get(sessionId) ?? [];
         this.handoffRecordings.set(sessionId, results);
@@ -530,6 +556,8 @@ export class MediaSessionService implements GatewayMediaController {
                 }
             }
             if (this.recordingUncertain.has(sessionId)) await this.stopUnknownRecordings(session);
+            // Re-validated with the guard held (no endpoint can be added meanwhile): the rule still holds at the end.
+            this.assertHandoffMedia(sessionId, ownerConnectionId);
             return [...results];
         } catch (err) {
             this.releaseHandoff(sessionId, token);

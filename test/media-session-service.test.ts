@@ -1215,3 +1215,59 @@ test('explicit STUN URLs work without a TURN secret or advertised IPv4 address',
     assert.deepEqual(session.iceConfiguration?.servers, [{ urls: ['stun:stun.example.net:3478'] }]);
     await service.destroySession(session.sessionId);
 });
+
+test('a held handoff guard refuses RTP, WebRTC and bridge endpoint additions until released', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    const token = {};
+    await service.prepareHandoff('media-session-1', 'owner', token);
+    await assert.rejects(service.createRtpOffer('media-session-1'), MediaActionConflictError);
+    await assert.rejects(service.createRtpFromOffer('media-session-1', { sdp: 'v=0' }), MediaActionConflictError);
+    await assert.rejects(service.createWebrtcOffer('media-session-1'), MediaActionConflictError);
+    assert.equal(service.get('media-session-1')?.endpoints.filter(endpoint => endpoint.type === 'rtp').length, 1);
+    service.releaseHandoff('media-session-1', token);
+    await service.createRtpOffer('media-session-1');
+});
+
+test('handoff preparation is refused while an endpoint creation is in flight', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const original = client.createRtpOffer.bind(client);
+    client.createRtpOffer = async (...args: Parameters<typeof original>) => {
+        started.resolve();
+        await release.promise;
+        return original(...args);
+    };
+    const creating = service.createRtpOffer('media-session-1');
+    await started.promise;
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), MediaActionConflictError);
+    release.resolve();
+    await creating;
+    // The refused attempt left no guard behind (recording still starts) and the counter drained.
+    await service.startRecording('media-session-1', {});
+    const token = {};
+    await service.prepareHandoff('media-session-1', 'owner', token);
+    service.releaseHandoff('media-session-1', token);
+});
+
+test('a failed endpoint creation releases its in-flight count so a later handoff can proceed', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    const original = client.createRtpOffer.bind(client);
+    client.createRtpOffer = async () => {
+        throw new Error('backend refused');
+    };
+    await assert.rejects(service.createRtpOffer('media-session-1'), /backend refused/);
+    client.createRtpOffer = original;
+    const token = {};
+    await service.prepareHandoff('media-session-1', 'owner', token);
+    service.releaseHandoff('media-session-1', token);
+});
