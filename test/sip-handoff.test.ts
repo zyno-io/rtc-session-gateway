@@ -40,9 +40,12 @@ class Dialog extends EventEmitter {
     log?: string[];
     name = 'dialog';
     reinviteFailure?: Error;
+    /** Fences the leg when the re-INVITE fails, as an UNKNOWN native outcome does. */
+    fenceOnReinviteFailure = false;
     reinviteHook?: (offer: string) => Promise<string>;
     offerlessGate?: Promise<void>;
     ackFailure?: Error;
+    fenceOnAckFailure = false;
     private buffered = new Map<number, string>();
     private waiters = new Map<number, { resolve: (body: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
     constructor(
@@ -56,7 +59,10 @@ class Dialog extends EventEmitter {
     async reinvite(offer: string) {
         this.reinvites.push(offer);
         if (offer) this.localSdp = offer;
-        if (this.reinviteFailure) throw this.reinviteFailure;
+        if (this.reinviteFailure) {
+            if (this.fenceOnReinviteFailure) this.isFenced = true;
+            throw this.reinviteFailure;
+        }
         // An offerless re-INVITE returns the peer's 2xx offer.
         if (!offer) {
             await this.offerlessGate;
@@ -66,7 +72,10 @@ class Dialog extends EventEmitter {
     }
     async ackAnswer(answer: string) {
         this.log?.push(`${this.name}:ack`);
-        if (this.ackFailure) throw this.ackFailure;
+        if (this.ackFailure) {
+            if (this.fenceOnAckFailure) this.isFenced = true;
+            throw this.ackFailure;
+        }
         this.acks.push(answer);
         this.localSdp = answer;
     }
@@ -116,6 +125,7 @@ class Response {
     statuses: number[] = [];
     answered?: string;
     log?: string[];
+    answerGate?: Promise<void>;
     constructor(
         private dialog?: Dialog,
         private answerFailure?: Error
@@ -130,6 +140,7 @@ class Response {
         }
     }
     async answer(offer: string) {
+        await this.answerGate;
         if (this.answerFailure) throw this.answerFailure;
         this.answered = offer;
         this.finalResponseSent = true;
@@ -1148,4 +1159,164 @@ test('a single-leg dialog-gone call is removed synchronously so a racing app BYE
     await assert.rejects(f.gateway.bye('caller'), /not found/i);
     await turn();
     assert.equal(f.caller.byes, 1);
+});
+
+const noMediaSdp = 'v=0\r\no=- 1 1 IN IP4 10.0.0.2\r\ns=-\r\nt=0 0\r\n';
+
+test('rejectSdpOffer never throws: an offer without media is rejected with a minimal valid SDP', () => {
+    for (const offer of ['', 'garbage', noMediaSdp]) {
+        const rejection = rejectSdpOffer(offer);
+        assert.match(rejection, /^v=0\r\no=- 0 0 IN IP4 0\.0\.0\.0\r\ns=-\r\nc=IN IP4 0\.0\.0\.0\r\nt=0 0\r\n$/);
+    }
+});
+
+test('a failed transfer whose destination offer has no media ACKs it before the BYE', async () => {
+    const f = await fixture();
+    f.center.remoteSdp = noMediaSdp;
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:bye']
+    );
+});
+
+test('an offerless relay whose peer offer has no media ACKs the peer before the BYE', async () => {
+    const f = await handedOff();
+    f.center.remoteSdp = noMediaSdp;
+    const response = new Response();
+    f.caller.emit('request', request('INVITE', '', 43), response);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(response.status, 488);
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:bye']
+    );
+    assert.equal(f.registry.size, 0);
+});
+
+test('a definitely refused destination ACK is still followed by a BYE on that leg', async () => {
+    const f = await fixture();
+    f.center.ackFailure = new NativeOperationError('ACK refused');
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    assert.equal(f.center.byes, 1, 'nothing else cleans the unacknowledged leg up');
+});
+
+test('an uncertain destination ACK fences the leg and it is never commanded', async () => {
+    const f = await fixture();
+    f.center.ackFailure = new NativeOperationError('ACK unknown', true);
+    f.center.fenceOnAckFailure = true;
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    assert.equal(f.center.byes, 0);
+});
+
+test('a refused peer ACK on an offerless relay still BYEs that leg and ends the call', async () => {
+    const f = await handedOff();
+    f.center.ackFailure = new NativeOperationError('ACK refused');
+    f.caller.emit('request', request('INVITE', '', 43), new Response());
+    await turn();
+    f.caller.deliverAck(43, sdp('10.0.0.1'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('an uncertain cross-leg re-INVITE ends the call once, never commanding a fenced leg', async () => {
+    for (const offerless of [false, true]) {
+        for (const fenced of [true, false]) {
+            const f = await handedOff();
+            f.center.reinviteFailure = new NativeOperationError('x', true);
+            f.center.fenceOnReinviteFailure = fenced;
+            const response = new Response();
+            response.log = f.log;
+            f.caller.emit('request', request('INVITE', offerless ? '' : sdp('10.0.0.1'), 43), response);
+            await new Promise(resolve => setTimeout(resolve, 20));
+            assert.equal(response.status, 488);
+            assert.equal(f.registry.size, 0);
+            assert.equal(f.caller.byes, 1);
+            assert.equal(f.center.byes, fenced ? 0 : 1);
+        }
+    }
+});
+
+test('a Replaces return whose caller hung up while the application was consulted is refused with 603', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    f.hub.request = async () => {
+        await gate.promise;
+        return { action: 'answer', sdp: sdp('10.0.0.3') } as never;
+    };
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await turn();
+    f.caller.emit('ended', 'bye');
+    gate.resolve();
+    await pending;
+    await turn();
+    assert.deepEqual(response.statuses, [603]);
+    assert.equal(response.answered, undefined);
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.center.byes, 1);
+    assert.equal(replacement.byes, 0);
+    assert.ok(
+        f.events.some(event => JSON.stringify(event).includes('replacement')),
+        'the application is told the new leg ended'
+    );
+});
+
+test('a Replaces return whose caller hung up during the answer tears down the new dialog', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    response.answerGate = gate.promise;
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    f.caller.emit('ended', 'bye');
+    await turn();
+    gate.resolve();
+    await pending;
+    await turn();
+    assert.equal(f.registry.size, 0);
+    assert.equal(replacement.byes, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('a 481 to the progress NOTIFY ends the REFER subscription: no final NOTIFY, the call survives', async () => {
+    const f = await handedOff();
+    let notifies = 0;
+    f.center.request = async () => {
+        notifies++;
+        throw new NativeOperationError('SIP non-success response: 481', false, false, 481, false);
+    };
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(notifies, 1);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.registry.size, 1);
+});
+
+test('a NOTIFY that times out (COMPLETED error, status 0) ends the REFER subscription: no final NOTIFY, the call survives', async () => {
+    const f = await handedOff();
+    let notifies = 0;
+    f.center.request = async () => {
+        notifies++;
+        throw new NativeOperationError('Timer F expired', false, false, 0, false, true);
+    };
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(notifies, 1);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.registry.size, 1);
 });

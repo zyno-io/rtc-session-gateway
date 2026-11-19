@@ -604,6 +604,65 @@ test('a flood of refused first requests beyond the context limit does not block 
     }
 });
 
+test('ended contexts do not count against the live-context admission limit and are bounded separately', { ...native, timeout: 60000 }, async () => {
+    const fixture = await nativeFixture();
+    const registry = new CallRegistry();
+    const config = loadConfig({ ...fixture.tls, ROUTES_JSON: '[{"match":"exact","value":"support","url":"https://owner.test/sip"}]' });
+    const signaling = new SipbridgeSignaling(config);
+    let ownerCalls = 0;
+    const gateway = new SipGateway(
+        config,
+        registry,
+        {
+            async postJson() {
+                ownerCalls++;
+                return { action: 'reject', status: 486 };
+            }
+        } as never,
+        signaling
+    );
+    const uas = await udpUas(sdp);
+    const peer = await sipPeer(fixture.sipPort);
+    try {
+        await gateway.start();
+        await until(() => gateway.isConnected);
+        await gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' });
+        const contexts = (signaling as any).contexts as Map<string, any>;
+        const live = [...contexts.values()][0];
+        for (let i = 0; i < 1100; i++)
+            contexts.set('ended' + i, {
+                ...live,
+                ended: true,
+                retiredAt: Date.now(),
+                snapshot: { ...live.snapshot, context: { ...live.snapshot.context, id: 'ended' + i } }
+            });
+        assert.equal((signaling as any).liveContexts(), 1);
+        const before = ownerCalls;
+        peer.send('INVITE', 1, '', sdp);
+        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 486')), 5000);
+        assert.ok(ownerCalls > before, 'the INVITE reached the owner despite 1100 ended tombstones');
+        await gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' });
+        // Tombstones are capped, oldest retired first.
+        for (let i = 0; i < 4200; i++)
+            contexts.set('old' + i, {
+                ...live,
+                ended: true,
+                retiredAt: i,
+                snapshot: { ...live.snapshot, context: { ...live.snapshot.context, id: 'old' + i } }
+            });
+        (signaling as any).trimTombstones();
+        const ended = [...contexts.values()].filter(context => context.ended);
+        assert.equal(ended.length, 4096);
+        assert.ok(!contexts.has('old0') && contexts.has('ended0'));
+        assert.equal((signaling as any).liveContexts(), 2);
+    } finally {
+        await gateway.shutdown();
+        uas.close();
+        peer.close();
+        await fixture.close();
+    }
+});
+
 test('a request on a different flow is refused immediately', native, async () => {
     const fixture = await nativeFixture();
     const registry = new CallRegistry();
@@ -794,7 +853,7 @@ test('uncertain first requests expire, not-sent failures are definite, and capac
         });
         assert.equal(live.uncertain, false);
         client.request = request;
-        for (let i = 0; contexts.size < 1024; i++)
+        for (let i = 0; (signaling as any).liveContexts() < 1024; i++)
             contexts.set('filler' + i, { ...live, snapshot: { ...live.snapshot, context: { ...live.snapshot.context, id: 'filler' + i } } });
         const invites = () => uas.messages.filter(wire => wire.startsWith('INVITE ')).length;
         const before = invites();

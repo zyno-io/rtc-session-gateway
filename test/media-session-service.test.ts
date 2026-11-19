@@ -5,6 +5,7 @@ import http from 'node:http';
 import test from 'node:test';
 
 import { MediaActionConflictError, MediaSessionService, MediaUnavailableError } from '../src/media-session-service';
+import { RtpbridgeTimeoutError } from '../src/rtpbridge-client';
 import { RtpbridgeTransport } from '../src/rtpbridge-transport';
 
 test('media session service forwards rtpbridge events to the owner control connection', async () => {
@@ -710,7 +711,8 @@ test('handoff freezes recording starts, awaits in-flight starts, and confirms al
     };
     const recording = service.startRecording('media-session-1', {});
     await started.promise;
-    const handoff = service.prepareHandoff('media-session-1', 'owner');
+    const handoffToken = {};
+    const handoff = service.prepareHandoff('media-session-1', 'owner', handoffToken);
     await assert.rejects(service.startRecording('media-session-1', {}), MediaActionConflictError);
     release.resolve();
     await recording;
@@ -719,7 +721,30 @@ test('handoff freezes recording starts, awaits in-flight starts, and confirms al
     assert.equal(results[0].recordingId, 'rec-1');
     assert.equal(results[0].packets, 10);
     await assert.rejects(service.stopRecording('rec-1'), /not found/);
-    service.releaseHandoff('media-session-1');
+    service.releaseHandoff('media-session-1', handoffToken);
+});
+
+test('a failed handoff attempt never stops a recording the application starts after the guard is released', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    const token = {};
+    const original = client.stopRecording.bind(client);
+    let stops = 0;
+    client.stopRecording = async (...args: Parameters<typeof original>) => {
+        stops++;
+        // The handoff timed out and released its guard; the application immediately records again.
+        service.releaseHandoff('media-session-1', token);
+        client.startRecording = async () => ({ recordingId: 'rec-2' });
+        await service.startRecording('media-session-1', {});
+        return original(...args);
+    };
+    await service.prepareHandoff('media-session-1', 'owner', token);
+    assert.equal(stops, 1, 'only the recording present when the handoff began is stopped');
+    client.stopRecording = original;
+    assert.equal((await service.stopRecording('rec-2')).packets, 10, 'the newer recording is still active');
 });
 
 test('recording-stop failure aborts media preparation without forgetting the active recording', async () => {
@@ -732,13 +757,13 @@ test('recording-stop failure aborts media preparation without forgetting the act
     client.stopRecording = async () => {
         throw new Error('stop rejected');
     };
-    await assert.rejects(service.prepareHandoff('media-session-1', 'owner'), /stop rejected/);
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), /stop rejected/);
     client.stopRecording = original;
     const result = await service.stopRecording('rec-1');
     assert.equal(result.packets, 10);
-    await assert.rejects(service.prepareHandoff('media-session-1', 'other-owner'), /another owner/);
+    await assert.rejects(service.prepareHandoff('media-session-1', 'other-owner', {}), /another owner/);
     await service.createWebrtcOffer('media-session-1');
-    await assert.rejects(service.prepareHandoff('media-session-1', 'owner'), /dedicated call/);
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), /dedicated call/);
 });
 
 test('handoff validates the source RTP address and retains previously finalized recording segments', async () => {
@@ -752,11 +777,90 @@ test('handoff validates the source RTP address and retains previously finalized 
     assert.throws(() => service.assertHandoffMedia('media-session-1', 'owner', local.replace('40000', '40002')), /does not carry/);
     await service.startRecording('media-session-1', { filePath: 'first.pcap' });
     await service.stopRecording('rec-1');
-    const recordings = await service.prepareHandoff('media-session-1', 'owner');
+    const recordings = await service.prepareHandoff('media-session-1', 'owner', {});
     assert.equal(recordings.length, 1);
     assert.equal(recordings[0].recordingPath, 'first.pcap');
     await service.destroySession('media-session-1');
     assert.equal(service.size, 0);
+});
+
+test('handoff guard is owner-scoped: a stale token cannot release a newer attempt', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    const a = {};
+    const b = {};
+    await service.prepareHandoff('media-session-1', 'owner', a);
+    service.releaseHandoff('media-session-1', a);
+    await service.prepareHandoff('media-session-1', 'owner', b);
+    service.releaseHandoff('media-session-1', a);
+    await assert.rejects(service.startRecording('media-session-1', {}), MediaActionConflictError);
+    service.releaseHandoff('media-session-1', b);
+    await service.startRecording('media-session-1', {});
+});
+
+test('finalized handoff recordings are capped at 256, dropping the oldest', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    let n = 0;
+    client.startRecording = async (_sessionId, params) => {
+        client.recordingFilePath = params.filePath;
+        return { recordingId: `rec-${++n}` };
+    };
+    for (let i = 1; i <= 257; i++) {
+        await service.startRecording('media-session-1', { filePath: `r${i}.pcap` });
+        await service.stopRecording(`rec-${i}`);
+    }
+    const recordings = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.equal(recordings.length, 256);
+    assert.equal(recordings[0].recordingId, 'rec-2');
+    assert.equal(recordings.at(-1)!.recordingId, 'rec-257');
+});
+
+test('a timed-out recording.start is reconciled at handoff by stopping unknown active recordings', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    client.startRecording = async () => {
+        client.sessionRecordings = [{ recordingId: 'ghost-1', filePath: 'ghost.pcap', state: 'active' }];
+        throw new RtpbridgeTimeoutError('recording.start');
+    };
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeTimeoutError);
+    const stopped: string[] = [];
+    client.stopRecording = async (recordingId?: string) => {
+        stopped.push(recordingId!);
+        return { filePath: 'ghost.pcap', durationMs: 1, packets: 1 };
+    };
+    const results = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.deepEqual(stopped, ['ghost-1']);
+    assert.equal(results[0].recordingId, 'ghost-1');
+    // The mark is cleared: a later handoff does not query again.
+    client.listSessionRecordings = async () => {
+        throw new Error('should not be called');
+    };
+    await service.prepareHandoff('media-session-1', 'owner', {});
+});
+
+test('handoff fails closed when recording state cannot be verified after a timed-out start', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    client.startRecording = async () => {
+        throw new RtpbridgeTimeoutError('recording.start');
+    };
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeTimeoutError);
+    client.listSessionRecordings = async () => {
+        throw new Error('info unavailable');
+    };
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), MediaActionConflictError);
+    // Guard released on failure, mark retained: a retry still verifies.
+    client.listSessionRecordings = async () => [];
+    await service.prepareHandoff('media-session-1', 'owner', {});
 });
 
 class FakePublisher {
@@ -937,8 +1041,13 @@ class FakeRtpbridgeClient extends EventEmitter {
         return { recordingId: 'rec-1' };
     }
 
-    async stopRecording() {
+    async stopRecording(_recordingId?: string) {
         return { filePath: this.recordingFilePath, durationMs: 1000, packets: 10 };
+    }
+
+    sessionRecordings: Array<{ recordingId: string; filePath: string; state: 'active' | 'stopped' }> = [];
+    async listSessionRecordings() {
+        return this.sessionRecordings;
     }
 
     async startVad(endpointId: string, options: unknown) {

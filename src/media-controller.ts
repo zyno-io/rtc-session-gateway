@@ -124,8 +124,12 @@ export interface CreateMediaSessionParams {
 
 export interface GatewayMediaController {
     assertHandoffMedia?(sessionId: string, ownerConnectionId?: string, sourceSdp?: string): void;
-    prepareHandoff?(sessionId: string, ownerConnectionId?: string): Promise<import('./sip-handoff-contract').FinalizedSipRecording[]>;
-    releaseHandoff?(sessionId: string): void;
+    prepareHandoff?(
+        sessionId: string,
+        ownerConnectionId: string | undefined,
+        token: object
+    ): Promise<import('./sip-handoff-contract').FinalizedSipRecording[]>;
+    releaseHandoff?(sessionId: string, token: object): void;
     list(): MediaSessionSnapshot[];
     get(sessionId: string): MediaSessionSnapshot | undefined;
     createSession(params?: CreateMediaSessionParams): Promise<MediaSessionSnapshot>;

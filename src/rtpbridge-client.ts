@@ -50,6 +50,21 @@ export interface RtpbridgeDtmfEvent {
     sensitive?: boolean;
 }
 
+/** A request whose response never arrived: rtpbridge may still have executed it. */
+export class RtpbridgeTimeoutError extends Error {
+    constructor(readonly method: string) {
+        super(`rtpbridge request timed out: ${method}`);
+        this.name = 'RtpbridgeTimeoutError';
+    }
+}
+
+export interface RtpbridgeRecordingInfo {
+    recordingId: string;
+    endpointId?: string | null;
+    filePath: string;
+    state: 'active' | 'stopped';
+}
+
 interface PendingRequest {
     resolve: (value: any) => void;
     reject: (err: Error) => void;
@@ -161,10 +176,7 @@ export class RtpbridgeClient extends EventEmitter {
         return this.sendRequest('endpoint.webrtc.ice_restart', { endpointId });
     }
 
-    async createRtpOffer(
-        sessionId: string,
-        params: RtpOfferOptions = {}
-    ): Promise<{ endpointId: string; sdpOffer: string }> {
+    async createRtpOffer(sessionId: string, params: RtpOfferOptions = {}): Promise<{ endpointId: string; sdpOffer: string }> {
         return this.sendRequest('endpoint.rtp.create_offer', { sessionId, ...params });
     }
 
@@ -211,11 +223,15 @@ export class RtpbridgeClient extends EventEmitter {
         await this.sendRequest('endpoint.update_direction', { endpointId, direction });
     }
 
-    async startRecording(
-        sessionId: string,
-        params: { endpointId?: string; filePath: string }
-    ): Promise<{ recordingId: string }> {
+    async startRecording(sessionId: string, params: { endpointId?: string; filePath: string }): Promise<{ recordingId: string }> {
         return this.sendRequest('recording.start', { sessionId, ...params });
+    }
+
+    /** Recordings rtpbridge currently holds for this connection's session (`session.info`). */
+    async listSessionRecordings(): Promise<RtpbridgeRecordingInfo[]> {
+        const response = await this.sendRequest('session.info', {});
+        if (!Array.isArray(response.recordings)) throw new Error('session.info returned no recordings');
+        return response.recordings;
     }
 
     async stopRecording(recordingId: string): Promise<RecordingResult> {
@@ -257,7 +273,7 @@ export class RtpbridgeClient extends EventEmitter {
         const promise = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(id);
-                reject(new Error(`rtpbridge request timed out: ${method}`));
+                reject(new RtpbridgeTimeoutError(method));
             }, timeoutMs);
             this.pending.set(id, { resolve, reject, timer, method });
         });

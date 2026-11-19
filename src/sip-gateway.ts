@@ -279,9 +279,28 @@ export class SipGateway {
 
             acceptedReceiverUrl = controlRoute ? controlRoute.route.url : (action.receiverUrl ?? httpRoute!.url);
 
+            // The original caller may have hung up while the application was consulted (RFC 3891 3: 603 when the
+            // replaced dialog no longer exists to be replaced). Checked synchronously before and after the answer.
+            const claimHeld = () => !replacing || (this.registry.get(replacing.callId) === replacing && replacing.ownership === 'returning');
+            if (!claimHeld()) {
+                this.logger.warn({ callId, replacedCallId: replacing!.callId }, 'Replaced call ended during return; rejecting INVITE');
+                await res.respond(603);
+                this.registry.releaseReservation(callId);
+                void this.sendFailedInviteEvent(controlRoute?.connectionId, acceptedReceiverUrl, {
+                    event: 'terminated',
+                    callId,
+                    sipCallId,
+                    reason: 'return-failed',
+                    receivedAt: new Date().toISOString()
+                });
+                return;
+            }
+
             const dialog = await res.answer(action.sdp, action.headers);
             answeredDialog = dialog;
             this.lifecycle?.assertRunning();
+            // The claim was lost during the answer: the caller is gone, so the new dialog is torn down (catch below).
+            if (!claimHeld()) throw new InvalidCallStateError('Replaced call ended during return');
             const now = new Date().toISOString();
             const call = this.registry.activate({
                 logicalCallId: inviteRequest.logicalCallId,
@@ -374,9 +393,12 @@ export class SipGateway {
     private async byeLeg(dialog: NativeDialog, headers?: SipHeaders) {
         if (dialog.isEnded || dialog.isFenced) return;
         // I6: a leg still owed its ACK gets it (a rejection) before any BYE, whichever path ends the call.
-        await this.ackOwed
-            .get(dialog)?.()
-            .catch(() => undefined);
+        try {
+            await this.ackOwed.get(dialog)?.();
+        } catch {
+            // A definitely refused ACK still gets the BYE (sipbridge allows a local BYE then, and nothing else cleans
+            // the context up); an uncertain one fenced the leg (checked below), which is never commanded again.
+        }
         if (dialog.isEnded || dialog.isFenced) return;
         await dialog.bye(headers);
     }
@@ -573,18 +595,20 @@ export class SipGateway {
         let attempt: OutboundAttempt | undefined;
         let destination: NativeDialog | undefined;
         let destinationOffer = '';
-        let destinationAcked = false;
+        let destinationAck: Promise<void> | undefined;
         let relayedOffer = '';
         let switched = false;
         let carrierPending = false;
         let expired = false;
         let timer: NodeJS.Timeout | undefined;
+        // Owner-scoped media guard: a stale attempt must never release a later attempt's recording suspension.
+        const handoffToken = {};
         const previousSdp = call.localSdp;
         // I6: the single ACK for the destination's late-offer 2xx, taken synchronously by whichever path gets there first.
         const ackDestination = async (sdp: string) => {
-            if (destinationAcked) return false;
-            destinationAcked = true;
-            await destination!.ackAnswer(sdp);
+            if (destinationAck) return false;
+            destinationAck = destination!.ackAnswer(sdp);
+            await destinationAck;
             return true;
         };
         try {
@@ -609,38 +633,34 @@ export class SipGateway {
             if (!destinationOffer) throw new InvalidCallStateError('Destination provided no late offer');
             relayedOffer = relaySdp(destinationOffer, call.localSdp);
             const negotiate = async () => {
+                // I3: recording is stopped and confirmed before any destination SDP reaches the carrier.
+                status.recordings = await media.prepareHandoff!(params.mediaSessionId, call.controlConnectionId, handoffToken);
+                this.assertLiveCall(call);
+                if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                if (call.dialog.isFenced || destination!.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
+                if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
+                carrierPending = true;
+                let answer: string;
                 try {
-                    // I3: recording is stopped and confirmed before any destination SDP reaches the carrier.
-                    status.recordings = await media.prepareHandoff!(params.mediaSessionId, call.controlConnectionId);
-                    this.assertLiveCall(call);
-                    if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                    if (call.dialog.isFenced || destination!.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
-                    if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
-                    carrierPending = true;
-                    let answer: string;
-                    try {
-                        answer = await call.dialog.reinvite(relayedOffer);
-                    } catch (err) {
-                        // A definite refusal or rejection means the carrier never switched media: no timeout BYE is owed.
-                        if (err instanceof NativeOperationError && !err.uncertain) carrierPending = false;
-                        throw err;
-                    }
-                    // The carrier accepted the destination's media; failures from here on must restore its previous media.
-                    switched = true;
-                    this.sentSdp.set(call.dialog, relayedOffer);
-                    assertDirectMediaAnswer(destinationOffer, answer);
-                    // A late carrier answer must not leave the caller connected to an abandoned destination.
-                    if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                    this.assertLiveCall(call);
-                    if (!(await ackDestination(answer))) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                    this.sentSdp.set(destination!, answer);
-                    if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                    this.assertLiveCall(call);
-                    if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
-                    this.registry.updateSdp(call.callId, { localSdp: relayedOffer, remoteSdp: answer });
-                } finally {
-                    if (expired) media.releaseHandoff?.(params.mediaSessionId);
+                    answer = await call.dialog.reinvite(relayedOffer);
+                } catch (err) {
+                    // A definite refusal or rejection means the carrier never switched media: no timeout BYE is owed.
+                    if (err instanceof NativeOperationError && !err.uncertain) carrierPending = false;
+                    throw err;
                 }
+                // The carrier accepted the destination's media; failures from here on must restore its previous media.
+                switched = true;
+                this.sentSdp.set(call.dialog, relayedOffer);
+                assertDirectMediaAnswer(destinationOffer, answer);
+                // A late carrier answer must not leave the caller connected to an abandoned destination.
+                if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                this.assertLiveCall(call);
+                if (!(await ackDestination(answer))) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                this.sentSdp.set(destination!, answer);
+                if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                this.assertLiveCall(call);
+                if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
+                this.registry.updateSdp(call.callId, { localSdp: relayedOffer, remoteSdp: answer });
             };
             await Promise.race([
                 negotiate(),
@@ -690,12 +710,14 @@ export class SipGateway {
             status.state = 'failed';
             status.failure = 'SIP handoff failed';
             const live = this.registry.get(call.callId) === call;
-            const destinationUsable = !!destination && !destination.isEnded && !destination.isFenced;
+            const destinationUsableNow = () => !!destination && !destination.isEnded && !destination.isFenced;
             // I6 first: the answered destination is ACKed (a rejection) before any slower carrier restoration, so its
             // 2xx is never left waiting for the restore re-INVITEs.
-            if (destinationUsable && !destinationAcked && destinationOffer) {
+            if (destinationUsableNow() && destinationOffer) {
                 try {
-                    await ackDestination(rejectSdpOffer(destinationOffer));
+                    // An ACK already in flight is awaited so the BYE below can never overtake it.
+                    if (destinationAck) await destinationAck;
+                    else await ackDestination(rejectSdpOffer(destinationOffer));
                 } catch {
                     this.logger.warn(
                         { callId: call.callId, failure: 'handoff-destination-ack-failed' },
@@ -715,7 +737,7 @@ export class SipGateway {
                     await this.bye(call.callId, 'transfer-restore-failed').catch(() => undefined);
                 }
             }
-            if (destinationUsable) {
+            if (destinationUsableNow()) {
                 try {
                     await destination!.bye();
                 } catch {
@@ -737,7 +759,7 @@ export class SipGateway {
             throw new InvalidCallStateError(errorMessage(err));
         } finally {
             if (timer) clearTimeout(timer);
-            media.releaseHandoff?.(params.mediaSessionId);
+            media.releaseHandoff?.(params.mediaSessionId, handoffToken);
             this.modifyingPairs.delete(call.callId);
             this.transferRequests.delete(call.callId);
             pending.finish();
@@ -1049,10 +1071,24 @@ export class SipGateway {
         } catch (err) {
             this.logger.warn({ callId: call.callId, failure: 'paired-renegotiation-failed' }, errorMessage(err));
             if (!res.finalResponseSent) await res.respond(isGlare(err) ? 491 : 488).catch(() => undefined);
-            if (!peerAccepted) this.endIfDialogGone(call, err);
+            if (!peerAccepted) {
+                if (this.peerOutcomeUnknown(err, peer)) await this.endUncertainPair(call);
+                else this.endIfDialogGone(call, err);
+            }
             // The peer already moved to the new media but the requester never got its answer: the legs disagree.
             if (peerAccepted && this.registry.get(call.callId) === call) await this.bye(call.callId, 'renegotiation-failed').catch(() => undefined);
         }
+    }
+
+    /** True when the cross-leg re-INVITE's outcome is unknown, so the legs' media may have diverged. */
+    private peerOutcomeUnknown(err: unknown, peer: NativeDialog) {
+        return (err instanceof NativeOperationError && err.uncertain) || peer.isFenced;
+    }
+
+    /** I7: bye() removes the call first (the single token), skips fenced legs, and BYEs the usable one exactly once. */
+    private async endUncertainPair(call: ActiveCall) {
+        if (this.registry.get(call.callId) !== call) return;
+        await this.bye(call.callId, 'renegotiation-uncertain').catch(() => undefined);
     }
 
     /**
@@ -1061,14 +1097,14 @@ export class SipGateway {
      */
     private async relayOfferlessModify(call: ActiveCall, dialog: NativeDialog, peer: NativeDialog, req: IncomingSipRequest, res: SipResponse) {
         let peerOffer: string | undefined;
-        let peerAcked = false;
-        // Single ACK for the peer's late-offer 2xx, whatever path reaches it first (I6).
-        const ackPeer = async (sdp: string) => {
-            if (peerAcked) return;
-            peerAcked = true;
-            this.ackOwed.delete(peer);
-            await peer.ackAnswer(sdp);
-        };
+        let peerAck: Promise<void> | undefined;
+        // Single ACK for the peer's late-offer 2xx, whatever path reaches it first (I6). Later callers share its outcome;
+        // the obligation is cleared only once the ACK succeeded.
+        const ackPeer = (sdp: string) =>
+            (peerAck ??= (async () => {
+                await peer.ackAnswer(sdp);
+                this.ackOwed.delete(peer);
+            })());
         let waiting = false;
         let reinvited = false;
         try {
@@ -1108,14 +1144,15 @@ export class SipGateway {
                 // The peer refused the offerless re-INVITE (glare, 488, ...): nothing changed on either leg.
                 this.ackOwed.delete(peer);
                 if (!res.finalResponseSent) await res.respond(isGlare(err) ? 491 : 488).catch(() => undefined);
-                this.endIfDialogGone(call, err);
+                if (this.peerOutcomeUnknown(err, peer)) await this.endUncertainPair(call);
+                else this.endIfDialogGone(call, err);
                 return;
             }
-            if (peerOffer && !peerAcked && !peer.isFenced && !peer.isEnded) {
+            if (peerOffer && !peerAck && !peer.isFenced && !peer.isEnded) {
                 try {
                     await ackPeer(rejectSdpOffer(peerOffer));
                 } catch {
-                    // The native layer's own ACK-timeout cleanup owns a peer that cannot be acknowledged.
+                    // A peer whose ACK failed is still ended by the BYE below (an uncertain one is fenced and never commanded).
                 }
             }
             if (!res.finalResponseSent) await res.respond(488).catch(() => undefined);
@@ -1161,8 +1198,12 @@ export class SipGateway {
             await res.respond(491);
             return;
         }
+        // RFC 6665 4.2.2: a failure response to a NOTIFY ends the implicit REFER subscription, so no later NOTIFY is sent.
+        let subscriptionGone = false;
+        let progress: Promise<void> | undefined;
         const notify = async (status: number, final: boolean) => {
-            if (readHeader(req, 'refer-sub')?.toLowerCase() === 'false' || dialog.isFenced || dialog.isEnded) return;
+            if (final) await progress?.catch(() => undefined);
+            if (subscriptionGone || readHeader(req, 'refer-sub')?.toLowerCase() === 'false' || dialog.isFenced || dialog.isEnded) return;
             const sequence = req.cseq || undefined;
             await dialog
                 .request('NOTIFY', {
@@ -1174,7 +1215,11 @@ export class SipGateway {
                     body: `SIP/2.0 ${status} ${status === 200 ? 'OK' : status === 100 ? 'Trying' : 'Return Failed'}\r\n`
                 })
                 // A 481 to a NOTIFY ends only the implicit REFER subscription (RFC 6665), never the INVITE dialog.
-                .catch(() => undefined);
+                .catch(err => {
+                    // A peer final (non-2xx, or a timeout arriving as a COMPLETED error with status 0) ends it (RFC 6665);
+                    // so does an uncertain outcome. A local refusal is not the peer's answer and leaves it intact.
+                    if (err instanceof NativeOperationError && (err.sipStatus >= 300 || err.uncertain || err.completed)) subscriptionGone = true;
+                });
         };
         const returning = call.ownership === 'handed-off';
         // I1: the return claim is synchronous with the ownership check above.
@@ -1191,7 +1236,7 @@ export class SipGateway {
             }
             throw err;
         }
-        void notify(100, false);
+        progress = notify(100, false);
         try {
             await this.returnToApplication(call, notify, destinationUri, routeDestination.destinationUser, controlRoute, httpRoute);
         } finally {
@@ -1298,11 +1343,10 @@ export class SipGateway {
                     reason: 'return-failed',
                     receivedAt: new Date().toISOString()
                 });
-            // The NOTIFY is enqueued synchronously (commands per leg are serialized), so it precedes any BYE below.
-            const notified = notify(503, true);
+            // The final NOTIFY precedes any dialog-gone BYE below (it waits only for the progress NOTIFY).
+            await notify(503, true);
             // A no-op when an earlier path already ended the call.
             if (!switched) this.endIfDialogGone(call, err);
-            await notified;
         }
     }
 

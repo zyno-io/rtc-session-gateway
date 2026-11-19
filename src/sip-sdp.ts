@@ -18,8 +18,18 @@ export function relaySdp(remoteSdp: string, previousLocalSdp?: string): string {
     return lines.join('\r\n') + '\r\n';
 }
 
+const EMPTY_REJECTION_SDP = 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n';
+
+/**
+ * Builds the answer that declines every stream of an offer. Never throws: sipbridge treats any non-empty SDP body as an
+ * offer that needs an ACK answer, so an unparsable offer must still be acknowledged (with a minimal valid SDP).
+ */
 export function rejectSdpOffer(sdp: string): string {
-    return relaySdp(sdp).replace(/^m=(\S+) \d+/gm, 'm=$1 0');
+    try {
+        return relaySdp(sdp).replace(/^m=(\S+) \d+/gm, 'm=$1 0');
+    } catch {
+        return EMPTY_REJECTION_SDP;
+    }
 }
 
 /** A rejected audio stream or an incompatible answer cannot be a successful handoff. */

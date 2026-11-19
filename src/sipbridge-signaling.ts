@@ -50,10 +50,15 @@ const ALLOW = 'INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, REFER';
 // Upper bound on waiting for a peer's ACK that completes a relayed offerless re-INVITE.
 export const PEER_ACK_WAIT_MS = 10_000;
 const MAX_BUFFERED_ACKS = 8;
+// Admission limit on live (not ended) contexts. Ended contexts are tombstones bounded separately below.
 const MAX_CONTEXTS = 1024;
+const MAX_TOMBSTONES = 4096;
+const TOMBSTONE_MIN_RETENTION_MS = 120_000;
 const MAX_RECEIPTS = 8192;
 // sipbridge redelivers an unacknowledged lifecycle event for about two minutes.
 const RECEIPT_LIFETIME_MS = 150_000;
+// A tombstone answers the outbound open race and a redelivered lifecycle event, which sipbridge stops after ~2 minutes.
+const TOMBSTONE_RETENTION_MS = RECEIPT_LIFETIME_MS;
 const UNCERTAIN_FIRST_REQUEST_MS = 40_000;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const processEqual = (a?: ProcessRef, b?: ProcessRef) => a?.instanceId === b?.instanceId && a?.epoch === b?.epoch;
@@ -74,7 +79,9 @@ export class NativeOperationError extends Error {
          * RFC 3261 14.1 / RFC 5057: the peer (or silence from it) established that the dialog no longer exists.
          * Never set for a local refusal.
          */
-        readonly dialogGone = false
+        readonly dialogGone = false,
+        /** True when the error is the outcome of a COMPLETED command (the peer's final or its timeout), not a local refusal. */
+        readonly completed = false
     ) {
         super(message);
     }
@@ -332,7 +339,7 @@ export class SipbridgeSignaling extends EventEmitter {
         const now = Date.now();
         for (const [id, marker] of this.events) if (marker.expires < now) this.events.delete(id);
         for (const [key, state] of this.contexts) {
-            if (state.retiredAt !== undefined && now - state.retiredAt > 300000) this.contexts.delete(key);
+            if (state.retiredAt !== undefined && now - state.retiredAt > TOMBSTONE_RETENTION_MS) this.contexts.delete(key);
             else if (state.expiresAt !== undefined && state.expiresAt <= now && !state.ended) this.drop(state, 'expired');
         }
         const view = this.catalog!.snapshot.signaling;
@@ -496,10 +503,28 @@ export class SipbridgeSignaling extends EventEmitter {
         }
         state.uncertain = true;
     }
+    /** Contexts that count against admission; ended tombstones never do. */
+    private liveContexts() {
+        let live = 0;
+        for (const context of this.contexts.values()) if (!context.ended) live++;
+        return live;
+    }
+    /** Keeps at most MAX_TOMBSTONES ended contexts, evicting the oldest retired first. */
+    private trimTombstones() {
+        if (this.contexts.size <= MAX_TOMBSTONES) return;
+        const ended = [...this.contexts].filter(([, context]) => context.ended);
+        if (ended.length <= MAX_TOMBSTONES) return;
+        // sipbridge redelivers events and retains ended contexts for 2 minutes; never evict anything younger.
+        const now = Date.now();
+        const evictable = ended.filter(([, context]) => now - (context.retiredAt ?? 0) >= TOMBSTONE_MIN_RETENTION_MS);
+        evictable.sort(([, a], [, b]) => (a.retiredAt ?? 0) - (b.retiredAt ?? 0));
+        for (const [key] of evictable.slice(0, Math.min(evictable.length, ended.length - MAX_TOMBSTONES))) this.contexts.delete(key);
+    }
     private retire(state: Context, reason: string) {
         if (state.ended) return;
         state.ended = true;
         state.retiredAt = Date.now();
+        this.trimTombstones();
         if (state.credentials) this.credentials.delete(state.credentials.id);
         state.deferred?.reject(new NativeOperationError('Native call ended'));
         state.dialog?.emit('ended', reason);
@@ -531,7 +556,9 @@ export class SipbridgeSignaling extends EventEmitter {
         peer: Peer,
         client: SipbridgeControlClient,
         snapshot: ContextSnapshot,
-        capacity: 'enforce' | 'transient' | 'force' = 'enforce'
+        capacity: 'enforce' | 'transient' | 'force' = 'enforce',
+        /** A context first seen already terminal is created ended so it can never become a live ghost. */
+        terminal = false
     ): Context {
         const ref = snapshot.context;
         if (
@@ -548,17 +575,20 @@ export class SipbridgeSignaling extends EventEmitter {
         let state = this.contexts.get(key);
         if (state && state.peer !== peer) throw new Error('Native context peer mismatch');
         if (!state) {
-            if (this.contexts.size >= MAX_CONTEXTS && capacity === 'enforce') throw new Error('Native context capacity');
+            const ended = terminal || !!snapshot.ended;
+            if (!ended && this.liveContexts() >= MAX_CONTEXTS && capacity === 'enforce') throw new Error('Native context capacity');
             state = {
                 peer,
                 snapshot,
                 sequence: snapshot.commandSequence,
                 tail: Promise.resolve(),
                 uncertain: false,
-                ended: false
+                ended,
+                retiredAt: ended ? Date.now() : undefined
             };
             // At capacity a request is tracked only long enough to be denied.
-            if (this.contexts.size < MAX_CONTEXTS || capacity === 'force') this.contexts.set(key, state);
+            if (ended || this.liveContexts() < MAX_CONTEXTS || capacity === 'force') this.contexts.set(key, state);
+            if (ended) this.trimTombstones();
         }
         if (snapshot.revision >= state.snapshot.revision) state.snapshot = snapshot;
         if (snapshot.commandSequence > state.sequence) state.sequence = snapshot.commandSequence;
@@ -587,7 +617,7 @@ export class SipbridgeSignaling extends EventEmitter {
                 return;
             }
             const fresh = !this.contexts.has(requestKey);
-            const full = fresh && this.contexts.size >= MAX_CONTEXTS;
+            const full = fresh && this.liveContexts() >= MAX_CONTEXTS;
             const key = contextKey(request.snapshot.context!) + ':request:' + request.requestId;
             const fingerprint = createHash('sha256')
                 .update(
@@ -627,15 +657,22 @@ export class SipbridgeSignaling extends EventEmitter {
                 await client.reply(frame.correlationId, { $case: 'result', result: emptyResult() });
                 return;
             }
-            // A current-term terminal event may precede the local record of its context (e.g. an outbound
-            // open); it is kept as a tombstone, never refused for capacity.
-            const state = this.remember(peer, client, event.snapshot, terminal ? 'force' : 'enforce');
             const key = contextKey(event.snapshot.context!) + ':' + frame.correlationId;
             const fingerprint = createHash('sha256')
                 .update(JSON.stringify(DialogEvent.toJSON(event)))
                 .digest('hex');
-            const { marker: prior, created } = this.receipt(key, fingerprint);
-            if (!created && prior.fingerprint !== fingerprint) throw new Error('Native event replay mismatch');
+            // A redelivered duplicate is acknowledged before any context bookkeeping: its tombstone may have
+            // been evicted, and remembering it again would resurrect the context.
+            const duplicate = this.events.get(key);
+            if (duplicate) {
+                if (duplicate.fingerprint !== fingerprint) throw new Error('Native event replay mismatch');
+                await client.reply(frame.correlationId, { $case: 'result', result: emptyResult() });
+                return;
+            }
+            // A current-term terminal event may precede the local record of its context (e.g. an outbound
+            // open); it is kept as an ended tombstone, never refused for capacity.
+            const state = this.remember(peer, client, event.snapshot, terminal ? 'force' : 'enforce', terminal);
+            const { created } = this.receipt(key, fingerprint);
             await client.reply(frame.correlationId, { $case: 'result', result: emptyResult() });
             if (!created) return;
             if (event.kind === DialogEvent_Kind.PROVISIONAL) state.onProvisional?.(event.message?.status ?? 0);
@@ -649,6 +686,7 @@ export class SipbridgeSignaling extends EventEmitter {
             if ([DialogEvent_Kind.ENDED, DialogEvent_Kind.FAILED, DialogEvent_Kind.CANCELLED].includes(event.kind)) {
                 state.ended = true;
                 state.retiredAt = Date.now();
+                this.trimTombstones();
                 state.deferred?.reject(new NativeOperationError(event.error || 'SIP call ended'));
                 state.dialog?.emit('ended', event.kind === DialogEvent_Kind.ENDED ? 'bye' : 'terminated');
                 if (state.credentials) this.credentials.delete(state.credentials.id);
@@ -897,11 +935,11 @@ export class SipbridgeSignaling extends EventEmitter {
                             method === 'INVITE'
                                 ? status === 408 || status === 481 || status === 0
                                 : status === 481 && method !== 'NOTIFY' && method !== 'SUBSCRIBE';
-                        if (result.error) throw new NativeOperationError(result.error, false, false, status, dialogGone);
+                        if (result.error) throw new NativeOperationError(result.error, false, false, status, dialogGone, true);
                         // A peer's non-2xx final is a definite failure: it neither fences the context nor is uncertain. The
                         // snapshot above is already remembered.
                         if (status < 200 || status >= 300)
-                            throw new NativeOperationError(`SIP non-success response: ${status}`, false, false, status, dialogGone);
+                            throw new NativeOperationError(`SIP non-success response: ${status}`, false, false, status, dialogGone, true);
                     }
                 }
                 // NOT_ACCEPTED is a local refusal (even with a 481 status): never dialog-gone.
@@ -926,7 +964,7 @@ export class SipbridgeSignaling extends EventEmitter {
             const peer = [...this.peers.values()].find(peer => peer.client && peer.endpoint.acceptNew)!;
             const client = peer.client!;
             // Record the context only after the INVITE is accepted, so capacity must be known first.
-            if (this.contexts.size >= MAX_CONTEXTS) throw new NativeOperationError('Native context capacity', false, true);
+            if (this.liveContexts() >= MAX_CONTEXTS) throw new NativeOperationError('Native context capacity', false, true);
             const bootstrapId = randomUUID();
             const credentialId = params.auth ? randomUUID() : undefined;
             if (credentialId) this.credentials.set(credentialId, { peer, contextId: bootstrapId, ...params.auth! });
