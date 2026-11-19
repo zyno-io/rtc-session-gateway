@@ -1963,8 +1963,20 @@ export class SipGateway {
         // leg; for the destination (being retired) nothing waits on the NOTIFY retries.
         const keptReferrer = referrer === call.dialog;
         // The prepared owner's correlated outcome for this attempt (never sent once sip.answered went out).
+        // For an HTTP owner whose call continues, a later call-level end event (bye/terminated POST) waits for this attempt's
+        // bounded outcome delivery: it is tracked against the live call before the return lock is released. SIP teardown never
+        // waits on it. Idempotent; resolved by the outcome delivery (or on any exit that sends none).
+        let releaseOutcomeHold = () => {};
+        const holdOutcomeDelivery = () => {
+            if (!preparedCall || (preparedCall.controlConnectionId && this.controlHub?.isConnected(preparedCall.controlConnectionId))) return;
+            const hold = Promise.withResolvers<void>();
+            releaseOutcomeHold = () => hold.resolve();
+            this.trackAnsweredDelivery(call, hold.promise);
+        };
         const sendAttemptTerminated = (reason: 'return-aborted' | 'return-failed') => {
-            if (!preparedCall) return;
+            if (!preparedCall) return releaseOutcomeHold();
+            // return-aborted follows the call's own end event, which must therefore never wait on this hold.
+            if (reason === 'return-aborted') releaseOutcomeHold();
             const owner = preparedCall;
             // The call's own end event settles first (success or failure; each POST is bounded by the callback timeout), so
             // an HTTP owner never receives return-aborted before it.
@@ -1980,7 +1992,8 @@ export class SipGateway {
                         returnAttemptId,
                         receivedAt: new Date().toISOString()
                     })
-                );
+                )
+                .finally(() => releaseOutcomeHold());
         };
         try {
             const offer = previousRemoteSdp;
@@ -2144,6 +2157,9 @@ export class SipGateway {
                     goneCall.peerDialog = undefined;
                 }
             }
+            // A call that continues holds its owner's later end event behind the outcome POST (an ended call's own end event
+            // precedes return-aborted instead, so it never holds).
+            if (!goneCall) holdOutcomeDelivery();
             // A carrier known ended (its terminal event is still pending) cannot be restored or kept: end the pair now.
             if (this.registry.get(call.callId) === call && call.ownership === 'returning' && call.dialog.isEnded && !call.dialog.isFenced) {
                 await this.byeCall(call, 'return-carrier-ended').catch(() => undefined);
@@ -2187,10 +2203,14 @@ export class SipGateway {
             // attempt), 'return-failed' when the call continues. An owner never offered the return hears nothing.
             const sendOutcome = () => sendAttemptTerminated(this.registry.get(call.callId) !== call ? 'return-aborted' : 'return-failed');
             if (keptReferrer) {
-                await finalNotify();
-                // A no-op when an earlier path already ended the call.
-                if (!switched) this.endIfDialogGone(call, err);
-                sendOutcome();
+                try {
+                    await finalNotify();
+                    // A no-op when an earlier path already ended the call.
+                    if (!switched) this.endIfDialogGone(call, err);
+                    sendOutcome();
+                } finally {
+                    releaseOutcomeHold();
+                }
             } else {
                 // The kept leg is not the referrer: the pair lock does not wait on NOTIFY retries, so they run detached. The
                 // dialog-gone BYE (which ends the referrer too) and the owner's events follow the final NOTIFY inside the same
@@ -2227,6 +2247,16 @@ export class SipGateway {
         } finally {
             releaseMedia();
         }
+    }
+
+    /** Registers a bounded owner delivery that call-level end events (bye/terminated) wait behind; SIP cleanup never waits. */
+    private trackAnsweredDelivery(call: ActiveCall, delivery: Promise<unknown>) {
+        const prior = this.answeredDeliveries.get(call);
+        const tracked = Promise.all([prior, delivery.catch(() => undefined)]).then(() => undefined);
+        this.answeredDeliveries.set(call, tracked);
+        void tracked.then(() => {
+            if (this.answeredDeliveries.get(call) === tracked) this.answeredDeliveries.delete(call);
+        });
     }
 
     private async handleRemoteModify(callId: string, req: IncomingSipRequest, res: SipResponse) {
@@ -2297,12 +2327,7 @@ export class SipGateway {
             // An HTTP owner's answered/transferred POST can still be in flight when the call ends; the call-level end event
             // queues behind it (bounded by the callback deadline) so the owner never sees bye before it. SIP cleanup never waits.
             const delivery = this.dispatchFollowUpEvent(call, event, expectAction);
-            const prior = this.answeredDeliveries.get(call);
-            const tracked = Promise.all([prior, delivery.catch(() => undefined)]).then(() => undefined);
-            this.answeredDeliveries.set(call, tracked);
-            void tracked.then(() => {
-                if (this.answeredDeliveries.get(call) === tracked) this.answeredDeliveries.delete(call);
-            });
+            this.trackAnsweredDelivery(call, delivery);
             return delivery;
         }
         if (!expectAction && (event.event === 'bye' || event.event === 'terminated') && !event.returnAttemptId) {

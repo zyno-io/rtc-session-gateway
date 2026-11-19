@@ -69,3 +69,30 @@ test('oversized and compressed-bomb owner responses are rejected by maxContentLe
         await new Promise(resolve => server.close(resolve));
     }
 });
+
+for (const status of [200, 500]) {
+    test(`discardBody closes the owner connection promptly for a trickling ${status} response (no leaked socket)`, async () => {
+        const closed = Promise.withResolvers<void>();
+        const server = createServer((req, res) => {
+            req.resume();
+            req.on('close', () => undefined);
+            res.writeHead(status, { 'content-type': 'application/json' });
+            res.write('{"a":"');
+            const timer = setInterval(() => res.write('x'), 10);
+            req.socket.on('close', () => {
+                clearInterval(timer);
+                closed.resolve();
+            });
+        });
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+        try {
+            const port = (server.address() as { port: number }).port;
+            const post = new AxiosGatewayHttpClient().postJson(`http://127.0.0.1:${port}/`, {}, 30000, { discardBody: true });
+            if (status === 200) assert.equal(await post, undefined);
+            else await assert.rejects(post, (err: unknown) => err instanceof HttpPostError && err.status === 500);
+            await Promise.race([closed.promise, new Promise((_, reject) => setTimeout(() => reject(new Error('connection leaked')), 2000))]);
+        } finally {
+            await new Promise(resolve => server.close(resolve));
+        }
+    });
+}

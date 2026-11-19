@@ -1048,6 +1048,25 @@ test('a recording.start failing with SESSION_UNRESPONSIVE is reconciled at hando
     assert.deepEqual(stopped, ['ghost-2']);
 });
 
+test('a recording.start failing with protocol_error is reconciled at handoff like a timeout', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    client.startRecording = async () => {
+        client.sessionRecordings = [{ recordingId: 'ghost-3', filePath: 'ghost.pcap', state: 'active' }];
+        throw new RtpbridgeRequestError('rtpbridge protocol error: invalid reply frame', 'protocol_error');
+    };
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeRequestError);
+    const stopped: string[] = [];
+    client.stopRecording = async (recordingId?: string) => {
+        stopped.push(recordingId!);
+        return { filePath: 'ghost.pcap', durationMs: 1, packets: 1 };
+    };
+    await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.deepEqual(stopped, ['ghost-3']);
+});
+
 test('a definitive recording.start error does not mark recording uncertainty', async () => {
     const client = new FakeRtpbridgeClient();
     const service = new MediaSessionService(new FakeMediaServerManager(client) as any);

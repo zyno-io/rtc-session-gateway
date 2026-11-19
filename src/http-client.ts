@@ -28,16 +28,17 @@ export class AxiosGatewayHttpClient implements GatewayHttpClient {
                 signal: controller.signal,
                 maxContentLength: MAX_HTTP_JSON_BYTES,
                 maxBodyLength: MAX_HTTP_JSON_BYTES,
-                ...(options.discardBody ? { responseType: 'stream' as const } : {}),
+                ...(options.discardBody ? { responseType: 'stream' as const, decompress: false } : {}),
                 validateStatus: status => status >= 200 && status < 300
             });
             if (options.discardBody) {
-                (response.data as unknown as { destroy?: () => void })?.destroy?.();
+                destroyExchange(response);
                 return undefined as T;
             }
             return response.data;
         } catch (err) {
             if (isAxiosError(err)) {
+                if (options.discardBody) destroyExchange(err.response);
                 if (expired) {
                     throw new HttpPostError(`HTTP POST ${url} failed`, { cause: err, code: 'ECONNABORTED', status: err.response?.status });
                 }
@@ -52,6 +53,15 @@ export class AxiosGatewayHttpClient implements GatewayHttpClient {
             clearTimeout(timer);
         }
     }
+}
+
+/**
+ * With responseType 'stream' + maxContentLength axios hands back a Readable wrapper: destroying it does not close the real
+ * response, so the underlying ClientRequest (and its socket) is destroyed explicitly.
+ */
+function destroyExchange(response: { data?: unknown; request?: unknown } | undefined) {
+    (response?.data as { destroy?: () => void } | undefined)?.destroy?.();
+    (response?.request as { destroy?: () => void } | undefined)?.destroy?.();
 }
 
 export class HttpPostError extends Error {

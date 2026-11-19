@@ -506,9 +506,11 @@ export class MediaSessionService implements GatewayMediaController {
                 filePath
             });
         } catch (err) {
-            // SESSION_UNRESPONSIVE means rtpbridge's own reply deadline expired; the worker may still have installed it.
+            // SESSION_UNRESPONSIVE means rtpbridge's own reply deadline expired; protocol_error means the reply was unreadable. Either way
+            // the worker may still have installed it.
             const unknownOutcome =
-                err instanceof RtpbridgeTimeoutError || (err instanceof RtpbridgeRequestError && err.code === 'SESSION_UNRESPONSIVE');
+                err instanceof RtpbridgeTimeoutError ||
+                (err instanceof RtpbridgeRequestError && (err.code === 'SESSION_UNRESPONSIVE' || err.code === 'protocol_error'));
             if (unknownOutcome && this.sessions.get(sessionId) === session) this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
             throw err;
         }
