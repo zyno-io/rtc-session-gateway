@@ -1,8 +1,29 @@
+import { randomUUID } from 'node:crypto';
+
 import type { NativeDialog } from './sipbridge-signaling';
 
 import { normalizeCallId } from './call-id';
+import type { SipCallOwnership, SipTransferStatus } from './sip-handoff-contract';
+import type { ReplacesIdentity } from './sip-sdp';
 
 export interface ActiveCall {
+    logicalCallId?: string;
+    ownership?: SipCallOwnership;
+    transfer?: SipTransferStatus;
+    /** Bounded record of earlier finished transfers (oldest first), so a delayed retry of an old transferId never dials again. */
+    finishedTransfers?: SipTransferStatus[];
+    /** Every transfer ID admitted on this call (bounded); a retried ID whose result was evicted is refused, never dialed. */
+    admittedTransferIds?: Set<string>;
+    /** Destination dialog of a handed-off call; the primary `dialog` stays the original leg. */
+    peerDialog?: NativeDialog;
+    /** Observed source IP of `dialog` (inbound legs) and, when only the configured destination is known, its host. */
+    remoteAddress?: string;
+    remoteHost?: string;
+    /** Same for `peerDialog`; an outbound leg has no observed source, so its configured destination host is the fallback. */
+    peerAddress?: string;
+    peerHost?: string;
+    /** Addresses the destination host resolved to when the handoff committed. */
+    peerAddresses?: string[];
     callId: string;
     sipCallId: string;
     routeUrl: string;
@@ -21,6 +42,9 @@ export interface ActiveCall {
 export type ActiveCallSnapshot = Pick<
     ActiveCall,
     | 'callId'
+    | 'logicalCallId'
+    | 'ownership'
+    | 'transfer'
     | 'sipCallId'
     | 'routeUrl'
     | 'receiverUrl'
@@ -56,6 +80,8 @@ export class CallRegistry {
     }
 
     activate(call: ActiveCall) {
+        call.logicalCallId ??= randomUUID();
+        call.ownership ??= 'application';
         this.releaseReservation(call.callId);
         this.calls.set(call.callId, call);
         return call;
@@ -63,6 +89,23 @@ export class CallRegistry {
 
     get(callId: string) {
         return this.calls.get(callId);
+    }
+
+    /** Finds a live dialog by exact Call-ID and tags; `toTag` is this gateway's tag, `fromTag` the remote's. */
+    findDialog(identity: ReplacesIdentity) {
+        for (const call of this.calls.values()) {
+            for (const dialog of [call.dialog, call.peerDialog]) {
+                if (
+                    dialog &&
+                    !dialog.isEnded &&
+                    dialog.sipCallId === identity.callId &&
+                    dialog.localTag === identity.toTag &&
+                    dialog.remoteTag === identity.fromTag
+                )
+                    return { call, dialog };
+            }
+        }
+        return undefined;
     }
 
     list() {
@@ -99,6 +142,17 @@ export class CallRegistry {
 }
 
 export function snapshotCall(call: ActiveCall): ActiveCallSnapshot {
-    const { dialog: _dialog, ...snapshot } = call;
+    const {
+        dialog: _dialog,
+        peerDialog: _peerDialog,
+        remoteAddress: _remoteAddress,
+        remoteHost: _remoteHost,
+        peerAddress: _peerAddress,
+        peerHost: _peerHost,
+        peerAddresses: _peerAddresses,
+        finishedTransfers: _finishedTransfers,
+        admittedTransferIds: _admittedTransferIds,
+        ...snapshot
+    } = call;
     return snapshot;
 }

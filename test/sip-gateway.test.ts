@@ -8,6 +8,7 @@ import type { SipbridgeSignaling, NativeDialog, SipResponse } from '../src/sipbr
 import type { GatewayHttpClient } from '../src/http-client';
 import { ControlHub } from '../src/control-hub';
 import { GatewayLifecycle } from '../src/gateway-lifecycle';
+import { loadFirewallConfig, SipFirewall } from '../src/sip-firewall';
 
 class Dialog extends EventEmitter {
     sipCallId = 'outbound@example.com';
@@ -184,7 +185,8 @@ test('native outbound parameters and cancellation remain bound to the initiating
     await assert.rejects(gateway.cancelOutbound('attempt', 'owner-b'), /another control connection/);
     await gateway.cancelOutbound('attempt', 'owner-a');
     await failed;
-    assert.equal(cancellations, 1);
+    // The app's cancel plus the failure-path CANCEL: a second CANCEL on a finished attempt is harmless and covers a refused first one.
+    assert.equal(cancellations, 2);
 });
 test('drain rejects new SIP admission while preserving retained dialog commands', async () => {
     const registry = new CallRegistry();
@@ -213,4 +215,64 @@ test('drain rejects new SIP admission while preserving retained dialog commands'
     await gateway.bye('abc@example.com');
     await draining;
     assert.equal(dialog.byes, 1);
+});
+
+test('firewall route misses are not scored without connected owners or shortly after an owner disconnects', () => {
+    const message = (uri: string) => ({ method: 'INVITE', uri, headers: [] }) as never;
+    const source = { ip: '192.0.2.7', port: 5060, transport: 'udp' };
+    const setup = (routes: string, mode = 'enforce') => {
+        const firewall = new SipFirewall(
+            loadFirewallConfig({ SIP_FIREWALL_MODE: mode, SIP_FIREWALL_THRESHOLD: '100', SIP_FIREWALL_ROUTE_GRACE_MS: '1000' })
+        );
+        const hub = new ControlHub(1000);
+        const signaling = new EventEmitter() as unknown as SipbridgeSignaling;
+        const gateway = new SipGateway(
+            loadConfig({ ROUTES_JSON: routes, SIP_ALLOWED_DOMAINS_JSON: '["localhost"]' }),
+            new CallRegistry(),
+            http([]),
+            signaling,
+            hub,
+            undefined,
+            { firewall }
+        );
+        const admit = (uri = 'sip:nobody@localhost') =>
+            (gateway as unknown as { admitRoute(m: never, s: typeof source): number | undefined }).admitRoute(message(uri), source);
+        return { firewall, hub, gateway, admit, signaling: signaling as unknown as { routePolicy?: unknown } };
+    };
+    const socket = () => Object.assign(new EventEmitter(), { close() {}, send() {} }) as never;
+    // Control routing with no owner connected: 404, unscored.
+    let t = setup('[]');
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 0);
+    // An outbound-only connection (no routes) is not an owner: still unscored.
+    const outbound = t.hub.registerConnection(socket());
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 0);
+    // Owner connected and settled: scored.
+    const id = t.hub.registerConnection(socket());
+    t.hub.setRoutes(id, [{ match: 'exact', value: 'support' }]);
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 1);
+    // Owner disconnects while the outbound-only connection stays: unscored (no owner, then within grace).
+    t.hub.unregisterConnection(id);
+    assert.equal(t.hub.size, 1);
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 1);
+    // A returning owner is unscored within the grace window.
+    const again = t.hub.registerConnection(socket());
+    t.hub.setRoutes(again, [{ match: 'exact', value: 'support' }]);
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 1);
+    t.hub.unregisterConnection(outbound);
+    // Unknown host is always scored.
+    t = setup('[]');
+    assert.equal(t.admit('sip:x@evil.example'), 404);
+    assert.equal(t.firewall.counters.observations, 1);
+    // Static routes only: scored without owners.
+    t = setup('[{"match":"exact","value":"support","url":"https://owner.test/sip"}]');
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 1);
+    // Mode off installs no admission-time route check.
+    t = setup('[]', 'off');
+    assert.equal(t.signaling.routePolicy, undefined);
 });

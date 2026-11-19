@@ -123,6 +123,15 @@ export interface CreateMediaSessionParams {
 }
 
 export interface GatewayMediaController {
+    /** Returns the id of the RTP endpoint carrying `sourceSdp`, when one is given. */
+    assertHandoffMedia?(sessionId: string, ownerConnectionId?: string, sourceSdp?: string, sourceEndpointId?: string): string | undefined | void;
+    prepareHandoff?(
+        sessionId: string,
+        ownerConnectionId: string | undefined,
+        token: object,
+        source?: { endpointId?: string; sdp: string }
+    ): Promise<import('./sip-handoff-contract').FinalizedSipRecording[]>;
+    releaseHandoff?(sessionId: string, token: object): void;
     list(): MediaSessionSnapshot[];
     get(sessionId: string): MediaSessionSnapshot | undefined;
     createSession(params?: CreateMediaSessionParams): Promise<MediaSessionSnapshot>;
@@ -136,7 +145,10 @@ export interface GatewayMediaController {
     createRtpFromOffer(sessionId: string, params: { sdp: string; direction?: string }): Promise<{ endpointId: string; sdpAnswer: string }>;
     acceptRtpAnswer(endpointId: string, params: { sdp: string }): Promise<{ ok: true }>;
     rtpReinvite(endpointId: string, params: { sdp: string }): Promise<{ sdpAnswer: string }>;
-    play(sessionId: string, params: { source: string; loopCount?: number | null; cacheTtlSecs?: number; headers?: Record<string, string> }): Promise<{ endpointId: string }>;
+    play(
+        sessionId: string,
+        params: { source: string; loopCount?: number | null; cacheTtlSecs?: number; headers?: Record<string, string> }
+    ): Promise<{ endpointId: string }>;
     playAndWait(sessionId: string, params: PlayAndWaitParams): Promise<{ played: boolean }>;
     stopMedia(endpointId: string): Promise<{ ok: true }>;
     updateDirection(endpointId: string, direction: 'sendrecv' | 'recvonly' | 'sendonly' | 'inactive'): Promise<{ ok: true }>;
@@ -146,8 +158,13 @@ export interface GatewayMediaController {
     playAndGather(sessionId: string, params: PlayAndGatherParams): Promise<GatherResult & { playbackEndpointId?: string }>;
     leaveMessage(sessionId: string, params: LeaveMessageParams): Promise<LeaveMessageResult>;
     injectDtmf(endpointId: string, digit: string): Promise<{ ok: true }>;
-    startRecording(sessionId: string, params: { endpointId?: string; filePath?: string }): Promise<{ recordingId: string; backendId?: string; filePath: string; recordingPath: string; downloadPath: string }>;
-    stopRecording(recordingId: string): Promise<{ filePath: string; durationMs: number; packets: number; backendId?: string; recordingPath: string; downloadPath: string }>;
+    startRecording(
+        sessionId: string,
+        params: { endpointId?: string; filePath?: string }
+    ): Promise<{ recordingId: string; backendId?: string; filePath: string; recordingPath: string; downloadPath: string }>;
+    stopRecording(
+        recordingId: string
+    ): Promise<{ filePath: string; durationMs: number; packets: number; backendId?: string; recordingPath: string; downloadPath: string }>;
     listRecordings(params?: { backendId?: string; startsWith?: string; skip?: number; limit?: number }): Promise<RecordingListResult>;
     downloadRecording(backendId: string, recordingPath: string): Promise<RecordingDownloadResult>;
     mergeRecordings(targets: RecordingMergeTarget[]): Promise<RecordingDownloadResult>;

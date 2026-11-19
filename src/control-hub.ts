@@ -41,6 +41,8 @@ export class ControlHub extends EventEmitter {
     private logger = BaseLogger.child({ ns: 'ControlHub' });
     private connections = new Map<string, ControlConnection>();
     private pending = new Map<string, PendingRequest>();
+    private routeOwnersSeen = false;
+    private routeOwnerLossAt = 0;
 
     constructor(private requestTimeoutMs: number) {
         super();
@@ -56,6 +58,7 @@ export class ControlHub extends EventEmitter {
         });
         ws.on('close', () => this.removeConnection(id));
         ws.on('error', err => this.logger.warn({ err, connectionId: id }, 'Control connection error'));
+        this.emit('connection', id);
         return id;
     }
 
@@ -71,6 +74,8 @@ export class ControlHub extends EventEmitter {
             url: `control://${connectionId}`
         }));
         this.assertRoutesAvailable(connectionId, nextRoutes);
+        if (nextRoutes.length > 0) this.routeOwnersSeen = true;
+        else if (connection.routes.length > 0) this.routeOwnerLossAt = Date.now();
         connection.routes = nextRoutes;
         return connection.routes;
     }
@@ -81,6 +86,32 @@ export class ControlHub extends EventEmitter {
             if (route) return { connectionId: connection.id, route };
         }
         return undefined;
+    }
+
+    /**
+     * True while `connectionId` is the connection that currently wins the route for the destination and its WebSocket is
+     * still OPEN: a closing socket can no longer terminate a call committed to it.
+     */
+    holdsRoute(connectionId: string, destination: InviteDestination) {
+        const connection = this.connections.get(connectionId);
+        return !!connection && connection.ws.readyState === WebSocket.OPEN && this.findRoute(destination)?.connectionId === connectionId;
+    }
+
+    /** Connections that currently hold inbound routes; an outbound-only connection is not one. */
+    get routeOwnerCount() {
+        let count = 0;
+        for (const connection of this.connections.values()) if (connection.routes.length > 0) count++;
+        return count;
+    }
+
+    /** True once any connection has registered inbound routes. */
+    get hasHadRouteOwner() {
+        return this.routeOwnersSeen;
+    }
+
+    /** Epoch ms when a connection that held routes last lost them (disconnect or cleared); 0 if never. */
+    get lastRouteOwnerLossAt() {
+        return this.routeOwnerLossAt;
     }
 
     get routeCount() {
@@ -231,6 +262,7 @@ export class ControlHub extends EventEmitter {
         const connection = this.connections.get(connectionId);
         if (!connection) return;
         this.connections.delete(connectionId);
+        if (connection.routes.length > 0) this.routeOwnerLossAt = Date.now();
         for (const [id, pending] of this.pending) {
             if (pending.connectionId !== connectionId) continue;
             this.pending.delete(id);

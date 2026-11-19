@@ -2,6 +2,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { decodeSipbridgeFrame, encodeSipbridgeFrame } from '../src/sipbridge/codec';
+import {
+    isTerminalCommand,
+    NON_TERMINAL_COMMAND_LIMIT,
+    SipbridgeControlClient,
+    SipbridgeControlNotSentError,
+    TERMINAL_COMMAND_RESERVE
+} from '../src/sipbridge/client';
+import { SIPBRIDGE_COMMAND_BUDGET_CAPABILITY, SIPBRIDGE_STAGING_CAPABILITY } from '../src/sipbridge/codec';
 import { Envelope } from '../src/sipbridge/generated/sipbridge-control';
 import { NativeOperationError } from '../src/sipbridge-signaling';
 import { controlErrorForCommand } from '../src/session-commands';
@@ -131,4 +139,43 @@ test('reconnect retires only an ended snapshot or exact current-authority absenc
     ended.setResult({ certainty: 3, error: '', snapshot: { ...ended.snapshot, ended: true, revision: 2n } });
     await ended.inspect();
     assert.equal(ended.state.ended, true);
+});
+
+test('ACK, BYE and CANCEL commands are terminal and draw on the reserved control capacity', () => {
+    const command = (action: unknown) => ({ $case: 'command', command: { action } }) as never;
+    assert.equal(isTerminalCommand(command({ $case: 'cancel', cancel: {} })), true);
+    for (const method of ['ACK', 'bye']) assert.equal(isTerminalCommand(command({ $case: 'dialogRequest', dialogRequest: { method } })), true);
+    for (const method of ['INVITE', 'NOTIFY', 'UPDATE'])
+        assert.equal(isTerminalCommand(command({ $case: 'dialogRequest', dialogRequest: { method } })), false);
+    assert.equal(isTerminalCommand({ $case: 'inspect', inspect: {} } as never), false);
+    assert.ok(TERMINAL_COMMAND_RESERVE > 0 && TERMINAL_COMMAND_RESERVE <= 32, 'the reserve stays small and bounded');
+});
+
+test('the 49th concurrent non-terminal command is refused locally while a BYE still goes through', async () => {
+    const client = Object.create(SipbridgeControlClient.prototype) as any;
+    const sent: string[] = [];
+    Object.assign(client, {
+        ack: { capabilities: [SIPBRIDGE_STAGING_CAPABILITY, SIPBRIDGE_COMMAND_BUDGET_CAPABILITY], sipbridge: {} },
+        session: 'session',
+        pending: new Map(),
+        expired: new Map(),
+        send: async (envelope: { correlationId: string }) => void sent.push(envelope.correlationId)
+    });
+    const command = (method: string) => ({ $case: 'command', command: { action: { $case: 'dialogRequest', dialogRequest: { method } } } }) as never;
+    assert.equal(NON_TERMINAL_COMMAND_LIMIT, 48);
+    const hung = Array.from({ length: NON_TERMINAL_COMMAND_LIMIT }, () => {
+        const result = client.request(command('INVITE'), 5000) as Promise<unknown>;
+        result.catch(() => undefined);
+        return result;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent.length, NON_TERMINAL_COMMAND_LIMIT);
+    await assert.rejects(client.request(command('NOTIFY'), 5000), SipbridgeControlNotSentError);
+    assert.equal(sent.length, NON_TERMINAL_COMMAND_LIMIT, 'the refused command was never written');
+    const bye = client.request(command('BYE'), 5000) as Promise<unknown>;
+    bye.catch(() => undefined);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sent.length, NON_TERMINAL_COMMAND_LIMIT + 1);
+    for (const entry of client.pending.values()) clearTimeout(entry.timer);
+    void hung;
 });

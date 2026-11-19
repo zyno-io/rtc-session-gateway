@@ -1,5 +1,5 @@
-node_modules
-dist
+**/node_modules
+**/dist
 docs/.vitepress/dist
 .git
 .serena
@@ -11,3 +11,5 @@ coverage
 .e2e
 .e2e-fixtures-*
 e2e-artifacts
+var
+.working

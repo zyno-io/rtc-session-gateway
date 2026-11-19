@@ -14,8 +14,6 @@ import {
     isSipbridgeReference,
     isSipbridgeStateAuthority,
     SIPBRIDGE_COMMAND_BUDGET_CAPABILITY,
-    SIPBRIDGE_COMPLETION_RELAY_CAPABILITY,
-    SIPBRIDGE_DIRECTORY_RECONCILE_CAPABILITY,
     SIPBRIDGE_MAX_ENVELOPE_BYTES,
     SIPBRIDGE_NATIVE_COMPLETION_CAPABILITY,
     SIPBRIDGE_LOCAL_CHALLENGE_CAPABILITY,
@@ -86,6 +84,9 @@ export interface SipbridgeControlDeadlineDiagnostic {
     callIdHash?: string;
 }
 
+/** A request that failed local checks before anything was written; its outcome is definitely "not sent". */
+export class SipbridgeControlNotSentError extends Error {}
+
 /** Local diagnostics only; the request's outcome remains unknown. */
 export class SipbridgeControlDeadlineError extends Error {
     readonly diagnostic: Readonly<SipbridgeControlDeadlineDiagnostic>;
@@ -107,6 +108,24 @@ export class SipbridgeControlDeadlineError extends Error {
     }
 }
 
+export const TERMINAL_COMMAND_RESERVE = 16;
+/**
+ * Most in-flight non-terminal commands per sipbridge peer. sipbridge's engine runs at most 64 commands at once
+ * (`work: make(chan struct{}, 64)`; a full engine answers NOT_ACCEPTED immediately) and each one holds its slot until it
+ * completes or its 40 s budget expires, so capping ordinary commands below that leaves slots for ACK, BYE and CANCEL.
+ */
+export const NON_TERMINAL_COMMAND_LIMIT = 48;
+
+/** True for commands that finish a dialog obligation: ACK, BYE and CANCEL. */
+export function isTerminalCommand(payload: NonNullable<Envelope['payload']>): boolean {
+    if (payload.$case !== 'command') return false;
+    const action = payload.command.action;
+    if (action?.$case === 'cancel') return true;
+    if (action?.$case !== 'dialogRequest') return false;
+    const method = action.dialogRequest.method.toUpperCase();
+    return method === 'ACK' || method === 'BYE';
+}
+
 function controlContext(payload: NonNullable<Envelope['payload']>): ContextRef | undefined {
     switch (payload.$case) {
         case 'command':
@@ -117,14 +136,8 @@ function controlContext(payload: NonNullable<Envelope['payload']>): ContextRef |
             return payload.inspect.context;
         case 'flowAdoption':
             return payload.flowAdoption.context;
-        case 'reconcileContext':
-            return payload.reconcileContext.context;
-        case 'reconcileAuthority':
-            return payload.reconcileAuthority.snapshot?.context;
-        case 'authorityReceipt':
-            return payload.authorityReceipt.context;
-        case 'retireAuthority':
-            return payload.retireAuthority.context;
+        case 'requestDecision':
+            return payload.requestDecision.context;
         default:
             return undefined;
     }
@@ -144,7 +157,10 @@ export class SipbridgeControlClient {
     private pendingWrites = 0;
     private stopped = false;
     private stopReason: SipbridgeControlCloseReason | undefined;
-    private readonly pending = new Map<string, { resolve: (value: Envelope) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+    private readonly pending = new Map<
+        string,
+        { resolve: (value: Envelope) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; nonTerminalCommand: boolean }
+    >();
     private readonly expired = new Map<string, number>();
     private readonly helloId = randomUUID();
 
@@ -183,9 +199,6 @@ export class SipbridgeControlClient {
         const bound = options.maxEnvelopeBytes ?? SIPBRIDGE_MAX_ENVELOPE_BYTES;
         const timeout = options.helloTimeoutMs ?? 5000;
         if (
-            (hasSipbridgeStateCapability(options.capabilities) &&
-                (!options.capabilities?.includes(SIPBRIDGE_DIRECTORY_RECONCILE_CAPABILITY) ||
-                    !options.capabilities?.includes(SIPBRIDGE_COMPLETION_RELAY_CAPABILITY))) ||
             !isSipbridgeProcess(options.process) ||
             options.connectionAttempt <= 0n ||
             options.connectionAttempt > 0xffffffffffffffffn ||
@@ -247,7 +260,7 @@ export class SipbridgeControlClient {
                     payload: {
                         $case: 'hello',
                         hello: {
-                            nexus: this.options.process,
+                            controller: this.options.process,
                             connectionAttempt: this.options.connectionAttempt,
                             major: 1,
                             minMinor: 0,
@@ -292,10 +305,7 @@ export class SipbridgeControlClient {
             ack.major !== 1 ||
             ack.minor !== 0 ||
             ack.capabilities.some(value => !(this.options.capabilities ?? []).includes(value)) ||
-            (hasSipbridgeStateCapability(ack.capabilities) &&
-                (!isSipbridgeStateAuthority(ack.stateAuthority) ||
-                    !ack.capabilities.includes(SIPBRIDGE_DIRECTORY_RECONCILE_CAPABILITY) ||
-                    !ack.capabilities.includes(SIPBRIDGE_COMPLETION_RELAY_CAPABILITY))) ||
+            (hasSipbridgeStateCapability(ack.capabilities) && !isSipbridgeStateAuthority(ack.stateAuthority)) ||
             !ack.bounds ||
             !Number.isInteger(ack.bounds.maxEnvelopeBytes) ||
             ack.bounds.maxEnvelopeBytes < 512 ||
@@ -317,7 +327,7 @@ export class SipbridgeControlClient {
                 lease.application.epoch !== this.options.process.epoch ||
                 !isSipbridgeStateAuthority(lease.authority) ||
                 !ack.stateAuthority ||
-                ack.stateAuthority.schemaVersion !== 2 ||
+                ack.stateAuthority.schemaVersion !== 1 ||
                 lease.authority.service !== ack.stateAuthority.service ||
                 lease.authority.generation !== ack.stateAuthority.generation ||
                 lease.authority.primaryId !== ack.stateAuthority.primaryId ||
@@ -354,18 +364,8 @@ export class SipbridgeControlClient {
             this.pendingHeartbeat = undefined;
             return;
         }
-        if (
-            ['reconcileContext', 'reconcileAuthority', 'authorityReceipt'].includes(payload?.$case ?? '') &&
-            !hasSipbridgeStateCapability(this.ack?.capabilities)
-        )
-            throw new Error('state protocol not negotiated');
         if (this.ack?.capabilities.includes(SIPBRIDGE_STAGING_CAPABILITY)) {
-            if (
-                payload?.$case === 'result' ||
-                payload?.$case === 'delivery' ||
-                payload?.$case === 'routeResult' ||
-                payload?.$case === 'authorityReceipt'
-            ) {
+            if (payload?.$case === 'result' || payload?.$case === 'delivery' || payload?.$case === 'routeResult') {
                 const pending = this.pending.get(envelope.correlationId);
                 if (pending) {
                     clearTimeout(pending.timer);
@@ -420,12 +420,18 @@ export class SipbridgeControlClient {
     }
 
     private async send(envelope: Envelope): Promise<void> {
-        if (this.stopped || this.socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('sipbridge session closed'));
-        const frame = encodeSipbridgeFrame(envelope, this.bound);
+        if (this.stopped || this.socket.readyState !== WebSocket.OPEN)
+            return Promise.reject(new SipbridgeControlNotSentError('sipbridge session closed'));
+        let frame: string;
+        try {
+            frame = encodeSipbridgeFrame(envelope, this.bound);
+        } catch (error) {
+            throw new SipbridgeControlNotSentError(error instanceof Error ? error.message : 'invalid sipbridge frame');
+        }
         // No application queue: session control messages are small and bounded.
         if (this.pendingWrites >= 256 || this.socket.bufferedAmount + Buffer.byteLength(frame) > 1024 * 1024) {
             this.stop('write-capacity');
-            return Promise.reject(new Error('sipbridge write capacity'));
+            return Promise.reject(new SipbridgeControlNotSentError('sipbridge write capacity'));
         }
         this.pendingWrites++;
         try {
@@ -446,18 +452,24 @@ export class SipbridgeControlClient {
     }
 
     async request(payload: NonNullable<Envelope['payload']>, budgetMs = sipbridgeOperationBudget(payload)): Promise<Envelope> {
-        if (!this.ack?.capabilities.includes(SIPBRIDGE_STAGING_CAPABILITY)) throw new Error('application protocol not negotiated');
-        if (
-            ['reconcileContext', 'reconcileAuthority', 'authorityReceipt'].includes(payload.$case) &&
-            !hasSipbridgeStateCapability(this.ack.capabilities)
-        )
-            throw new Error('state protocol not negotiated');
+        if (!this.ack?.capabilities.includes(SIPBRIDGE_STAGING_CAPABILITY))
+            throw new SipbridgeControlNotSentError('application protocol not negotiated');
         if (budgetMs > 2000 && !this.ack.capabilities.includes(SIPBRIDGE_COMMAND_BUDGET_CAPABILITY))
-            throw new Error('extended command budget not negotiated');
+            throw new SipbridgeControlNotSentError('extended command budget not negotiated');
         if (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > sipbridgeOperationBudget(payload))
-            throw new Error('invalid control operation budget');
+            throw new SipbridgeControlNotSentError('invalid control operation budget');
         for (const [id, until] of this.expired) if (until <= performance.now()) this.expired.delete(id);
-        if (this.pending.size >= 128 || this.expired.size >= 1024) throw new Error('control operation capacity');
+        // ACK, BYE and CANCEL end or complete dialogs; a small reserve keeps them sendable when ordinary commands fill the limit.
+        const terminal = isTerminalCommand(payload);
+        const reserve = terminal ? TERMINAL_COMMAND_RESERVE : 0;
+        const nonTerminalCommand = payload.$case === 'command' && !terminal;
+        if (nonTerminalCommand) {
+            let inFlight = 0;
+            for (const entry of this.pending.values()) if (entry.nonTerminalCommand) inFlight++;
+            if (inFlight >= NON_TERMINAL_COMMAND_LIMIT) throw new SipbridgeControlNotSentError('control operation capacity');
+        }
+        if (this.pending.size >= 128 + reserve || this.expired.size >= 1024 + reserve)
+            throw new SipbridgeControlNotSentError('control operation capacity');
         const id = randomUUID();
         const startedAt = performance.now();
         const context = controlContext(payload);
@@ -482,7 +494,7 @@ export class SipbridgeControlClient {
                     })
                 );
             }, budgetMs);
-            this.pending.set(id, { resolve, reject, timer });
+            this.pending.set(id, { resolve, reject, timer, nonTerminalCommand });
         });
         // A session can close while its write callback is still pending. Observe rejection immediately.
         void result.catch(() => undefined);

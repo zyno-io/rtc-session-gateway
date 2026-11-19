@@ -18,6 +18,23 @@ file supplies endpoint metadata; it does not proxy control or grant call ownersh
   protocol authority; cached snapshots are command references, not a second FSM.
 - `sip-gateway.ts`: owner routing, inbound policy, the outbound API, the call
   registry, application events and cleanup. It delegates SIP semantics to sipbridge.
+- `sip-sdp.ts`, `sip-handoff-contract.ts`: pure SDP relay, `Replaces`/`Refer-To`
+  parsing and the public handoff contract. In `sip-gateway.ts`, `transfer()`
+  dials a late-offer destination, cuts the carrier over and then relays between two
+  `NativeDialog`s (offerless re-INVITE answers arrive through sipbridge's
+  `sip.reinvite-ack.v1`). The registry links the legs as one logical call; a leg
+  with an uncertain native outcome is fenced and never commanded again. See the
+  [handoff design](docs/development/sip-handoff-plan.md).
+- `sip-firewall.ts`, `firewall-*.ts`: in-memory abuse score and block list, the
+  operator/snapshot API and the optional snapshot publisher. `sip-gateway.ts`
+  installs a source policy that sipbridge's request-decision path runs for each
+  fresh request (banned source 403; unscored 503 when not admitting; scored 404
+  for unknown host or unrouted INVITE). Sources are the flow addresses sipbridge
+  observed.
+- `firewall-sidecar/`: separate image (nftables-napi is AGPL-3.0-only and is never
+  in the gateway) sharing sipbridge's dedicated network namespace. It applies
+  complete snapshots through nftables; `FIREWALL_PROTECTED_CIDRS` keeps the gateway
+  and probe ranges reachable. One gateway publishes to one sidecar.
 - Control/HTTP and media components keep their existing public API ownership.
 
 ## Admission and retention
@@ -30,13 +47,19 @@ connected, reconciled session to a fresh entry with `acceptNew=true`.
 
 When the signaling section expires or an entry disappears, new calls are refused.
 Sessions that still carry calls stay open until those calls end; sessions with no
-retained calls are closed. Retained work stays pinned to its original state
-authority, lease term and RTC process. If a reconnect reports a different state
-authority or lease term, RTC ends the affected local contexts and never migrates
-calls or replays commands to the new authority.
+retained calls are closed. Work is pinned to its original state authority, lease
+term and RTC process. With Memory sipbridge, losing an established control session
+expires that session's application term and sipbridge ends all of its calls
+([memory-core](https://github.com/zyno-io/sipbridge/blob/main/docs/memory-core.md)
+on control-session disconnect). RTC therefore ends every call it holds on that
+sipbridge as soon as the session closes, and a reconnect admits only fresh calls
+under a new term. Lifecycle events of an earlier term that sipbridge redelivers to
+the new session are acknowledged and ignored; per-message errors never close the
+session, because a close ends every call. RTC never migrates calls or replays
+commands to a new authority or term.
 
-Before readmitting new calls, a reconnect inspects retained contexts with at most
-eight concurrent reads. Only an owned ended snapshot or a retirement proof from the
+A reconnect still inspects any context that remains locally, with at most eight
+concurrent reads. Only an owned ended snapshot or a retirement proof from the
 current authority retires a call; a lookup failure or absence without proof
 leaves it fenced. Inspection never clears an uncertain-mutation fence.
 
@@ -56,7 +79,10 @@ key and CA files are re-read for each new connection. The negotiated sipbridge
 instance ID must equal the catalog entry ID. Framing is strict text JSON
 preserving uint64 strings, bytes, oneofs and size bounds; compression and redirects
 are disabled. Heartbeats, pending RPCs, write buffers, event receipts and reconnect
-backoff are bounded. An unknown peer message fails the session.
+backoff are bounded; a full receipt table evicts its oldest receipts. Transport
+violations (bad framing, a wrong-direction message, a mismatched heartbeat or
+result) fail the session. An unsupported or invalid application message is dropped
+without closing it, since closing ends every call of the session's term.
 
 `/healthz` is process-local. `/readyz` requires an admitting native session (as
 above) and a non-draining lifecycle, plus admitting media when `RTPBRIDGE_REQUIRED`
@@ -69,7 +95,9 @@ owner WebSockets stay connected during drain.
 ## Public integration boundary
 
 RTC's runtime dependencies are sipbridge native control, rtpbridge media/recording
-APIs and application-owner HTTP or WebSocket connections. It imports no
+APIs and application-owner HTTP or WebSocket connections. The optional firewall
+adds one outbound HTTPS push from the gateway to its sidecar receiver and no
+other runtime dependency. It imports no
 product-specific backend package and calls no registry or tunnel service. The
 catalog file is a deployment input: an operator, supervisor or optional discovery
 publisher can write it, and RTC never uses that publisher's credentials.
@@ -77,7 +105,7 @@ Deployment charts, registry access and product-specific adapters belong to the
 consuming deployment.
 
 The contract receipt in `dependencies/` pins the schema distributed by sipbridge and
-the generated bindings matching its published receipt. The wire field `hello.nexus`
+the generated bindings matching its published receipt. The wire field `hello.controller`
 names the calling application process; it does not identify an external service.
 
 ## Evidence

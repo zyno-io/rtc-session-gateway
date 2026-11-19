@@ -7,6 +7,11 @@ const base64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const invalidUnicode = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
+/** True when the string has no unpaired surrogates (the native frame encoder rejects those). */
+export function isWellFormedSipbridgeString(value: string): boolean {
+    return !invalidUnicode.test(value);
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -70,7 +75,7 @@ function validateScalar(value: unknown, field: JsonField): void {
     throw new Error(`invalid sipbridge JSON ${field.kind} field`);
 }
 
-export function validateSipbridgeJson(value: unknown, name = '.zyno.sipbridge.v1.Envelope'): void {
+export function validateSipbridgeJson(value: unknown, name = '.sipbridge.control.v1.Envelope'): void {
     if (!isObject(value)) throw new Error('sipbridge JSON message must be an object');
     const message = SIPBRIDGE_JSON_MESSAGES[name];
     if (!message) throw new Error('unknown sipbridge JSON message');

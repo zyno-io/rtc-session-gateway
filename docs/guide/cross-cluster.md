@@ -20,6 +20,17 @@ config map, a supervisor or an optional discovery publisher. RTC only reads the
 file; it never contacts the publisher's registries or uses its credentials. Local
 Compose writes the catalog itself and runs with sipbridge and rtpbridge alone.
 
+## Optional SIP firewall publication
+
+| Path                                    | Transport                                                       | Requires                                                                                                                                      |
+| --------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Gateway to firewall receiver (optional) | HTTPS push of complete firewall snapshots, bearer-authenticated | A reachable receiver in sipbridge's dedicated network namespace, a CA the gateway trusts and `FIREWALL_PROTECTED_CIDRS` covering the gateway. |
+
+The gateway initiates this connection; the sidecar never connects back. See the
+[SIP firewall guide](./sip-firewall.md). A deployment adapter may instead read
+`GET /firewall/snapshot` with the read-only token and forward the unchanged JSON to
+the receiver.
+
 ## Endpoint catalog and identity
 
 Set `RTC_ENDPOINTS_FILE` to an atomically replaced catalog v2. Download the
@@ -65,7 +76,10 @@ drain.
 Native contexts are bound to sipbridge's state authority, RTC's process epoch and
 the application lease term. Reconnects use a higher connection attempt and never
 replay mutations. A sipbridge state-authority change, such as a restart with
-memory state, ends the old contexts. Unknown outcomes return `SIGNALING_UNKNOWN`
+memory state, ends the old contexts. With memory-state sipbridge, losing the
+control session also ends every call this gateway process holds on that sipbridge
+(it expires the session's term and sends BYE), so cross-cluster links must keep that session stable.
+Unknown outcomes return `SIGNALING_UNKNOWN`
 and must not be replayed; an unavailable session returns `SIGNALING_UNAVAILABLE`.
 Drain refuses new work and keeps retained native and media sessions until the
 configured deadline. See [operations](./operations.md).

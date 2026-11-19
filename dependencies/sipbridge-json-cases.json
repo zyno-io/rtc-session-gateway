@@ -2,7 +2,7 @@
     {
         "name": "hello maximum uint64",
         "valid": true,
-        "json": "{\"correlationId\":\"case\",\"hello\":{\"nexus\":{\"instanceId\":\"nexus\",\"epoch\":\"epoch\"},\"connectionAttempt\":\"18446744073709551615\",\"major\":1,\"bounds\":{\"maxEnvelopeBytes\":4096}}}"
+        "json": "{\"correlationId\":\"case\",\"hello\":{\"controller\":{\"instanceId\":\"controller\",\"epoch\":\"epoch\"},\"connectionAttempt\":\"18446744073709551615\",\"major\":1,\"bounds\":{\"maxEnvelopeBytes\":4096}}}"
     },
     {
         "name": "optional unknown fields",
@@ -12,7 +12,7 @@
     {
         "name": "binary payload and counter",
         "valid": true,
-        "json": "{\"correlationId\":\"case\",\"write\":{\"wire\":\"AP+AQQ==\",\"bindingRevision\":\"9007199254740993\"}}"
+        "json": "{\"correlationId\":\"case\",\"request\":{\"snapshot\":{\"revision\":\"9007199254740993\"},\"message\":{\"wire\":\"AP+AQQ==\"}}}"
     },
     {
         "name": "symbolic enum",
@@ -112,7 +112,7 @@
     {
         "name": "fractional uint32",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"hello\":{\"major\":1.5}}"
+        "json": "{\"correlationId\":\"case\",\"hello\":{\"major\":2.5}}"
     },
     {
         "name": "overflow uint32",
@@ -137,22 +137,22 @@
     {
         "name": "invalid base64",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"write\":{\"wire\":\"??==\"}}"
+        "json": "{\"correlationId\":\"case\",\"ingress\":{\"message\":{\"wire\":\"??==\"}}}"
     },
     {
         "name": "unpadded base64",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"write\":{\"wire\":\"YQ\"}}"
+        "json": "{\"correlationId\":\"case\",\"ingress\":{\"message\":{\"wire\":\"YQ\"}}}"
     },
     {
         "name": "noncanonical base64 pad bits",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"write\":{\"wire\":\"YR==\"}}"
+        "json": "{\"correlationId\":\"case\",\"ingress\":{\"message\":{\"wire\":\"YR==\"}}}"
     },
     {
         "name": "URL-safe base64",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"write\":{\"wire\":\"_w==\"}}"
+        "json": "{\"correlationId\":\"case\",\"ingress\":{\"message\":{\"wire\":\"_w==\"}}}"
     },
     {
         "name": "snake case alias",
@@ -242,7 +242,7 @@
     {
         "name": "integer uint32 exponent",
         "valid": true,
-        "json": "{\"correlationId\":\"case\",\"hello\":{\"major\":1e2}}"
+        "json": "{\"correlationId\":\"case\",\"hello\":{\"major\":2e2}}"
     },
     {
         "name": "maximum accepted nesting",
@@ -255,43 +255,38 @@
         "json": "{\"correlationId\": \"case\", \"hello\": {\"connectionAttempt\": \"1\\n\"}}"
     },
     {
-        "name": "explicit context reconciliation",
+        "name": "controller recovery attachment",
         "valid": true,
-        "json": "{\"correlationId\":\"case\",\"reconcileContext\":{\"context\":{\"id\":\"context\"},\"fromDirectoryEpoch\":\"old\",\"directoryEpoch\":\"new\"}}"
+        "json": "{\"correlationId\":\"reattach\",\"hello\":{\"controller\":{\"instanceId\":\"controller-b\",\"epoch\":\"new-process\"},\"connectionAttempt\":\"1\",\"major\":1,\"capabilities\":[\"sip.controller-reattach.v1\"],\"bounds\":{\"maxEnvelopeBytes\":4096},\"recovery\":{\"application\":{\"instanceId\":\"controller-a\",\"epoch\":\"original-process\"},\"term\":\"original-term\",\"token\":\"synthetic-recovery-proof\",\"attemptId\":\"reattach-1\",\"attachmentGeneration\":\"2\"}}}"
     },
     {
-        "name": "barrier authority unsigned revision",
+        "name": "controller context inventory",
         "valid": true,
-        "json": "{\"correlationId\":\"case\",\"reconcileAuthority\":{\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"barrierRevision\":\"18446744073709551615\",\"snapshot\":{\"directoryEpoch\":\"old\"},\"origin\":{\"wire\":\"SU5WSVRF\"}}}"
+        "json": "{\"correlationId\":\"list\",\"controllerContexts\":{\"cursor\":\"opaque-cursor\",\"limit\":64}}"
     },
     {
-        "name": "immutable authority receipt",
+        "name": "controller context inventory result",
         "valid": true,
-        "json": "{\"correlationId\":\"case\",\"authorityReceipt\":{\"barrierRevision\":\"9007199254740993\",\"directoryEpoch\":\"new\",\"delivery\":{\"nativeRevision\":\"9007199254740993\"}}}"
+        "json": "{\"correlationId\":\"list\",\"controllerContextsResult\":{\"contexts\":[{\"id\":\"retained-context\"}],\"cursor\":\"next-cursor\"}}"
     },
     {
-        "name": "numeric barrier revision",
+        "name": "noncanonical numeric attachment generation",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"reconcileAuthority\":{\"barrierRevision\":9007199254740993}}"
+        "json": "{\"correlationId\":\"reattach\",\"hello\":{\"recovery\":{\"attachmentGeneration\":2}}}"
     },
     {
-        "name": "invalid authority receipt delivery revision",
+        "name": "invalid inventory limit",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"authorityReceipt\":{\"delivery\":{\"nativeRevision\":\"-1\"}}}"
+        "json": "{\"correlationId\":\"list\",\"controllerContexts\":{\"limit\":-1}}"
     },
     {
-        "name": "conflicting reconciliation payloads",
-        "valid": false,
-        "json": "{\"correlationId\":\"case\",\"reconcileContext\":{},\"authorityReceipt\":{}}"
-    },
-    {
-        "name": "completion-only authority receipt",
+        "name": "peer re-INVITE ACK answer",
         "valid": true,
-        "json": "{\"correlationId\":\"case\",\"authorityReceipt\":{\"ownerLost\":true}}"
+        "json": "{\"correlationId\":\"event-ack\",\"dialogEvent\":{\"kind\":\"ACKNOWLEDGED\",\"inviteCseq\":42,\"message\":{\"method\":\"ACK\",\"body\":\"dj0wDQo=\",\"headers\":[{\"name\":\"CSeq\",\"value\":\"42 ACK\"},{\"name\":\"Content-Type\",\"value\":\"application/sdp\"}]}}}"
     },
     {
-        "name": "invalid completion-only authority receipt flag",
+        "name": "invalid re-INVITE CSeq",
         "valid": false,
-        "json": "{\"correlationId\":\"case\",\"authorityReceipt\":{\"ownerLost\":\"true\"}}"
+        "json": "{\"correlationId\":\"event-ack\",\"dialogEvent\":{\"kind\":\"ACKNOWLEDGED\",\"inviteCseq\":-1}}"
     }
 ]

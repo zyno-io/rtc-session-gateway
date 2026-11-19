@@ -1,6 +1,6 @@
 {
-    "repository": "https://git.s24.dev/signal24/oss/sipbridge",
-    "revision": "81b868e6bc9917ce2aa1ad2e27d7d5aa04f69b1b",
-    "image": "gcr.s24.dev/signal24/oss/sipbridge:81b868e6bc9917ce2aa1ad2e27d7d5aa04f69b1b@sha256:b1a4583b7aedf42f54c9e355e4f231fd095632687c9aca0ab86d671e5fdfe5b3",
-    "schema_sha256": "8f9e6843aee6a74a932a597d8589abb52845452c7d500950332c0fd5b568ccca"
+    "repository": "https://github.com/zyno-io/sipbridge",
+    "revision": "8536cc0031eed0781cc2650023b4483f5c86b7be",
+    "image": "gcr.s24.dev/signal24/oss/sipbridge:8536cc0031eed0781cc2650023b4483f5c86b7be@sha256:f37adc95c2448b3e38edd2ceb688c90d01aee1166ab08581bffd4b2b8c0cd20e",
+    "schema_sha256": "aa21438374a1e098d159bd2e4c16ce9def0b4281959f30caa691d169a8fe3eea"
 }

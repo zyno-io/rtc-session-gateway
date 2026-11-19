@@ -7,6 +7,8 @@ import { AxiosGatewayHttpClient } from './http-client';
 import { MediaServerManager } from './media-server-manager';
 import { MediaSessionService } from './media-session-service';
 import { GatewayLifecycle } from './gateway-lifecycle';
+import { SipFirewall } from './sip-firewall';
+import { FirewallPublisher } from './firewall-publisher';
 
 process.on('unhandledRejection', err => {
     console.error(err);
@@ -25,6 +27,8 @@ run().catch(err => {
 
 async function run() {
     const registry = new CallRegistry();
+    const firewall = new SipFirewall(Config.SIP_FIREWALL);
+    const firewallPublisher = new FirewallPublisher(firewall);
     const controlHub = new ControlHub(Config.CONTROL_REQUEST_TIMEOUT_MS);
     const mediaServers = Config.RTPBRIDGE_HOST || Config.RTC_ENDPOINTS_FILE ? new MediaServerManager(Config) : undefined;
     let media: MediaSessionService | undefined;
@@ -36,6 +40,7 @@ async function run() {
         activeResources: () => registry.size + registry.pendingCount + (media?.size ?? 0),
         stop: async () => {
             await Promise.allSettled([gateway.shutdown(), media?.shutdown()]);
+            await firewallPublisher.stop();
             controlHub.closeConnections();
             mediaServers?.destroy();
             await httpServer.close();
@@ -63,15 +68,11 @@ async function run() {
           )
         : undefined;
     if (mediaServers) mediaServers.isCallActive = callId => registry.hasCallOrReservation(callId) || !!media?.get(callId);
-    gateway = new SipGateway(
-        Config,
-        registry,
-        new AxiosGatewayHttpClient(),
-        undefined,
-        controlHub,
-        lifecycle,
-        () => !!mediaServers?.readiness.eligibleBackends
-    );
+    gateway = new SipGateway(Config, registry, new AxiosGatewayHttpClient(), undefined, controlHub, lifecycle, {
+        media: () => !!mediaServers?.readiness.eligibleBackends,
+        firewall,
+        mediaController: media
+    });
     controlHub.on('disconnect', connectionId => {
         const cleanup = async () => {
             const operations = [gateway.terminateCallsForControlConnection(connectionId)];
@@ -89,8 +90,11 @@ async function run() {
         media,
         lifecycle,
         () => !!mediaServers?.readiness.eligibleBackends,
-        () => mediaServers?.readiness
+        () => mediaServers?.readiness,
+        firewall,
+        firewallPublisher
     );
     httpServer.start();
+    firewallPublisher.start();
     await gateway.start();
 }

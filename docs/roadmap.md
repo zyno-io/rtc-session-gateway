@@ -9,6 +9,9 @@
 
 ## Media
 
+- Qualify the implemented [external SIP handoff and referral return](./development/sip-handoff-plan.md)
+  against production carriers and call centers, including direct-media reachability,
+  late offers, codec compatibility, and media security.
 - Keep `media.leaveMessage` backed by existing rtpbridge VAD behavior.
 - Defer standalone public VAD commands until the activation and notification contract is finalized.
 - Defer AMD and beep detection until there is a selected efficient implementation or rtpbridge-native primitive.
@@ -23,6 +26,8 @@
 
 ## Operations
 
+- Qualify the [SIP firewall](./guide/sip-firewall.md) against deployment carrier
+  allowlists and traffic in shadow mode before enabling enforcement.
 - Add Kubernetes manifests or Helm examples.
 - Add metrics and dashboards.
 - Document recommended sipbridge and rtpbridge sizing.

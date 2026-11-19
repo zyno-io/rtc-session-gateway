@@ -27,7 +27,17 @@ routes. `/routing/lookup` and `/drachtio/route` are no longer served.
 | `GET` | `/calls/:callId` | Get one SIP call. |
 | `POST` | `/calls` | Create outbound SIP call. |
 | `POST` | `/calls/:callId/reinvite` | Send SIP re-INVITE. |
+| `POST` | `/calls/:callId/transfer` | Hand off to an external SIP URI with direct media. |
 | `POST` | `/calls/:callId/bye` | Send SIP BYE. |
+
+The transfer body uses the [`sip.transfer` parameters](./control-protocol.md#external-sip-handoff),
+with `sessionId` supplied by the path. `transferId` is limited to 128 bytes of `[A-Za-z0-9._:-]`; others get
+`400`. HTTP can transfer only HTTP-owned SIP/media
+sessions; WebSocket owners must use their owning connection. Call/session snapshots
+include `logicalCallId`, `ownership` (`application`, `transferring`, `handed-off`,
+`returning`) and the latest `transfer` status, with no live dialog objects or
+addresses. A completed handoff remains visible until either SIP party hangs up.
+`CONFLICT` results map to HTTP 409 and `SIGNALING_UNKNOWN` to 503.
 
 ## Sessions
 
@@ -80,6 +90,14 @@ routes. `/routing/lookup` and `/drachtio/route` are no longer served.
 | `DELETE` | `/recordings/:backendId/*` | Delete one recording. |
 
 Decoded audio is not served by this API. Use rtpbridge `pcap2audio` for PCAP-to-WAV conversion: <https://zyno-io.github.io/rtpbridge/protocol/recording.html#decoding-pcap2audio>.
+
+## Firewall
+
+The optional [SIP firewall](../guide/sip-firewall.md#operator-apis) exposes
+`GET /firewall/status`, `GET`/`POST`/`DELETE /firewall/blocks` and
+`GET /firewall/snapshot`. They use their own bearers (`SIP_FIREWALL_ADMIN_TOKEN`
+and `SIP_FIREWALL_SNAPSHOT_TOKEN`) independent of control authentication, and
+answer 401 when the firewall token is unset.
 
 ## Process
 

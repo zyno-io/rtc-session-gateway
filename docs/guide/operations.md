@@ -1,5 +1,12 @@
 # Operations
 
+The optional [SIP firewall](./sip-firewall.md) keeps its block list in gateway
+memory and applies finite nftables bans through a separate sidecar that shares
+sipbridge's network namespace. Monitor snapshot receipt/apply age and
+skipped-observation counters (`GET /firewall/status`, receiver `GET /v1/status`)
+independently of readiness; firewall failure never gates `/readyz`. Run exactly one
+gateway per sidecar.
+
 ## Deployment Shape
 
 A production deployment needs:
@@ -64,6 +71,13 @@ fresh native process epoch, so old and new gateways hold separate native session
 Keep the old gateway's sipbridge and rtpbridge endpoints reachable until it exits.
 A sipbridge state-authority change, such as a restart with memory state, ends the
 calls held under the old authority; RTC does not migrate them.
+
+**Warning:** with memory-state sipbridge, any loss of the gateway's control session
+to that sipbridge (network drop, certificate rotation that forces a reconnect, a
+gateway restart) ends every call this gateway process holds on that sipbridge, because sipbridge expires the
+session's application term and sends BYE for its calls. Reconnecting does not
+restore them. Treat control-session stability as call availability. See sipbridge's
+[memory-core](https://github.com/zyno-io/sipbridge/blob/main/docs/memory-core.md) notes.
 
 Existing HTTP-owned calls need a stable route to their owning instance for commands during drain; a shared Service that removes that instance on readiness failure is insufficient. Persistent control WebSockets already retain that connection affinity, provided the load balancer preserves established connections when readiness changes. Application route registrations are local to each gateway, so register them on replacements before sending new calls there.
 

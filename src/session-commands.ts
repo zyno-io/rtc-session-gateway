@@ -1,9 +1,9 @@
-import { CallRegistry } from './call-registry';
+import { CallRegistry, snapshotCall } from './call-registry';
 import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
 import { NativeOperationError } from './sipbridge-signaling';
-import { CallNotFoundError, type SipAuthCredentials } from './sip-gateway';
+import { CallNotFoundError, SipOperationConflictError, type SipAuthCredentials } from './sip-gateway';
 import type { GatewayController } from './http-server';
-import { InvalidHttpActionError, parseOptionalHeaders } from './http-contract';
+import { InvalidHttpActionError, isValidTransferId, parseOptionalHeaders, TRANSFER_ID_ERROR } from './http-contract';
 import type { GatewayMediaController } from './media-controller';
 import { MediaBackendNotFoundError, MediaBackendUnavailableError } from './media-server-manager';
 import {
@@ -43,6 +43,8 @@ export class SessionCommandHandler {
                 return this.createOutbound(params, context);
             case 'sip.cancelOutbound':
                 return this.cancelOutbound(params, context);
+            case 'sip.transfer':
+                return this.transfer(params, context);
             case 'sip.reinvite':
                 return this.reinvite(params);
             case 'sip.bye':
@@ -115,8 +117,7 @@ export class SessionCommandHandler {
         }
         const call = this.registry.get(sessionId);
         if (call) {
-            const { dialog: _dialog, ...snapshot } = call;
-            return snapshot;
+            return snapshotCall(call);
         }
         const mediaSession = this.media?.get(sessionId);
         if (mediaSession) return mediaSession;
@@ -174,6 +175,27 @@ export class SessionCommandHandler {
         if (!this.gateway.cancelOutbound) throw new CommandNotImplementedError('sip.cancelOutbound is not implemented');
         const body = requireObject(params);
         return this.gateway.cancelOutbound(requiredString(body.outboundAttemptId, 'outboundAttemptId'), context.controlConnectionId);
+    }
+
+    private async transfer(params: unknown, context: CommandContext) {
+        if (!this.gateway.transfer) throw new CommandNotImplementedError('sip.transfer is not implemented');
+        const body = requireObject(params);
+        const transferId = requiredString(body.transferId, 'transferId');
+        if (!isValidTransferId(transferId)) throw new CommandValidationError(TRANSFER_ID_ERROR);
+        return this.gateway.transfer(
+            {
+                sessionId: requiredString(body.sessionId, 'sessionId'),
+                mediaSessionId: requiredString(body.mediaSessionId, 'mediaSessionId'),
+                requestUri: requiredString(body.requestUri, 'requestUri'),
+                transferId,
+                headers: parseOptionalHeaders(body.headers),
+                callingNumber: optionalString(body.callingNumber, 'callingNumber'),
+                callingName: optionalString(body.callingName, 'callingName'),
+                proxy: optionalString(body.proxy, 'proxy'),
+                auth: parseOptionalSipAuth(body.auth)
+            },
+            context.controlConnectionId
+        );
     }
 
     private async reinvite(params: unknown) {
@@ -486,6 +508,7 @@ export function controlErrorForCommand(err: unknown) {
             code: err.uncertain ? 'SIGNALING_UNKNOWN' : 'SIGNALING_UNAVAILABLE',
             message: err.uncertain ? 'Native signaling outcome unknown; do not replay the operation' : 'Native signaling unavailable'
         };
+    if (err instanceof SipOperationConflictError) return { code: 'CONFLICT', message: err.message };
     if (err instanceof GatewayDrainingError) return { code: 'SHUTTING_DOWN', message: err.message };
     if (err instanceof CommandNotImplementedError) return { code: 'NOT_IMPLEMENTED', message: err.message };
     if (err instanceof CommandValidationError || err instanceof InvalidHttpActionError) return { code: 'BAD_REQUEST', message: err.message };

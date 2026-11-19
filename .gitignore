@@ -8,3 +8,6 @@ yarn-error.log*
 .e2e/
 .e2e-fixtures-*/
 e2e-artifacts/
+firewall-sidecar/.yarn/
+/.working/
+/var/

@@ -1,7 +1,9 @@
 import { parseRoutesJson, parseAllowedSipDomains, RouteConfig } from './routing';
 import { parseIceUrls } from './endpoint-catalog';
+import { loadFirewallConfig, type SipFirewallConfig } from './sip-firewall';
 
 export interface GatewayConfig {
+    SIP_FIREWALL?: SipFirewallConfig;
     RTC_ENDPOINTS_FILE?: string;
     SIPBRIDGE_TLS_CERT_FILE?: string;
     SIPBRIDGE_TLS_KEY_FILE?: string;
@@ -47,6 +49,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     const iceUrls = env.COTURN_URLS_JSON ? parseIceUrls(JSON.parse(env.COTURN_URLS_JSON)) : undefined;
     if (iceUrls?.some(url => url.startsWith('turn')) && !env.COTURN_AUTH_SECRET) throw new Error('TURN URLs require COTURN_AUTH_SECRET');
     return {
+        SIP_FIREWALL: loadFirewallConfig(env),
         RTC_ENDPOINTS_FILE: env.RTC_ENDPOINTS_FILE || undefined,
         SIPBRIDGE_TLS_CERT_FILE: env.SIPBRIDGE_TLS_CERT_FILE || undefined,
         SIPBRIDGE_TLS_KEY_FILE: env.SIPBRIDGE_TLS_KEY_FILE || undefined,

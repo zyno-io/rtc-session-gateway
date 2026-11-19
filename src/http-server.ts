@@ -3,7 +3,7 @@ import http from 'node:http';
 
 import type { FileEndpointCatalog } from './endpoint-catalog';
 
-import { CallRegistry } from './call-registry';
+import { CallRegistry, snapshotCall } from './call-registry';
 import { GatewayConfig } from './config';
 import { ControlHub } from './control-hub';
 import { ControlServer } from './control-server';
@@ -23,9 +23,14 @@ import {
 } from './media-session-service';
 import { acceptsSipHost, getSipUser, matchRoute } from './routing';
 import { CommandNotImplementedError, CommandValidationError, SessionCommandHandler } from './session-commands';
+import type { SipFirewall } from './sip-firewall';
+import type { FirewallPublisher } from './firewall-publisher';
+import { bearerMatches } from './firewall-auth';
+import type { SipTransferParams, SipTransferStatus } from './sip-handoff-contract';
 
 export interface GatewayController {
     isConnected: boolean;
+    transfer?(params: SipTransferParams, controlConnectionId?: string): Promise<SipTransferStatus>;
     createOutbound(params: OutboundSipCallParams): Promise<OutboundSipCallResult>;
     cancelOutbound?(outboundAttemptId: string, controlConnectionId?: string): Promise<{ ok: true }>;
     reinvite(callId: string, sdp: string, headers?: Record<string, string>): Promise<{ sdp: string }>;
@@ -63,7 +68,9 @@ export class HttpServer {
         private media?: GatewayMediaController,
         private lifecycle?: GatewayLifecycle,
         private mediaReady: () => boolean = () => true,
-        private mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined
+        private mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined,
+        private firewall?: SipFirewall,
+        private firewallPublisher?: FirewallPublisher
     ) {}
 
     start() {
@@ -76,7 +83,9 @@ export class HttpServer {
             this.controlHub,
             this.lifecycle,
             this.mediaReady,
-            this.mediaStatus
+            this.mediaStatus,
+            this.firewall,
+            this.firewallPublisher
         );
         const server = http.createServer(app);
         this.server = server;
@@ -119,7 +128,9 @@ export function createHttpApp(
     controlHub?: ControlHub,
     lifecycle?: GatewayLifecycle,
     mediaReady: () => boolean = () => true,
-    mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined
+    mediaStatus: () => FileEndpointCatalog['status'] | undefined = () => undefined,
+    firewall?: SipFirewall,
+    firewallPublisher?: FirewallPublisher
 ) {
     const logger = BaseLogger.child({ ns: 'Http' });
     const app = express();
@@ -132,7 +143,7 @@ export function createHttpApp(
         (!sipRouteConfig?.ROUTES_REQUIRED || routeCount() > 0);
     app.use(express.json({ limit: '2mb' }));
     app.use((req, _res, next) => {
-        if (req.url !== '/healthz') logger.info({ method: req.method, url: req.url }, 'Request');
+        if (req.url !== '/healthz') logger.info({ method: req.method, url: req.path }, 'Request');
         next();
     });
 
@@ -144,6 +155,58 @@ export function createHttpApp(
         const ready = admitting();
         res.status(ready ? 200 : 503).send({ ok: ready, draining: lifecycle?.isDraining ?? false });
     });
+
+    // Firewall routes use their own credentials and must work independently of control auth and draining.
+    // Case-sensitive/strict router: path aliases (/firewall/SNAPSHOT, /firewall/snapshot/) never match a route,
+    // so each route's own auth applies and unmatched paths end in 401 instead of falling through to control auth.
+    const firewallAuth =
+        (tokenOf: () => string | undefined): express.RequestHandler =>
+        (req, res, next) => {
+            if (!firewall || !bearerMatches(req.headers.authorization, tokenOf())) {
+                res.status(401).send({ error: 'Unauthorized' });
+                return;
+            }
+            next();
+        };
+    const snapshotAuth = firewallAuth(() => firewall?.config.snapshotToken);
+    const adminAuth = firewallAuth(() => firewall?.config.adminToken);
+    const firewallRouter = express.Router({ caseSensitive: true, strict: true });
+    firewallRouter.get('/snapshot', snapshotAuth, (_req, res) => {
+        res.send(firewall!.snapshot());
+    });
+    firewallRouter.get('/status', adminAuth, (_req, res) => {
+        res.send({ ...firewall!.status(), publisher: firewallPublisher?.status });
+    });
+    firewallRouter.get('/blocks', adminAuth, (req, res) => {
+        const offset = Number(req.query.offset ?? 0);
+        const limit = Number(req.query.limit ?? 100);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+            res.status(400).send({ error: 'Invalid pagination' });
+            return;
+        }
+        const blocks = firewall!.blocks();
+        res.send({ blocks: blocks.slice(offset, offset + limit), total: blocks.length });
+    });
+    firewallRouter.post('/blocks', adminAuth, (req, res) => {
+        try {
+            firewall!.ban(req.body?.target, req.body?.ttlSeconds, req.body?.reason);
+            res.send({ ok: true });
+        } catch (error) {
+            res.status(400).send({ error: error instanceof Error ? error.message : 'Invalid ban' });
+        }
+    });
+    firewallRouter.delete('/blocks', adminAuth, (req, res) => {
+        try {
+            firewall!.unblock(req.query.target);
+            res.send({ ok: true });
+        } catch {
+            res.status(400).send({ error: 'Invalid target' });
+        }
+    });
+    firewallRouter.use((_req, res) => {
+        res.status(401).send({ error: 'Unauthorized' });
+    });
+    app.use('/firewall', firewallRouter);
 
     app.use((_req, res, next) => {
         try {
@@ -157,6 +220,13 @@ export function createHttpApp(
     });
 
     app.use(httpBearerAuth(authConfig));
+
+    app.post(
+        '/calls/:callId/transfer',
+        asyncHandler(async (req, res) => {
+            res.send(await commands.execute('sip.transfer', { ...(req.body ?? {}), sessionId: req.params.callId }));
+        })
+    );
 
     app.get('/routing/status', (_req, res) => {
         res.send({
@@ -180,15 +250,13 @@ export function createHttpApp(
             res.status(404).send({ error: 'Call not found' });
             return;
         }
-        const { dialog: _dialog, ...snapshot } = call;
-        res.send(snapshot);
+        res.send(snapshotCall(call));
     });
 
     app.get('/sessions/:sessionId', (req, res) => {
         const call = registry.get(req.params.sessionId);
         if (call) {
-            const { dialog: _dialog, ...snapshot } = call;
-            res.send(snapshot);
+            res.send(snapshotCall(call));
             return;
         }
         const mediaSession = media?.get(req.params.sessionId);

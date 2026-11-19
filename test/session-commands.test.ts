@@ -44,7 +44,7 @@ test('session commands create outbound SIP calls through the gateway', async () 
             return { sessionId: 'sip-session-1', sipCallId: 'sip-call-1', sdp: 'remote-sdp' };
         },
         reinvite: async () => ({ sdp: 'remote-sdp' }),
-        bye: async () => { }
+        bye: async () => {}
     };
     const commands = new SessionCommandHandler(new CallRegistry(), gateway);
 
@@ -94,6 +94,79 @@ test('session commands require complete outbound SIP auth credentials', async ()
     );
 });
 
+test('SIP handoff commands require identities and retain requester ownership through HTTP and WebSocket dispatch', async () => {
+    const calls: Array<{ params: unknown; owner: string | undefined }> = [];
+    const status = {
+        transferId: 'transfer-1',
+        logicalCallId: 'logical-1',
+        state: 'completed' as const,
+        startedAt: new Date().toISOString(),
+        committedAt: new Date().toISOString(),
+        recordings: []
+    };
+    const gateway: GatewayController = {
+        ...fakeGateway,
+        async transfer(params, owner) {
+            calls.push({ params, owner });
+            return status;
+        }
+    };
+    const commands = new SessionCommandHandler(new CallRegistry(), gateway);
+    const params = { sessionId: 'source', mediaSessionId: 'media', requestUri: 'sip:center@example.test', transferId: 'transfer-1' };
+    for (const field of ['sessionId', 'mediaSessionId', 'requestUri', 'transferId']) {
+        await assert.rejects(commands.execute('sip.transfer', { ...params, [field]: undefined }), new RegExp(`${field} is required`));
+    }
+    await assert.rejects(commands.execute('sip.transfer', { ...params, auth: { username: 'user' } }), /auth.password/);
+    await commands.execute('sip.transfer', params, { controlConnectionId: 'owner' });
+    assert.equal(calls[0].owner, 'owner');
+    const server = http.createServer(createHttpApp(new CallRegistry(), gateway));
+    await listen(server);
+    try {
+        const response = await postJson(server, '/calls/source/transfer', { ...params, sessionId: 'wrong-source' });
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body, status);
+        assert.equal((calls[1].params as typeof params).sessionId, 'source');
+        assert.equal(calls[1].owner, undefined);
+    } finally {
+        server.close();
+    }
+});
+
+test('transferId is limited to 128 bytes of [A-Za-z0-9._:-] over WebSocket and HTTP dispatch', async () => {
+    const calls: unknown[] = [];
+    const gateway: GatewayController = {
+        ...fakeGateway,
+        async transfer(params) {
+            calls.push(params);
+            return {
+                transferId: params.transferId,
+                logicalCallId: 'l',
+                state: 'failed' as const,
+                startedAt: new Date().toISOString(),
+                recordings: []
+            };
+        }
+    };
+    const commands = new SessionCommandHandler(new CallRegistry(), gateway);
+    const params = { sessionId: 'source', mediaSessionId: 'media', requestUri: 'sip:center@example.test' };
+    const server = http.createServer(createHttpApp(new CallRegistry(), gateway));
+    await listen(server);
+    try {
+        for (const transferId of ['x'.repeat(129), 'é'.repeat(65), 'has space', 'a/b']) {
+            await assert.rejects(commands.execute('sip.transfer', { ...params, transferId }), /transferId must be/);
+            const response = await postJson(server, '/calls/source/transfer', { ...params, transferId });
+            assert.equal(response.status, 400);
+        }
+        assert.equal(calls.length, 0);
+        const maxId = 'a.B_c:d-'.repeat(16);
+        await commands.execute('sip.transfer', { ...params, transferId: maxId });
+        assert.equal((await postJson(server, '/calls/source/transfer', { ...params, transferId: maxId })).status, 200);
+        assert.equal(calls.length, 2);
+    } finally {
+        server.close();
+    }
+});
+
 test('session commands cancel a pending outbound SIP attempt on its control connection', async () => {
     const cancellations: unknown[][] = [];
     const gateway: GatewayController = {
@@ -105,10 +178,9 @@ test('session commands cancel a pending outbound SIP attempt on its control conn
     };
     const commands = new SessionCommandHandler(new CallRegistry(), gateway);
 
-    assert.deepEqual(
-        await commands.execute('sip.cancelOutbound', { outboundAttemptId: 'attempt-1' }, { controlConnectionId: 'conn-1' }),
-        { ok: true }
-    );
+    assert.deepEqual(await commands.execute('sip.cancelOutbound', { outboundAttemptId: 'attempt-1' }, { controlConnectionId: 'conn-1' }), {
+        ok: true
+    });
     assert.deepEqual(cancellations, [['attempt-1', 'conn-1']]);
 });
 
@@ -166,16 +238,27 @@ test('session commands route WebRTC and recording operations to media controller
         }),
         { played: true }
     );
-    assert.deepEqual(await commands.execute('media.leaveMessage', { sessionId: 'media-session-1', endpointId: 'rtp-1', messageSource: 'https://audio.example.com/message.wav', maxWaitMs: 1000 }), {
-        terminator: 'silence',
-        messagePlayed: true
-    });
-    assert.deepEqual(await commands.execute('media.bridge', { sessionId: 'media-session-1', targetSessionId: 'media-session-2', direction: 'sendrecv' }), {
-        sessionId: 'media-session-1',
-        endpointId: 'bridge-1',
-        targetSessionId: 'media-session-2',
-        targetEndpointId: 'bridge-2'
-    });
+    assert.deepEqual(
+        await commands.execute('media.leaveMessage', {
+            sessionId: 'media-session-1',
+            endpointId: 'rtp-1',
+            messageSource: 'https://audio.example.com/message.wav',
+            maxWaitMs: 1000
+        }),
+        {
+            terminator: 'silence',
+            messagePlayed: true
+        }
+    );
+    assert.deepEqual(
+        await commands.execute('media.bridge', { sessionId: 'media-session-1', targetSessionId: 'media-session-2', direction: 'sendrecv' }),
+        {
+            sessionId: 'media-session-1',
+            endpointId: 'bridge-1',
+            targetSessionId: 'media-session-2',
+            targetEndpointId: 'bridge-2'
+        }
+    );
     assert.deepEqual(await commands.execute('media.unbridge', { endpointId: 'bridge-1' }), { ok: true });
     assert.deepEqual(await commands.execute('dtmf.inject', { endpointId: 'rtp-1', digit: '5' }), { ok: true });
     assert.deepEqual(await commands.execute('endpoint.updateDirection', { endpointId: 'webrtc-1', direction: 'inactive' }), { ok: true });
@@ -184,11 +267,7 @@ test('session commands route WebRTC and recording operations to media controller
         ['createWebrtcOffer', 'media-session-1', { direction: 'sendrecv' }],
         ['acceptWebrtcAnswer', 'webrtc-1', { sdp: 'answer-sdp', offerGeneration: 2 }],
         ['restartIce', 'webrtc-1'],
-        [
-            'createRtpOffer',
-            'media-session-1',
-            { direction: 'sendrecv', srtp: undefined, srtpOptional: true, codecs: ['PCMU'] }
-        ],
+        ['createRtpOffer', 'media-session-1', { direction: 'sendrecv', srtp: undefined, srtpOptional: true, codecs: ['PCMU'] }],
         ['startRecording', 'media-session-1', { endpointId: undefined, filePath: undefined }],
         ['listRecordings', { backendId: undefined, startsWith: 'call_', skip: undefined, limit: 10 }],
         ['deleteRecording', 'rtpbridge-0', 'call_42.pcap'],
@@ -198,15 +277,19 @@ test('session commands route WebRTC and recording operations to media controller
             { endpointId: 'rtp-1', numDigits: 1, timeoutMs: undefined, interDigitTimeoutMs: undefined, terminator: undefined, sensitive: undefined }
         ],
         ['playAndWait', 'media-session-1', { source: 'https://audio.example.com/prompt.wav', playbackTimeoutMs: 30_000 }],
-        ['leaveMessage', 'media-session-1', {
-            endpointId: 'rtp-1',
-            messageSource: 'https://audio.example.com/message.wav',
-            maxWaitMs: 1000,
-            playbackTimeoutMs: undefined,
-            silenceIntervalMs: undefined,
-            speechThreshold: undefined,
-            terminator: undefined
-        }],
+        [
+            'leaveMessage',
+            'media-session-1',
+            {
+                endpointId: 'rtp-1',
+                messageSource: 'https://audio.example.com/message.wav',
+                maxWaitMs: 1000,
+                playbackTimeoutMs: undefined,
+                silenceIntervalMs: undefined,
+                speechThreshold: undefined,
+                terminator: undefined
+            }
+        ],
         ['bridge', 'media-session-1', { targetSessionId: 'media-session-2', direction: 'sendrecv' }],
         ['unbridge', 'bridge-1'],
         ['injectDtmf', 'rtp-1', '5'],
@@ -217,18 +300,12 @@ test('session commands route WebRTC and recording operations to media controller
 test('session commands validate recording pagination and header errors as bad requests', async () => {
     const commands = new SessionCommandHandler(new CallRegistry(), fakeGateway, new FakeMediaController());
 
-    await assert.rejects(
-        () => commands.execute('recording.list', { skip: -1 }),
-        /skip must be a non-negative integer/
-    );
-    await assert.rejects(
-        () => commands.execute('recording.list', { limit: 0 }),
-        /limit must be a positive integer/
-    );
-    assert.deepEqual(
-        controlErrorForCommand(new InvalidHttpActionError('headers must be an object')),
-        { code: 'BAD_REQUEST', message: 'headers must be an object' }
-    );
+    await assert.rejects(() => commands.execute('recording.list', { skip: -1 }), /skip must be a non-negative integer/);
+    await assert.rejects(() => commands.execute('recording.list', { limit: 0 }), /limit must be a positive integer/);
+    assert.deepEqual(controlErrorForCommand(new InvalidHttpActionError('headers must be an object')), {
+        code: 'BAD_REQUEST',
+        message: 'headers must be an object'
+    });
 });
 
 test('HTTP media endpoints use the same command surface', async () => {
@@ -334,10 +411,13 @@ test('HTTP recording proxy lists and streams backend recordings', async () => {
         assert.equal(merged.status, 200);
         assert.equal(merged.headers.get('content-type'), 'application/vnd.tcpdump.pcap');
         assert.equal(await merged.text(), 'merged-pcap-bytes');
-        assert.deepEqual(media.calls.at(-1), ['mergeRecordings', [
-            { backendId: 'rtpbridge-0', path: 'call_42__seg_0001.pcap' },
-            { backendId: 'rtpbridge-1', path: 'call_42__seg_0002.pcap' }
-        ]]);
+        assert.deepEqual(media.calls.at(-1), [
+            'mergeRecordings',
+            [
+                { backendId: 'rtpbridge-0', path: 'call_42__seg_0001.pcap' },
+                { backendId: 'rtpbridge-1', path: 'call_42__seg_0002.pcap' }
+            ]
+        ]);
     } finally {
         server.close();
     }
@@ -352,7 +432,7 @@ test('HTTP outbound SIP endpoint uses the same command surface', async () => {
             return { sessionId: 'sip-session-1', sipCallId: 'sip-call-1', sdp: 'remote-sdp' };
         },
         reinvite: async () => ({ sdp: 'remote-sdp' }),
-        bye: async () => { }
+        bye: async () => {}
     };
     const server = http.createServer(createHttpApp(new CallRegistry(), gateway));
     await listen(server);
@@ -397,10 +477,12 @@ test('HTTP media commands return 503 when rtpbridge is not configured', async ()
 
 test('HTTP command and recording routes require bearer auth when configured', async () => {
     const media = new FakeMediaController();
-    const server = http.createServer(createHttpApp(new CallRegistry(), fakeGateway, media, {
-        CONTROL_AUTH_MODE: 'bearer',
-        CONTROL_AUTH_TOKEN: 'secret-token'
-    }));
+    const server = http.createServer(
+        createHttpApp(new CallRegistry(), fakeGateway, media, {
+            CONTROL_AUTH_MODE: 'bearer',
+            CONTROL_AUTH_TOKEN: 'secret-token'
+        })
+    );
     await listen(server);
 
     try {
@@ -431,7 +513,7 @@ const fakeGateway: GatewayController = {
     isConnected: true,
     createOutbound: async () => ({ sessionId: 'sip-session-1', sipCallId: 'sip-call-1', sdp: 'remote-sdp' }),
     reinvite: async () => ({ sdp: 'remote-sdp' }),
-    bye: async () => { }
+    bye: async () => {}
 };
 
 class FakeMediaController implements GatewayMediaController {
@@ -446,7 +528,7 @@ class FakeMediaController implements GatewayMediaController {
     };
 
     list = () => [this.session];
-    get = (sessionId: string) => sessionId === this.session.sessionId ? this.session : undefined;
+    get = (sessionId: string) => (sessionId === this.session.sessionId ? this.session : undefined);
     createSession = async () => this.session;
     destroySession = async () => {};
     createWebrtcOffer = async (sessionId: string, params?: { direction?: string }) => {
@@ -493,7 +575,10 @@ class FakeMediaController implements GatewayMediaController {
         this.calls.push(['unbridge', endpointId]);
         return { ok: true as const };
     };
-    gather = async (sessionId: string, params: { endpointId: string; numDigits?: number; timeoutMs?: number; interDigitTimeoutMs?: number; terminator?: string }) => {
+    gather = async (
+        sessionId: string,
+        params: { endpointId: string; numDigits?: number; timeoutMs?: number; interDigitTimeoutMs?: number; terminator?: string }
+    ) => {
         this.calls.push(['gather', sessionId, params]);
         return { digits: '7', reason: 'digits' as const };
     };
@@ -573,5 +658,5 @@ async function postJson(server: http.Server, path: string, body: unknown, header
         headers: { 'content-type': 'application/json', ...headers },
         body: JSON.stringify(body)
     });
-    return { status: response.status, body: await response.json() as any };
+    return { status: response.status, body: (await response.json()) as any };
 }

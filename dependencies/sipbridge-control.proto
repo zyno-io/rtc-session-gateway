@@ -1,14 +1,13 @@
 syntax = "proto3";
 
-package zyno.sipbridge.v1;
+package sipbridge.control.v1;
 option go_package = "sipbridge/internal/controlpb";
 
 // Canonical control contract and source for generated JSON codecs/validation.
 // Wire transport is UTF-8 JSON text only (sipbridge.control.json.v1), with
 // lowerCamelCase keys, symbolic enums, uint64 decimal strings and base64 bytes.
-// Application families require the explicitly
-// negotiated sip.v1 capability; the session-only
-// executable never admits SIP. PROTOCOL.md and ARCHITECTURE.md in sipbridge own
+// Application families require the explicitly negotiated sip.v1 capability.
+// PROTOCOL.md and ARCHITECTURE.md in sipbridge own
 // behavioral semantics. Reference/correlation strings match [A-Za-z0-9_.:@+-]{1,96}.
 message Envelope {
   string correlation_id = 1;
@@ -40,14 +39,11 @@ message Envelope {
     CredentialResult credential_result = 37;
     // Reads existing physical attempt evidence only; never authorizes a write.
     FlowWrite inspect_effect = 38;
-    EffectSettlement settle_effect = 39;
-    // Native proof that all SIP procedures and delivery reconciliation have retired.
-    ContextSnapshot retire_authority = 40;
     ApplicationProbe probe_application = 41;
     ApplicationStatus application_status = 42;
-    ContextReconcile reconcile_context = 43;
-    AuthorityReconcile reconcile_authority = 44;
-    AuthorityReceipt authority_receipt = 45;
+    ControllerContexts controller_contexts = 46;
+    ControllerContextsResult controller_contexts_result = 47;
+    RequestDecision request_decision = 48;
   }
 }
 
@@ -61,13 +57,34 @@ message Bounds {
 }
 
 message SessionHello {
-  ProcessRef nexus = 1;
+  ProcessRef controller = 1;
   uint64 connection_attempt = 2;
   uint32 major = 3;
   uint32 min_minor = 4;
   uint32 max_minor = 5;
   repeated string capabilities = 6;
   Bounds bounds = 7;
+  ControllerRecovery recovery = 8;
+}
+
+// Possession proof for reattaching a logical controller application. Tokens are
+// sensitive: never include hello/recovery payloads in logs or diagnostics.
+message ControllerRecovery {
+  ProcessRef application = 1;
+  string term = 2;
+  string token = 3;
+  string attempt_id = 4;
+  uint64 attachment_generation = 5;
+}
+
+message ControllerContexts {
+  string cursor = 1;
+  uint32 limit = 2;
+}
+
+message ControllerContextsResult {
+  repeated ContextRef contexts = 1;
+  string cursor = 2;
 }
 
 message SessionHelloAck {
@@ -85,11 +102,18 @@ message SessionHelloAck {
   InboundAuthPolicy inbound_auth_policy = 11;
 }
 
-// SIP-owner authority in the selected state adapter. A session may renew only its authenticated
-// process and current live term; a successor term never revives older contexts.
+// SIP-owner authority in the selected state adapter. Application identifies the
+// original logical owner lineage; holder is the authenticated controller process.
+// Recovery tokens are sensitive and must never appear in logs or diagnostics.
 message ApplicationLease {
   ProcessRef application = 1; StateAuthority authority = 2; string term = 3;
   uint64 checked_at_ms = 4; uint64 expires_at_ms = 5;
+  string recovery_token = 6;
+  ProcessRef holder = 7;
+  uint64 attachment_generation = 8;
+  uint64 reattach_until_ms = 9;
+  uint32 lease_lifetime_ms = 10;
+  uint32 reattach_timeout_ms = 11;
 }
 
 message SessionStatus {
@@ -109,7 +133,7 @@ message InboundAuthPolicy {
 }
 
 // Short-lived issuance policy, not an account credential or authentication proof.
-// The signing key is a purpose/epoch-scoped derivation, never the trusted SRPC key.
+// Use a purpose/epoch-scoped signing key, never a shared application master key.
 message DigestChallengePolicy {
   string realm = 1;
   string authentication_epoch = 2;
@@ -141,7 +165,7 @@ message SipMessage {
 message IngressReceived { FlowRef flow = 1; SipMessage message = 2; ContextRef context = 3; }
 message RouteResult {
   enum Outcome { UNSPECIFIED = 0; ACCEPTED = 1; REDIRECT = 2; REJECTED = 3; UNAVAILABLE = 4; }
-  Outcome outcome = 1; ProcessRef nexus = 2; uint32 sip_status = 3;
+  Outcome outcome = 1; ProcessRef controller = 2; uint32 sip_status = 3;
 }
 message OwnerIngest {
   ContextRef context = 1; ProcessRef application = 2; FlowRef flow = 3; bytes wire = 4;
@@ -157,8 +181,23 @@ message ContextSnapshot {
   bool answered = 15; bool initial_ack = 16; bool ended = 17; uint64 revision = 18; uint64 command_sequence = 19;
   repeated string selectors = 20; string transport = 21; ContextDelivery delivery = 22; ProcessRef executor = 23; string directory_epoch = 24;
   string application_lease_term = 25;
+  uint64 attachment_generation = 26;
 }
-message RequestPresented { ContextSnapshot snapshot = 1; string request_id = 2; SipMessage message = 3; FlowRef flow = 4; }
+message RequestPresented {
+  ContextSnapshot snapshot = 1; string request_id = 2; SipMessage message = 3; FlowRef flow = 4;
+  // Native-validated proposal; ordered publication is returned in RequestDecision.
+  FlowAdoptionRequest flow_adoption = 5;
+}
+// sip.request-decision.v1: one decision for one exact pending native request.
+// status=0 admits asynchronous handling; REGISTER/SUBSCRIBE require a final status.
+// Accepted SUBSCRIBE includes its required NOTIFY content before native commit.
+message RequestDecision {
+  ContextRef context = 1; string request_id = 2; uint64 sequence = 3;
+  CommandAdmission admission = 4; OwnerIngest.Admission basis = 5;
+  string principal_id = 6; string binding_id = 7; ContextDelivery delivery = 8;
+  uint32 status = 9; repeated Header headers = 10; bytes body = 11;
+  DialogRequest notify = 12;
+}
 // Trusted directory admission anchor for a business-selected response. Native
 // completion writes remain independently authorized by the SIP state owner.
 message ResponseAuthority { string directory_epoch = 1; string completion_scope = 2; }
@@ -168,7 +207,7 @@ message CredentialRef { string id = 1; string version = 2; }
 // protocol inputs/effects/receipts; the executor stores only derived digest data.
 message CredentialLookup { ContextRef context = 1; CredentialRef credential = 2; }
 message CredentialResult { string username = 1; string password = 2; string version = 3; string error = 4; }
-message NetworkTarget { string proxy = 1; string transport = 2; string username = 3; string password = 4; CredentialRef credential = 5; }
+message NetworkTarget { string proxy = 1; string transport = 2; CredentialRef credential = 5; }
 message OpenUac { string uri = 1; bytes body = 2; repeated Header headers = 3; string binding_id = 4; string principal_id = 5; NetworkTarget network = 6; string transport = 7; string method = 8; }
 message DialogRequest { string method = 1; bytes body = 2; repeated Header headers = 3; }
 message Cancel {}
@@ -203,15 +242,13 @@ message EffectAuthorization {
 }
 message SendPermit { EffectAuthorization authorization = 1; FlowRef flow = 2; string directory_epoch = 3; string ordering_proof = 4; string completion_scope = 5; }
 message EgressRequest { ContextSnapshot snapshot = 1; SipMessage message = 2; FlowRef return_flow = 3; EffectAuthorization authorization = 4; }
-message FlowWrite { FlowRef flow = 1; string binding_id = 2; uint64 binding_revision = 3; bytes wire = 4; StateEffectRef effect = 5; SendPermit permit = 6; }
+message FlowWrite { FlowRef flow = 1; StateEffectRef effect = 5; SendPermit permit = 6; }
 message DeliveryResult {
   enum Outcome { UNSPECIFIED = 0; WRITTEN = 1; NOT_WRITTEN = 2; UNKNOWN = 3; }
   Outcome outcome = 1; string error = 2; StateEffectRef effect = 3;
   // True only after the exact terminal physical outcome is committed in SIP state.
   bool recorded = 4;
 }
-// Historical reconciliation only; this message cannot start a physical write.
-message EffectSettlement { FlowWrite write = 1; DeliveryResult delivery = 2; }
 // Read-only proof from the current trusted directory; a control disconnect is not owner loss.
 message ApplicationProbe { ContextRef context = 1; ProcessRef application = 2; }
 message ApplicationStatus {
@@ -222,6 +259,11 @@ message FlowClosed { FlowRef flow = 1; }
 message DialogEvent {
   enum Kind { UNSPECIFIED = 0; PROVISIONAL = 1; ANSWERED = 2; ACKNOWLEDGED = 3; CANCELLED = 4; ENDED = 5; FAILED = 6; SUBSCRIPTION_EXPIRED = 7; }
   Kind kind = 1; ContextSnapshot snapshot = 2; SipMessage message = 3; string operation_id = 4; string error = 5;
+  // Only with sip.reinvite-ack.v1: message-bearing ACKNOWLEDGED for an accepted
+  // peer re-INVITE ACK. Message presence distinguishes it from an initial ACK;
+  // invite_cseq is the correlation value and may be zero.
+  // Initial ACKNOWLEDGED remains snapshot-only and leaves this field zero.
+  uint32 invite_cseq = 6;
 }
 message ContextInspect { ContextRef context = 1; }
 
@@ -234,18 +276,3 @@ message FlowAdoptionRequest {
   FlowRef flow = 5; uint64 native_revision = 6; bool subscription = 7;
 }
 message FlowAdoptionResult { ContextDelivery receipt = 1; string error = 2; }
-
-// Explicit quiescent native barrier; never an implicit owner/permit reset.
-message ContextReconcile {
-  ContextRef context = 1; string from_directory_epoch = 2; string directory_epoch = 3;
-}
-message AuthorityReconcile {
-  ContextSnapshot snapshot = 1; string from_directory_epoch = 2; string directory_epoch = 3;
-  string token = 4; uint64 barrier_revision = 5; SipMessage origin = 6;
-  string completion_scope = 7; FlowRef flow = 8;
-}
-message AuthorityReceipt {
-  ContextRef context = 1; ProcessRef application = 2; string from_directory_epoch = 3;
-  string directory_epoch = 4; string token = 5; uint64 barrier_revision = 6;
-  string completion_scope = 7; ContextDelivery delivery = 8; bool owner_lost = 9;
-}

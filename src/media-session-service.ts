@@ -31,7 +31,17 @@ import {
     RtpOfferOptions
 } from './media-controller';
 import { MediaServerManager, RtpbridgeBackend } from './media-server-manager';
-import { RtpbridgeClient, RtpbridgeDtmfEvent, RtpbridgeServerInfo } from './rtpbridge-client';
+import {
+    RecordingResult,
+    RtpbridgeClient,
+    RtpbridgeDtmfEvent,
+    RtpbridgeRecordingInfo,
+    RtpbridgeServerInfo,
+    RtpbridgeRequestError,
+    RtpbridgeTimeoutError
+} from './rtpbridge-client';
+import type { FinalizedSipRecording } from './sip-handoff-contract';
+import { mediaAddressKey } from './sip-sdp';
 
 interface MediaSessionRecord {
     sessionId: string;
@@ -62,10 +72,10 @@ interface ActiveEndpointAction {
     cancel: () => void;
 }
 
-export class MediaSessionNotFoundError extends Error { }
-export class MediaEndpointNotFoundError extends Error { }
-export class MediaUnavailableError extends Error { }
-export class MediaActionConflictError extends Error { }
+export class MediaSessionNotFoundError extends Error {}
+export class MediaEndpointNotFoundError extends Error {}
+export class MediaUnavailableError extends Error {}
+export class MediaActionConflictError extends Error {}
 export class MediaRecordingProxyError extends Error {
     constructor(
         public statusCode: number,
@@ -77,6 +87,7 @@ export class MediaRecordingProxyError extends Error {
 
 const PCAP_HEADER_BYTES = 24;
 const MAX_RECORDING_MERGE_TARGETS = 1000;
+const MAX_HANDOFF_RECORDINGS = 256;
 
 export class MediaSessionService implements GatewayMediaController {
     private logger = BaseLogger.child({ ns: 'MediaSessionService' });
@@ -86,6 +97,15 @@ export class MediaSessionService implements GatewayMediaController {
     private pendingIceRestarts = new Map<string, Promise<{ sdpOffer: string; offerGeneration: number }>>();
     private activeEndpointActions = new Map<string, ActiveEndpointAction>();
     private sensitiveGatherEndpointIds = new Set<string>();
+    private handoffSessions = new Map<string, object>();
+    /** Endpoint creations (webrtc, rtp, bridge) in flight per session; a handoff guard is refused while any is pending. */
+    private endpointCreations = new Map<string, number>();
+    /** Sessions where a recording.start timed out locally: rtpbridge may be recording under an id we never learned. */
+    private recordingUncertain = new Map<string, number>();
+    private uncertainSeq = 0;
+    private recordingStarts = new Map<string, Set<Promise<unknown>>>();
+    private handoffRecordings = new Map<string, FinalizedSipRecording[]>();
+    private rtpLocalSdp = new Map<string, string>();
 
     constructor(
         private mediaServers: MediaServerManager,
@@ -95,7 +115,7 @@ export class MediaSessionService implements GatewayMediaController {
         private turnConfig?: { authSecret?: string; credentialTtlSeconds: number; urls?: string[] },
         private lifecycle?: GatewayLifecycle,
         private recordingPathPrefix?: string
-    ) { }
+    ) {}
 
     list(): MediaSessionSnapshot[] {
         return [...this.sessions.values()].map(snapshotSession);
@@ -136,7 +156,16 @@ export class MediaSessionService implements GatewayMediaController {
             };
             this.sessions.set(sessionId, record);
             client.onClose(() => this.dropSession(sessionId!));
-            client.on('rtpbridge.event', event => this.publishRtpbridgeEvent(record, event));
+            client.on(
+                'rtpbridge.event',
+                this.guarded('rtpbridge.event', (event: unknown) => this.publishRtpbridgeEvent(record, event))
+            );
+            client.on(
+                'recording.stopped',
+                this.guarded('recording.stopped', (event: Parameters<MediaSessionService['onBackendRecordingStopped']>[1]) =>
+                    this.onBackendRecordingStopped(record, event)
+                )
+            );
             return snapshotSession(record);
         } catch (err) {
             if (sessionId) await client.destroySession(sessionId).catch(() => undefined);
@@ -165,16 +194,36 @@ export class MediaSessionService implements GatewayMediaController {
 
     async createWebrtcOffer(sessionId: string, params: { direction?: string } = {}) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createWebrtcOffer(sessionId, params);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createWebrtcOffer(sessionId, params));
         this.addEndpoint(session, result.endpointId, 'webrtc', params.direction);
         return result;
     }
 
     async createWebrtcFromOffer(sessionId: string, params: { sdp: string; direction?: string }) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createWebrtcFromOffer(sessionId, params);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createWebrtcFromOffer(sessionId, params));
         this.addEndpoint(session, result.endpointId, 'webrtc', params.direction);
         return result;
+    }
+
+    /**
+     * Runs a backend call that adds an endpoint. Refused while a handoff guard holds any of the sessions (the handoff
+     * validated their endpoint set); counted while in flight so a handoff cannot validate around it.
+     */
+    private async creatingEndpoint<T>(sessionIds: string[], create: () => Promise<T>): Promise<T> {
+        for (const id of sessionIds) {
+            if (this.handoffSessions.has(id)) throw new MediaActionConflictError('Endpoints cannot be added during SIP handoff');
+        }
+        for (const id of sessionIds) this.endpointCreations.set(id, (this.endpointCreations.get(id) ?? 0) + 1);
+        try {
+            return await create();
+        } finally {
+            for (const id of sessionIds) {
+                const remaining = (this.endpointCreations.get(id) ?? 1) - 1;
+                if (remaining > 0) this.endpointCreations.set(id, remaining);
+                else this.endpointCreations.delete(id);
+            }
+        }
     }
 
     async acceptWebrtcAnswer(endpointId: string, params: { sdp: string; offerGeneration?: number }) {
@@ -239,15 +288,15 @@ export class MediaSessionService implements GatewayMediaController {
 
     async createRtpOffer(sessionId: string, params: RtpOfferOptions = {}) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createRtpOffer(sessionId, params);
-        this.addEndpoint(session, result.endpointId, 'rtp', params.direction);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createRtpOffer(sessionId, params));
+        if (this.addEndpoint(session, result.endpointId, 'rtp', params.direction)) this.rtpLocalSdp.set(result.endpointId, result.sdpOffer);
         return result;
     }
 
     async createRtpFromOffer(sessionId: string, params: { sdp: string; direction?: string }) {
         const session = this.requireSession(sessionId);
-        const result = await session.client.createRtpFromOffer(sessionId, params);
-        this.addEndpoint(session, result.endpointId, 'rtp', params.direction);
+        const result = await this.creatingEndpoint([sessionId], () => session.client.createRtpFromOffer(sessionId, params));
+        if (this.addEndpoint(session, result.endpointId, 'rtp', params.direction)) this.rtpLocalSdp.set(result.endpointId, result.sdpAnswer);
         return result;
     }
 
@@ -259,7 +308,9 @@ export class MediaSessionService implements GatewayMediaController {
 
     async rtpReinvite(endpointId: string, params: { sdp: string }) {
         const session = this.requireSessionForEndpoint(endpointId);
-        return session.client.rtpReinvite(endpointId, params.sdp);
+        const result = await session.client.rtpReinvite(endpointId, params.sdp);
+        if (this.sessions.get(session.sessionId) === session && session.endpoints.has(endpointId)) this.rtpLocalSdp.set(endpointId, result.sdpAnswer);
+        return result;
     }
 
     async play(sessionId: string, params: { source: string; loopCount?: number | null; cacheTtlSecs?: number; headers?: Record<string, string> }) {
@@ -296,7 +347,9 @@ export class MediaSessionService implements GatewayMediaController {
             throw new MediaActionConflictError('Cannot bridge media sessions on different rtpbridge backends');
         }
 
-        const result = await session.client.bridgeSession(params.targetSessionId, { direction });
+        const result = await this.creatingEndpoint([session.sessionId, target.sessionId], () =>
+            session.client.bridgeSession(params.targetSessionId, { direction })
+        );
         const currentSession = this.sessions.get(sessionId);
         const currentTarget = this.sessions.get(params.targetSessionId);
         if (currentSession !== session || currentTarget !== target) {
@@ -413,9 +466,7 @@ export class MediaSessionService implements GatewayMediaController {
                     positiveIntegerOrDefault(params.playbackTimeoutMs, 30_000)!,
                     abort.signal
                 );
-                return messagePlayed
-                    ? { terminator, messagePlayed: true }
-                    : { terminator: 'cancelled', messagePlayed: false };
+                return messagePlayed ? { terminator, messagePlayed: true } : { terminator: 'cancelled', messagePlayed: false };
             }
             return { terminator, messagePlayed: false };
         } finally {
@@ -432,15 +483,200 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     async startRecording(sessionId: string, params: { endpointId?: string; filePath?: string }) {
+        if (this.handoffSessions.has(sessionId)) throw new MediaActionConflictError('Recording is suspended during SIP handoff');
+        const starts = this.recordingStarts.get(sessionId) ?? new Set<Promise<unknown>>();
+        this.recordingStarts.set(sessionId, starts);
+        const pending = this.startRecordingInternal(sessionId, params);
+        starts.add(pending);
+        try {
+            return await pending;
+        } finally {
+            starts.delete(pending);
+            if (!starts.size) this.recordingStarts.delete(sessionId);
+        }
+    }
+
+    private async startRecordingInternal(sessionId: string, params: { endpointId?: string; filePath?: string }) {
         const session = this.requireSession(sessionId);
         const filePath = this.recordingFilePath(params.filePath, sessionId);
-        const result = await session.client.startRecording(sessionId, {
-            endpointId: params.endpointId,
-            filePath
-        });
+        let result: { recordingId: string };
+        try {
+            result = await session.client.startRecording(sessionId, {
+                endpointId: params.endpointId,
+                filePath
+            });
+        } catch (err) {
+            // SESSION_UNRESPONSIVE means rtpbridge's own reply deadline expired; protocol_error means the reply was unreadable. Either way
+            // the worker may still have installed it.
+            const unknownOutcome =
+                err instanceof RtpbridgeTimeoutError ||
+                (err instanceof RtpbridgeRequestError && (err.code === 'SESSION_UNRESPONSIVE' || err.code === 'protocol_error'));
+            if (unknownOutcome && this.sessions.get(sessionId) === session) this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
+            throw err;
+        }
+        if (typeof result?.recordingId !== 'string' || !result.recordingId) {
+            // Defensive: never track a recording under an undefined id; reconcile through session.info on the next handoff.
+            if (this.sessions.get(sessionId) === session) this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
+            throw new RtpbridgeRequestError('rtpbridge protocol error: recording.start reply has no recording_id', 'protocol_error');
+        }
         const metadata = this.recordingMetadata(session, filePath);
         this.recordings.set(result.recordingId, { sessionId, ...metadata });
         return { ...result, ...metadata };
+    }
+
+    /** Returns the id of the RTP endpoint carrying `sourceSdp` (when given); `sourceEndpointId` pins it to one specific endpoint. */
+    assertHandoffMedia(sessionId: string, ownerConnectionId?: string, sourceSdp?: string, sourceEndpointId?: string): string | undefined {
+        const session = this.requireSession(sessionId);
+        if (session.ownerConnectionId !== ownerConnectionId) throw new MediaActionConflictError('Media session belongs to another owner');
+        if ([...session.endpoints.values()].some(endpoint => endpoint.type === 'webrtc')) {
+            throw new MediaActionConflictError('Handoff requires a dedicated call media session');
+        }
+        const rtpEndpoints = [...session.endpoints.values()].filter(endpoint => endpoint.type === 'rtp');
+        if (rtpEndpoints.length === 0) throw new MediaActionConflictError('Handoff requires established RTP call media');
+        // Handoff tears down the whole media session: a second RTP endpoint is another live call's audio.
+        if (rtpEndpoints.length > 1) throw new MediaActionConflictError('Handoff requires a media session with a single RTP endpoint');
+        if (sourceEndpointId && rtpEndpoints[0].endpointId !== sourceEndpointId)
+            throw new MediaActionConflictError('Media endpoint of the source SIP dialog was replaced');
+        if (sourceSdp) {
+            const sourceKey = mediaAddressKey(sourceSdp);
+            const carrier = [...session.endpoints.values()].find(endpoint => {
+                const localSdp = this.rtpLocalSdp.get(endpoint.endpointId);
+                return endpoint.type === 'rtp' && localSdp && mediaAddressKey(localSdp) === sourceKey;
+            });
+            if (!carrier) throw new MediaActionConflictError('Media session does not carry the source SIP dialog');
+            return carrier.endpointId;
+        }
+        return undefined;
+    }
+
+    /**
+     * `source` binds the guard to the endpoint the caller validated: it is re-verified here and again with the guard held,
+     * so an endpoint replaced since the caller's check (another call's media) is never stopped or destroyed.
+     */
+    async prepareHandoff(sessionId: string, ownerConnectionId: string | undefined, token: object, source?: { endpointId?: string; sdp: string }) {
+        this.assertHandoffMedia(sessionId, ownerConnectionId, source?.sdp, source?.endpointId);
+        // An endpoint being created now could land after validation and be destroyed with the session.
+        if (this.endpointCreations.get(sessionId)) throw new MediaActionConflictError('Handoff refused while a media endpoint is being created');
+        this.handoffSessions.set(sessionId, token);
+        const results = this.handoffRecordings.get(sessionId) ?? [];
+        this.handoffRecordings.set(sessionId, results);
+        const holds = () => {
+            if (this.handoffSessions.get(sessionId) !== token) throw new MediaActionConflictError('Handoff attempt is no longer current');
+        };
+        try {
+            await Promise.allSettled([...(this.recordingStarts.get(sessionId) ?? [])]);
+            holds();
+            const session = this.requireSession(sessionId);
+            // Snapshot: a recording the application starts after a failed handoff must not be stopped by it.
+            for (const [recordingId, metadata] of [...this.recordings]) {
+                if (metadata.sessionId !== sessionId) continue;
+                holds();
+                try {
+                    await this.stopRecording(recordingId);
+                } catch (err) {
+                    // Keep tracking the recording until a validated inventory confirms it is inactive.
+                    const active = await this.isRecordingActive(session, recordingId);
+                    holds();
+                    if (active) throw err;
+                    this.recordings.delete(recordingId);
+                    // The stop took effect but its reply was lost: keep the finalized entry (deduped by id when a
+                    // recording.stopped event already recorded it). Size and duration are unknown here.
+                    this.appendFinalizedRecording(
+                        session,
+                        recordingId,
+                        { filePath: metadata.filePath, durationMs: 0, packets: 0 },
+                        metadata.filePath
+                    );
+                }
+            }
+            holds();
+            if (this.recordingUncertain.has(sessionId)) await this.stopUnknownRecordings(session, holds);
+            holds();
+            // Re-validated with the guard held (no endpoint can be added meanwhile): the rule still holds at the end.
+            this.assertHandoffMedia(sessionId, ownerConnectionId, source?.sdp, source?.endpointId);
+            return [...results];
+        } catch (err) {
+            this.releaseHandoff(sessionId, token);
+            throw err;
+        }
+    }
+
+    /** True if rtpbridge still reports the recording active. Fails closed when state cannot be verified. */
+    private async isRecordingActive(session: MediaSessionRecord, recordingId: string) {
+        try {
+            const recordings = await session.client.listSessionRecordings();
+            return recordings.some(info => info.recordingId === recordingId && info.state === 'active');
+        } catch (err) {
+            throw new MediaActionConflictError(`Cannot verify recording state for handoff: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
+    /** rtpbridge stops recordings itself (endpoint removed/transferred); drop the id and keep the finalized metadata. */
+    private onBackendRecordingStopped(
+        session: MediaSessionRecord,
+        event: { recordingId?: string; filePath?: string; durationMs?: number; packets?: number }
+    ) {
+        const recordingId = event?.recordingId;
+        if (!recordingId) return;
+        const metadata = this.recordings.get(recordingId);
+        if (metadata && metadata.sessionId !== session.sessionId) return;
+        // rtpbridge may report a canonical (symlink-resolved) path that fails prefix validation; for a tracked
+        // recording the path validated at start is authoritative. An untracked one is recorded only if its path validates.
+        const filePath = metadata ? metadata.filePath : (event.filePath ?? '');
+        if (!metadata) {
+            try {
+                this.recordingMetadata(session, filePath);
+            } catch (err) {
+                this.logger.warn({ err, recordingId, filePath }, 'Ignoring recording.stopped for an untracked recording with an invalid path');
+                return;
+            }
+        }
+        this.recordings.delete(recordingId);
+        this.appendFinalizedRecording(session, recordingId, { filePath, durationMs: event.durationMs ?? 0, packets: event.packets ?? 0 }, filePath);
+    }
+
+    /** Wraps an rtpbridge event handler: it runs on the client's emitter, so a throw would reach uncaughtException. */
+    private guarded<A extends unknown[]>(name: string, fn: (...args: A) => void): (...args: A) => void {
+        return (...args: A) => {
+            try {
+                fn(...args);
+            } catch (err) {
+                this.logger.error({ err, event: name }, 'rtpbridge event listener failed');
+            }
+        };
+    }
+
+    /** Stops recordings rtpbridge reports active that the gateway never learned of (a timed-out recording.start). Fails closed. */
+    private async stopUnknownRecordings(session: MediaSessionRecord, holds: () => void) {
+        let active: RtpbridgeRecordingInfo[];
+        // Only starts that timed out before this query are covered by it; a later one stays uncertain.
+        const covered = this.recordingUncertain.get(session.sessionId);
+        try {
+            const recordings = await session.client.listSessionRecordings();
+            active = recordings.filter(info => info.state === 'active' && !this.recordings.has(info.recordingId));
+        } catch (err) {
+            throw new MediaActionConflictError(`Cannot verify recording state for handoff: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        holds();
+        for (const info of active) {
+            const result = await session.client.stopRecording(info.recordingId);
+            try {
+                this.appendFinalizedRecording(session, info.recordingId, { ...result, filePath: info.filePath }, info.filePath);
+            } catch (err) {
+                // Stopped, but its path is outside what the gateway may report: skip the entry rather than fail the handoff.
+                this.logger.warn(
+                    { recordingId: info.recordingId, error: err instanceof Error ? err.message : String(err) },
+                    'Skipping unreportable recording'
+                );
+            }
+            holds();
+        }
+        if (this.recordingUncertain.get(session.sessionId) === covered) this.recordingUncertain.delete(session.sessionId);
+    }
+
+    /** Releases the handoff guard only if `token` still holds it; a stale attempt cannot release a newer one. */
+    releaseHandoff(sessionId: string, token: object) {
+        if (this.handoffSessions.get(sessionId) === token) this.handoffSessions.delete(sessionId);
     }
 
     async destroySessionsForOwner(ownerConnectionId: string) {
@@ -461,9 +697,31 @@ export class MediaSessionService implements GatewayMediaController {
         const metadata = this.recordings.get(recordingId);
         if (!metadata) throw new MediaEndpointNotFoundError(`Recording ${recordingId} not found`);
         const session = this.requireSession(metadata.sessionId);
-        const result = await session.client.stopRecording(recordingId);
+        let result: RecordingResult;
+        try {
+            result = await session.client.stopRecording(recordingId);
+        } catch (err) {
+            // An unreadable stop reply leaves the outcome unknown: keep the recording tracked and mark the session uncertain.
+            if (err instanceof RtpbridgeRequestError && err.code === 'protocol_error' && this.sessions.get(session.sessionId) === session) {
+                this.recordingUncertain.set(session.sessionId, ++this.uncertainSeq);
+            }
+            throw err;
+        }
         this.recordings.delete(recordingId);
-        return { ...result, ...this.recordingMetadata(session, result.filePath || metadata.filePath) };
+        // The start-validated path is authoritative: rtpbridge's reply may carry a canonical/symlink-resolved one.
+        return this.appendFinalizedRecording(session, recordingId, { ...result, filePath: metadata.filePath }, metadata.filePath);
+    }
+
+    private appendFinalizedRecording(session: MediaSessionRecord, recordingId: string, result: RecordingResult, fallbackPath: string) {
+        const finalized = { ...result, ...this.recordingMetadata(session, result.filePath || fallbackPath) };
+        // A late reply for a dropped session must not resurrect history that nothing will clean up.
+        if (this.sessions.get(session.sessionId) !== session) return finalized;
+        const completed = this.handoffRecordings.get(session.sessionId) ?? [];
+        this.handoffRecordings.set(session.sessionId, completed);
+        if (completed.some(item => item.recordingId === recordingId)) return finalized;
+        completed.push({ recordingId, ...finalized });
+        if (completed.length > MAX_HANDOFF_RECORDINGS) completed.splice(0, completed.length - MAX_HANDOFF_RECORDINGS);
+        return finalized;
     }
 
     async listRecordings(params: { backendId?: string; startsWith?: string; skip?: number; limit?: number } = {}) {
@@ -474,7 +732,9 @@ export class MediaSessionService implements GatewayMediaController {
         const limit = Math.min(Math.max(1, params.limit ?? 100), 1000);
         const backends = params.backendId ? [await this.mediaServers.resolveBackend(params.backendId)] : await this.mediaServers.resolveBackends();
 
-        const byBackend = await Promise.all(backends.map(async backend => this.listBackendRecordings(backend, params.startsWith ?? this.recordingPathPrefix)));
+        const byBackend = await Promise.all(
+            backends.map(async backend => this.listBackendRecordings(backend, params.startsWith ?? this.recordingPathPrefix))
+        );
         const all = byBackend
             .flat()
             .filter(item => !this.recordingPathPrefix || this.ownsRecordingPath(item.path))
@@ -593,11 +853,14 @@ export class MediaSessionService implements GatewayMediaController {
         type: MediaEndpointType,
         direction?: string,
         bridge?: { pairedSessionId?: string; pairedEndpointId?: string }
-    ) {
+    ): boolean {
+        // A late backend reply for a dropped session must not repopulate indexes that nothing will clean up.
+        if (this.sessions.get(session.sessionId) !== session) return false;
         const now = new Date().toISOString();
         session.endpoints.set(endpointId, { endpointId, type, direction, ...bridge, createdAt: now });
         this.endpointToSession.set(endpointId, session.sessionId);
         this.touch(session);
+        return true;
     }
 
     private touch(session: MediaSessionRecord) {
@@ -605,12 +868,16 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     private dropSession(sessionId: string) {
+        this.handoffSessions.delete(sessionId);
+        this.recordingUncertain.delete(sessionId);
+        this.handoffRecordings.delete(sessionId);
         const session = this.sessions.get(sessionId);
         if (!session) return;
         this.cancelSessionActions(session);
         this.dropPairedBridgeEndpoints(session);
         this.sessions.delete(sessionId);
         for (const endpointId of session.endpoints.keys()) {
+            this.rtpLocalSdp.delete(endpointId);
             this.endpointToSession.delete(endpointId);
             this.sensitiveGatherEndpointIds.delete(endpointId);
         }
@@ -665,12 +932,12 @@ export class MediaSessionService implements GatewayMediaController {
                 timer = setTimeout(() => finish('timeout'), delayMs);
             };
 
-            const onTimeoutReset = (event: { endpointId?: string }) => {
+            const onTimeoutReset = this.guarded('gather.timeoutReset', (event: { endpointId?: string }) => {
                 if (digits || !hooks.resetTimeoutOn?.matches(event)) return;
                 armTimer(hooks.resetTimeoutOn.timeoutMs);
-            };
+            });
 
-            const onDtmf = (event: { endpointId?: string; digit?: string }) => {
+            const onDtmf = this.guarded('dtmf', (event: { endpointId?: string; digit?: string }) => {
                 if (event.endpointId !== params.endpointId || !event.digit) return;
                 const digit = event.digit.toUpperCase();
                 if (terminator.includes(digit)) {
@@ -688,7 +955,7 @@ export class MediaSessionService implements GatewayMediaController {
                     return;
                 }
                 armTimer(interDigitTimeoutMs);
-            };
+            });
 
             cancel = () => finish('cancelled');
             session.client.on('dtmf', onDtmf);
@@ -714,15 +981,15 @@ export class MediaSessionService implements GatewayMediaController {
                 resolve(reason);
             };
             const maxTimer = setTimeout(() => done('max-duration'), maxDurationMs);
-            const onSilence = (event?: { endpointId?: string }) => {
+            const onSilence = this.guarded('vad.silence', (event?: { endpointId?: string }) => {
                 if (event?.endpointId && event.endpointId !== params.endpointId) return;
                 done('silence');
-            };
-            const onDtmf = (event: { endpointId?: string; digit?: string }) => {
+            });
+            const onDtmf = this.guarded('dtmf', (event: { endpointId?: string; digit?: string }) => {
                 if (event.endpointId === params.endpointId && event.digit && terminator.includes(event.digit.toUpperCase())) {
                     done('dtmf');
                 }
-            };
+            });
             const cleanup = () => {
                 clearTimeout(maxTimer);
                 session.client.removeListener('vad.silence', onSilence);
@@ -748,7 +1015,7 @@ export class MediaSessionService implements GatewayMediaController {
                     cleanup();
                     reject(new Error(`Media playback timed out after ${timeoutMs}ms`));
                 }, timeoutMs);
-                const onFinished = (event: { endpointId?: string; reason?: string; error?: string }) => {
+                const onFinished = this.guarded('endpoint.file.finished', (event: { endpointId?: string; reason?: string; error?: string }) => {
                     if (event.endpointId !== playback.endpointId) return;
                     cleanup();
                     if (event.reason === 'error' || event.error) {
@@ -756,7 +1023,7 @@ export class MediaSessionService implements GatewayMediaController {
                     } else {
                         resolve(true);
                     }
-                };
+                });
                 const onAbort = () => {
                     cleanup();
                     resolve(false);
@@ -797,6 +1064,7 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     private removeEndpointSnapshot(session: MediaSessionRecord, endpointId: string) {
+        this.rtpLocalSdp.delete(endpointId);
         session.endpoints.delete(endpointId);
         this.endpointToSession.delete(endpointId);
         this.pendingIceRestarts.delete(endpointId);
@@ -846,11 +1114,7 @@ export class MediaSessionService implements GatewayMediaController {
         }
     }
 
-    private async withSensitiveDtmf<T>(
-        session: MediaSessionRecord,
-        endpointId: string,
-        operation: () => Promise<T>
-    ): Promise<T> {
+    private async withSensitiveDtmf<T>(session: MediaSessionRecord, endpointId: string, operation: () => Promise<T>): Promise<T> {
         this.sensitiveGatherEndpointIds.add(endpointId);
         try {
             await session.client.setSensitiveDtmf(endpointId, true);
@@ -869,10 +1133,7 @@ export class MediaSessionService implements GatewayMediaController {
             } catch (err) {
                 // Fail closed: keep redacting downstream events if rtpbridge could
                 // not confirm that the endpoint left sensitive mode.
-                this.logger.error(
-                    { err, endpointId },
-                    'Failed to disable sensitive DTMF mode; continuing to redact endpoint events'
-                );
+                this.logger.error({ err, endpointId }, 'Failed to disable sensitive DTMF mode; continuing to redact endpoint events');
             }
         }
     }
@@ -922,7 +1183,12 @@ export class MediaSessionService implements GatewayMediaController {
 
     private ownsRecordingPath(recordingPath: string): boolean {
         const segments = safeRecordingPathSegments(recordingPath);
-        return segments.length === 1 && !!this.recordingPathPrefix && segments[0].startsWith(this.recordingPathPrefix) && segments[0].length > this.recordingPathPrefix.length;
+        return (
+            segments.length === 1 &&
+            !!this.recordingPathPrefix &&
+            segments[0].startsWith(this.recordingPathPrefix) &&
+            segments[0].length > this.recordingPathPrefix.length
+        );
     }
 
     private requireOwnedRecordingPath(recordingPath: string): void {
@@ -1011,8 +1277,7 @@ function redactSensitiveDtmfEvent(event: unknown, sensitiveEndpointIds: Set<stri
         return event;
     }
     const data = message.data as Partial<RtpbridgeDtmfEvent>;
-    const sensitive =
-        data.sensitive === true || (typeof data.endpointId === 'string' && sensitiveEndpointIds.has(data.endpointId));
+    const sensitive = data.sensitive === true || (typeof data.endpointId === 'string' && sensitiveEndpointIds.has(data.endpointId));
     if (!sensitive) return event;
     return {
         ...message,
@@ -1142,7 +1407,8 @@ function destroyStream(stream: unknown) {
 
 function positiveIntegerOrDefault(value: number | undefined, fallback: number | undefined) {
     if (value === undefined) return fallback;
-    if (!Number.isInteger(value) || value <= 0) throw new MediaRecordingProxyError(400, 'media action timing and count values must be positive integers');
+    if (!Number.isInteger(value) || value <= 0)
+        throw new MediaRecordingProxyError(400, 'media action timing and count values must be positive integers');
     return value;
 }
 

@@ -1,6 +1,8 @@
+import type { SipReturnMetadata, SipTransferStatus } from './sip-handoff-contract';
+
 export type SipHeaders = Record<string, string>;
 
-export interface InviteHttpRequest {
+export interface InviteHttpRequest extends Partial<SipReturnMetadata> {
     event: 'invite';
     callId: string;
     sipCallId: string;
@@ -16,13 +18,16 @@ export interface InviteHttpRequest {
 }
 
 export interface FollowUpHttpEvent {
-    event: 'answered' | 'reinvite' | 'bye' | 'terminated';
+    event: 'answered' | 'reinvite' | 'bye' | 'terminated' | 'transferred';
     callId: string;
     sipCallId: string;
     headers?: SipHeaders;
     sdp?: string;
     status?: number;
     reason?: string;
+    /** Set on a return attempt's `answered` and `terminated` events; matches the invite's `returnAttemptId`. */
+    returnAttemptId?: string;
+    transfer?: SipTransferStatus;
     receivedAt: string;
 }
 
@@ -44,7 +49,7 @@ export interface RejectAction {
 
 export type SipAction = AnswerAction | RejectAction;
 
-export class InvalidHttpActionError extends Error { }
+export class InvalidHttpActionError extends Error {}
 
 export function parseSipActionResponse(input: unknown, options?: { allowReceiverUrl?: boolean }): SipAction {
     if (!input || typeof input !== 'object') {
@@ -89,6 +94,20 @@ export function parseOptionalHeaders(input: unknown): SipHeaders | undefined {
     return headers;
 }
 
+/** Compares canonical receiver URLs, ignoring fragments because HTTP requests omit them. */
+export function sameReceiverUrl(a: string, b: string): boolean {
+    if (a === b) return true;
+    try {
+        const first = new URL(a);
+        const second = new URL(b);
+        first.hash = '';
+        second.hash = '';
+        return first.href === second.href;
+    } catch {
+        return false;
+    }
+}
+
 function parseOptionalReceiverUrl(input: unknown, allowReceiverUrl: boolean) {
     if (input === undefined || input === null) return undefined;
     if (!allowReceiverUrl) throw new InvalidHttpActionError('receiverUrl is not accepted for this response');
@@ -108,3 +127,10 @@ function parseRequiredStatus(input: unknown, min: number, max: number, name: str
     }
     return input;
 }
+
+/** Transfer IDs are retained for the life of a call: a small byte limit and a conservative character set bound that memory. */
+export const TRANSFER_ID_MAX_BYTES = 128;
+export function isValidTransferId(value: string) {
+    return /^[A-Za-z0-9._:-]+$/.test(value) && Buffer.byteLength(value, 'utf8') <= TRANSFER_ID_MAX_BYTES;
+}
+export const TRANSFER_ID_ERROR = `transferId must be 1-${TRANSFER_ID_MAX_BYTES} bytes of [A-Za-z0-9._:-]`;
