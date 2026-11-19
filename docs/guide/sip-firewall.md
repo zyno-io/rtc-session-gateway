@@ -7,12 +7,15 @@ database. Restarting the gateway discards scores, repeat-offender tiers and
 runtime manual blocks.
 
 The gateway stays unprivileged and portable. Only the sidecar needs Linux and
-`NET_ADMIN`. It ships as its own image, built from `firewall-sidecar/Dockerfile`
-(`yarn build:firewall-sidecar-image`). Its native dependency, `nftables-napi`, is
-AGPL-3.0-only and lives only in that image: it is never in the gateway's
-dependencies or its production image. Operating the sidecar image as a separate
-network service keeps the gateway's own license unaffected; review the AGPL terms
-before modifying and redistributing the sidecar.
+`NET_ADMIN`. CI publishes `ghcr.io/zyno-io/rtc-session-gateway-firewall-sidecar`
+with `:main` and a seven-character commit SHA tag for builds from `main`. Release
+builds use the Git tag, such as `:v0.1.0`. The highest stable release also gets
+`:latest`. To build locally, run `yarn build:firewall-sidecar-image`.
+
+The sidecar image contains the AGPL-3.0-only native dependency `nftables-napi`.
+Operating the sidecar as a separate network service keeps the gateway's own
+license unaffected. Review the AGPL terms before modifying and redistributing
+the sidecar.
 
 ## Detection
 
