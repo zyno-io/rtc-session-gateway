@@ -272,7 +272,7 @@ test('Codex 2: a snapshot-first answer carrying a mislabeled body resolves as no
     }
 });
 
-test('Codex 2: an offerless re-INVITE offer needs an SDP-carrying final response (a mislabeled 2xx body is no offer)', async () => {
+test('an offerless re-INVITE uses the SDP-carrying final response as the offer', async () => {
     const snapshot = { remoteSdp: Buffer.from('stale-previous-sdp') };
     const dialogWith = (response: unknown) => {
         const owner = {
@@ -285,7 +285,7 @@ test('Codex 2: an offerless re-INVITE offer needs an SDP-carrying final response
     };
     const body = Buffer.from('v=0\r\n');
     const message = (contentType?: string) => ({ body, headers: contentType ? [{ name: 'Content-Type', value: contentType }] : [] });
-    assert.deepEqual(await dialogWith(message('application/sdp')).reinviteOffer(), { sdp: 'stale-previous-sdp', offered: true });
+    assert.deepEqual(await dialogWith(message('application/sdp')).reinviteOffer(), { sdp: body.toString('utf8'), offered: true });
     assert.deepEqual(await dialogWith(message('text/plain')).reinviteOffer(), { sdp: '', offered: false });
     assert.deepEqual(await dialogWith(message()).reinviteOffer(), { sdp: '', offered: false });
     assert.deepEqual(await dialogWith(undefined).reinviteOffer(), { sdp: '', offered: false });

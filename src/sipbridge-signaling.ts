@@ -256,19 +256,19 @@ export class NativeDialog extends EventEmitter {
     /**
      * Offerless re-INVITE with the exact final response classified: `sdp` is the peer's late offer only when `offered` is
      * true (the 2xx carried an application/sdp body, so an ACK answer is owed). Any other body was already ACKed empty by
-     * sipbridge and is no offer (the snapshot's remote SDP would then be the stale previous one).
+     * sipbridge. Read the SDP from the response because the snapshot describes current dialog state.
      */
     async reinviteOffer(headers?: Record<string, string>): Promise<{ sdp: string; offered: boolean }> {
         let response: OperationResult['response'];
-        const snapshot = await this.owner.command(
+        await this.owner.command(
             this.state,
             { $case: 'dialogRequest', dialogRequest: { method: 'INVITE', body: Buffer.alloc(0), headers: nativeHeaders(headers) } },
             result => {
                 response = result.response;
             }
         );
-        const offered = !!response && messageCarriesSdp(response);
-        return { sdp: offered ? Buffer.from(snapshot.remoteSdp).toString('utf8') : '', offered };
+        if (!response || !messageCarriesSdp(response)) return { sdp: '', offered: false };
+        return { sdp: Buffer.from(response.body).toString('utf8'), offered: true };
     }
     /** Sends the ACK answer for a late-offer 2xx (an initial late-offer UAC or an offerless re-INVITE we sent). */
     async ackAnswer(sdp: string, headers?: Record<string, string>) {
