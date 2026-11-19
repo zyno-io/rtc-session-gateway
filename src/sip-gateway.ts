@@ -38,7 +38,8 @@ import {
     parseReplaces,
     rejectSdpOffer,
     relaySdp,
-    sharesMediaEndpoint
+    sharesMediaEndpoint,
+    usesHostnameMedia
 } from './sip-sdp';
 import { sourceIp } from './firewall-address';
 import { acceptsSipHost, getSipUser, matchRoute, stripSipUri } from './routing';
@@ -573,6 +574,7 @@ export class SipGateway {
         const previousRemoteSdp = this.syncRemoteSdp(call);
         let prepared = false;
         let releaseMedia = () => {};
+        let releaseRestore = () => {};
         try {
             const action = await this.sendFollowUpEvent(
                 call,
@@ -637,10 +639,16 @@ export class SipGateway {
                         this.assertLiveCall(call);
                         if (call.dialog.isFenced) throw new InvalidCallStateError('Original dialog is fenced');
                         this.assertMediaUnreserved(restored.sdp, call);
+                        // Held through commit/cleanup (released in the outer finally): another call's handoff must not destroy it.
+                        releaseRestore = this.claimLocalMedia(restored.sdp, call);
                         const offer = relaySdp(restored.sdp, committed);
                         this.sentSdp.set(call.dialog, offer);
                         const answer = await call.dialog.reinvite(offer);
-                        assertDirectMediaAnswer(offer, answer);
+                        // The application never sees this answer, so it must leave the carrier exactly where it was
+                        // (address, direction, codecs, SDES keys); anything else cannot be kept and ends the call.
+                        assertRollbackAnswer(answer, previousRemoteSdp, offer, previousRemoteSdp);
+                        this.assertLiveCall(call);
+                        this.assertMediaUnreserved(restored.sdp, call);
                         this.updateCallSdp(call, { localSdp: offer, remoteSdp: answer });
                     } else {
                         this.updateCallSdp(call, { localSdp: restored.sdp, remoteSdp: previousRemoteSdp });
@@ -652,6 +660,7 @@ export class SipGateway {
             this.logger.warn({ callId: call.callId, failure: 'replacement-failed' }, 'Failed to replace application SIP dialog');
             if (!res.finalResponseSent) await res.respond(sipStatusForError(err)).catch(() => undefined);
         } finally {
+            releaseRestore();
             releaseMedia();
             this.modifyingPairs.delete(call);
         }
@@ -827,6 +836,17 @@ export class SipGateway {
      */
     private assertExclusiveMedia(call: ActiveCall) {
         if (!call.localSdp) return;
+        // A hostname connection address cannot be compared without resolving it, so exclusivity cannot be established.
+        const hostname = (sdp: string | undefined) => !!sdp && usesHostnameMedia(sdp);
+        if (
+            hostname(call.localSdp) ||
+            this.registry.list().some(other => hostname(other.localSdp)) ||
+            [...this.pendingLocalMedia].some(claim => hostname(claim.sdp))
+        ) {
+            throw new InvalidCallStateError(
+                'Handoff media exclusivity cannot be established: an active SIP call binds a hostname connection address'
+            );
+        }
         const shares = (sdp: string | undefined) => {
             if (!sdp) return false;
             try {

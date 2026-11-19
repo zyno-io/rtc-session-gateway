@@ -972,6 +972,7 @@ export class SipbridgeSignaling extends EventEmitter {
                 if (action.$case === 'dialogRequest' && result.certainty === OperationResult_Certainty.COMPLETED) {
                     const method = action.dialogRequest.method.toUpperCase();
                     const status = result.sipStatus ?? 0;
+                    // BYE/ACK status is not validated: RFC 3261 15.1.1 treats the session as terminated once the BYE reaches the client transaction, whatever the final response.
                     if (method !== 'ACK' && method !== 'BYE') {
                         // 408/481 (or no response at all) to a re-INVITE, or 481 to an in-dialog request, means the dialog is gone.
                         // A 481 to NOTIFY/SUBSCRIBE ends only that subscription usage (RFC 6665), not the INVITE dialog.

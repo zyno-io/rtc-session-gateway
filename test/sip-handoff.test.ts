@@ -14,7 +14,8 @@ import {
     parseReplaces,
     rejectSdpOffer,
     relaySdp,
-    sharesMediaEndpoint
+    sharesMediaEndpoint,
+    usesHostnameMedia
 } from '../src/sip-sdp';
 import { loadFirewallConfig, SipFirewall } from '../src/sip-firewall';
 import { NativeOperationError, type SipbridgeSignaling } from '../src/sipbridge-signaling';
@@ -2299,11 +2300,11 @@ test('a carrier fenced while the destination ACK is in flight is not committed b
     assert.equal(sentEvents(f, 'sip.terminated').length, 1);
 });
 
-test('a transfer rollback answer with extra payload types keeps the call', async () => {
+test('a transfer rollback answer with extra non-voice payload types keeps the call', async () => {
     const f = await fixture();
     f.center.ackFailure = new Error('ACK send rejected');
     let calls = 0;
-    f.caller.reinviteHook = async () => (++calls === 1 ? sdp('10.0.0.1') : sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101'));
+    f.caller.reinviteHook = async () => (++calls === 1 ? sdp('10.0.0.1') : sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 101 13'));
     await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
     await settle();
     assert.equal(f.registry.size, 1);
@@ -2322,7 +2323,7 @@ test('a transfer rollback answer on a new carrier port ends the call', async () 
     assert.equal(f.caller.byes, 1);
 });
 
-test('a return rollback answer with extra payload types keeps the pair', async () => {
+test('a return rollback answer with extra non-voice payload types keeps the pair', async () => {
     const f = await handedOff();
     let calls = 0;
     // The first return re-INVITE is accepted by the carrier, but the owner disconnects before commit.
@@ -2332,7 +2333,7 @@ test('a return rollback answer with extra payload types keeps the pair', async (
             f.hub.isConnected = () => false;
             return sdp('10.0.0.1');
         }
-        return sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101');
+        return sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 101 13');
     };
     f.center.emit('request', refer(), new Response());
     await settle();
@@ -2522,7 +2523,7 @@ test('a Replaces whose quoted parameter contains a comma is not rejected as malf
 test('rollback and endpoint helpers', () => {
     const prev = sdp('10.0.0.1');
     const restore = sdp('10.0.0.3');
-    assertRollbackAnswer(sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101'), prev, restore);
+    assertRollbackAnswer(sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 101 13'), prev, restore);
     assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 0), prev, restore), /rejected/);
     assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 40002), prev, restore), /address/);
     assert.equal(sharesMediaEndpoint(sdp('10.0.0.3'), sdp('10.0.0.3')), true);
@@ -2783,20 +2784,80 @@ test('endpoint sharing canonicalizes IPv6 spelling, brackets, mapped IPv4 and nu
     assert.equal(sharesMediaEndpoint(v6('::ffff:10.0.0.3', 40000), media('10.0.0.3', 40000, '0', [PCMU])), true);
 });
 
-test('a rollback answer must keep the voice codec the untouched leg selected', () => {
+test('a rollback answer must keep exactly the voice codecs the untouched leg negotiated', () => {
     const previousSdp = media('10.0.0.3', 40000, '0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]);
     const previousRemoteSdp = media('10.0.0.1', 30000, '0 101', [PCMU, TELEPHONE_EVENT]);
     const answer = (pts: string, maps: string[]) => media('10.0.0.1', 30000, pts, maps);
-    // Transfer rollback: the untouched leg is the application endpoint, which negotiated PCMU.
-    assert.throws(() => assertRollbackAnswer(answer('8 101', [PCMA, TELEPHONE_EVENT]), previousRemoteSdp, previousSdp, previousRemoteSdp), /codec/);
-    assertRollbackAnswer(answer('0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]), previousRemoteSdp, previousSdp, previousRemoteSdp);
-    assertRollbackAnswer(answer('8 0', [PCMA, PCMU]), previousRemoteSdp, previousSdp, previousRemoteSdp);
-    // REFER rollback: the destination holds PCMU+PCMA but sends the first one (PCMU) that the carrier also had.
-    const destination = media('10.0.0.2', 45000, '0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]);
-    assert.throws(() => assertRollbackAnswer(answer('8', [PCMA]), previousRemoteSdp, previousSdp, destination), /codec/);
-    assertRollbackAnswer(answer('0 8', [PCMU, PCMA]), previousRemoteSdp, previousSdp, destination);
+    // Transfer rollback: the untouched leg is the application endpoint, which negotiated {PCMU} with the carrier.
+    assert.throws(
+        () => assertRollbackAnswer(answer('8 101', [PCMA, TELEPHONE_EVENT]), previousRemoteSdp, previousSdp, previousRemoteSdp),
+        /voice codecs/
+    );
+    // An extra voice codec is not negotiated either (the untouched leg decodes only what it negotiated).
+    assert.throws(
+        () => assertRollbackAnswer(answer('0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]), previousRemoteSdp, previousSdp, previousRemoteSdp),
+        /voice codecs/
+    );
+    assert.throws(() => assertRollbackAnswer(answer('8 0', [PCMA, PCMU]), previousRemoteSdp, previousSdp, previousRemoteSdp), /voice codecs/);
+    // Non-voice formats may come and go; order does not matter.
+    assertRollbackAnswer(answer('0 101', [PCMU, TELEPHONE_EVENT]), previousRemoteSdp, previousSdp, previousRemoteSdp);
+    assertRollbackAnswer(answer('0', [PCMU]), previousRemoteSdp, previousSdp, previousRemoteSdp);
+    assertRollbackAnswer(answer('101 0 13', [TELEPHONE_EVENT, PCMU]), previousRemoteSdp, previousSdp, previousRemoteSdp);
     // Static payload types match without an rtpmap.
     assertRollbackAnswer(answer('0', []), previousRemoteSdp, previousSdp, previousRemoteSdp);
+    // REFER rollback: the destination and the carrier negotiated {PCMU, PCMA}; the carrier may reorder but not drop PCMA.
+    const carrierBefore = media('10.0.0.1', 30000, '0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]);
+    const destination = media('10.0.0.2', 45000, '0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]);
+    assert.throws(() => assertRollbackAnswer(answer('0 101', [PCMU]), carrierBefore, previousSdp, destination), /voice codecs/);
+    assertRollbackAnswer(answer('8 0', [PCMA, PCMU]), carrierBefore, previousSdp, destination);
+    // Codex 3: negotiated `0 8`, the destination may send PCMA, the restored answer accepts PCMU only.
+    assert.throws(() => assertRollbackAnswer(answer('0', [PCMU]), carrierBefore, previousSdp, destination), /voice codecs/);
+});
+
+test('rollback codec identity survives unmapped dynamic and static payload types', () => {
+    const offer = (pts: string, maps: string[]) => media('10.0.0.3', 40000, pts, maps);
+    const opus = ['a=rtpmap:111 opus/48000/2', 'a=rtpmap:101 telephone-event/48000'];
+    const previous = media('10.0.0.1', 30000, '111 101', opus);
+    // An answer that leaves the dynamic type unmapped keeps the mapping the offer gave it.
+    assertRollbackAnswer(media('10.0.0.1', 30000, '111 101', []), previous, offer('111 101', opus), previous);
+    // Static PT 15 (G728) with an rtpmap on only one side.
+    const g728 = ['a=rtpmap:15 G728/8000'];
+    const g728Previous = media('10.0.0.1', 30000, '15', g728);
+    assertRollbackAnswer(media('10.0.0.1', 30000, '15', []), g728Previous, offer('15', g728), g728Previous);
+    assertRollbackAnswer(media('10.0.0.1', 30000, '15', g728), g728Previous, offer('15', []), g728Previous);
+    // R4: the application offered opus, G722 and PCMU but negotiated PCMU; an answer led by G722 is not what it decodes.
+    const appOffer = offer('111 9 0 101', [...opus, 'a=rtpmap:9 G722/8000', PCMU]);
+    const carrierBefore = media('10.0.0.1', 30000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000']);
+    assert.throws(
+        () =>
+            assertRollbackAnswer(
+                media('10.0.0.1', 30000, '9 0 101', ['a=rtpmap:9 G722/8000', PCMU, 'a=rtpmap:101 telephone-event/48000']),
+                carrierBefore,
+                appOffer,
+                carrierBefore
+            ),
+        /voice codecs/
+    );
+    assertRollbackAnswer(media('10.0.0.1', 30000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000']), carrierBefore, appOffer, carrierBefore);
+});
+
+test('a rollback answer must not change the SDES keys of the carrier stream', () => {
+    const withKey = (key: string) => media('10.0.0.1', 30000, '0', [PCMU, `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${key}`]);
+    const restore = media('10.0.0.3', 40000, '0', [PCMU]);
+    assertRollbackAnswer(withKey('AAAA'), withKey('AAAA'), restore);
+    assert.throws(() => assertRollbackAnswer(withKey('BBBB'), withKey('AAAA'), restore), /SDES/);
+    assert.throws(() => assertRollbackAnswer(media('10.0.0.1', 30000, '0', [PCMU]), withKey('AAAA'), restore), /SDES/);
+    assertRollbackAnswer(withKey('BBBB'), media('10.0.0.1', 30000, '0', [PCMU]), restore);
+});
+
+test('hostname connection addresses are detected, IP literals are not', () => {
+    const host = (address: string, port = 4000) =>
+        ['v=0', 'o=- 1 1 IN IP4 x', 's=-', `c=IN IP4 ${address}`, 't=0 0', `m=audio ${port} RTP/AVP 0`, ''].join('\r\n');
+    assert.equal(usesHostnameMedia(host('media.example.com')), true);
+    assert.equal(usesHostnameMedia(host('10.0.0.1')), false);
+    assert.equal(usesHostnameMedia(host('10.0.0.1/127')), false);
+    assert.equal(usesHostnameMedia(host('media.example.com', 0)), false, 'a rejected stream binds nothing');
+    assert.equal(usesHostnameMedia(media('2001:db8::1', 4000, '0', [PCMU], 'IP6')), false);
 });
 
 test('a direct-media answer is classified by the offer rtpmap when the answer leaves a payload type unmapped', () => {
@@ -2956,4 +3017,86 @@ test('a failed application-owned Replaces ends the call when the original peer r
     );
     await settle(30);
     assert.equal(f.registry.get('caller'), undefined);
+});
+
+const withCrypto = (text: string, key: string) => text.replace('a=sendrecv', `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${key}\r\na=sendrecv`);
+
+/** A replacement INVITE that is cancelled, so the application restores media: first answer binds 10.0.0.8, the restore 10.0.0.9. */
+async function failedReplaceWithRestore(f: Fixture, carrierAnswer: () => Promise<string>) {
+    const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
+    f.hub.request = (async () => ({ action: 'answer', sdp: answers.shift()! })) as never;
+    f.caller.reinviteHook = carrierAnswer;
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(10);
+}
+
+test('a replace restore whose carrier answer moved its media port ends the call', async () => {
+    const f = await fixture();
+    await failedReplaceWithRestore(f, async () => sdp('10.0.0.1', 31000));
+    assert.equal(f.registry.get('caller'), undefined);
+    assert.ok(f.caller.byes >= 1);
+});
+
+test('a replace restore whose carrier answer changed the SDES key ends the call, an unchanged key keeps it', async () => {
+    const changed = await fixture();
+    changed.caller.remoteSdp = changed.call.remoteSdp = withCrypto(sdp('10.0.0.1'), 'AAAA');
+    await failedReplaceWithRestore(changed, async () => withCrypto(sdp('10.0.0.1'), 'BBBB'));
+    assert.equal(changed.registry.get('caller'), undefined);
+    assert.ok(changed.caller.byes >= 1);
+
+    const same = await fixture();
+    same.caller.remoteSdp = same.call.remoteSdp = withCrypto(sdp('10.0.0.1'), 'AAAA');
+    await failedReplaceWithRestore(same, async () => withCrypto(sdp('10.0.0.1'), 'AAAA'));
+    assert.ok(same.registry.get('caller'));
+    assert.equal(same.caller.byes, 0);
+});
+
+test('a replace restore with an unchanged carrier answer is kept', async () => {
+    const f = await fixture();
+    await failedReplaceWithRestore(f, async () => sdp('10.0.0.1'));
+    assert.ok(f.registry.get('caller'));
+    assert.equal(f.caller.byes, 0);
+    assert.match(f.registry.get('caller')!.localSdp ?? '', /c=IN IP4 10\.0\.0\.9/);
+});
+
+test('a transfer of another call is refused while a replace restore re-INVITE is in flight', async () => {
+    const f = await fixture();
+    f.hub.request = async () => ({ action: 'answer', sdp: sdp('10.0.0.9', 49000) }) as never;
+    await f.gateway.handleInvite(invite({}, 'callB', '10.0.0.5') as never, new Response(new Dialog('callB', 'gB', 'rB')) as never);
+    await turn();
+    assert.ok(f.registry.get('callB'));
+    const gate = Promise.withResolvers<void>();
+    const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
+    f.hub.request = async () => ({ action: 'answer', sdp: answers.shift()! }) as never;
+    f.caller.reinviteHook = async () => {
+        await gate.promise;
+        return sdp('10.0.0.1');
+    };
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(10);
+    await assert.rejects(
+        f.gateway.transfer({ sessionId: 'callB', mediaSessionId: 'mB', transferId: 'tB', requestUri: 'sip:center@center.example' }, 'app'),
+        /shared with another SIP call/
+    );
+    gate.resolve();
+    await pending;
+    await settle(10);
+    assert.ok(f.registry.get('caller'));
+    assert.ok(f.registry.get('callB'));
+});
+
+test('a transfer is refused when any active call binds a hostname connection address', async () => {
+    const f = await fixture();
+    f.call.localSdp = sdp('10.0.0.3').replace('c=IN IP4 10.0.0.3', 'c=IN IP4 media.example.com');
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /hostname/);
+    assert.equal(f.caller.reinvites.length, 0);
+    assert.equal(f.call.ownership, 'application');
 });

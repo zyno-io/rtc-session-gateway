@@ -45,6 +45,8 @@ interface MediaSection {
     direction: string;
     /** Payload type to lowercase `encoding/clock`. */
     rtpmap: Map<string, string>;
+    /** SDES `suite key-params` of every a=crypto line (the tag is not part of the key identity). */
+    crypto: Set<string>;
 }
 
 const DIRECTIONS = new Set(['sendrecv', 'sendonly', 'recvonly', 'inactive']);
@@ -57,7 +59,7 @@ function parseMediaSections(sdp: string): MediaSection[] {
     for (const line of sdp.trim().split(/\r?\n/)) {
         if (line.startsWith('m=')) {
             const [type, port, protocol, ...formats] = line.slice(2).trim().split(/\s+/);
-            current = { type, port: Number(port), protocol, formats, connection: '', direction: '', rtpmap: new Map() };
+            current = { type, port: Number(port), protocol, formats, connection: '', direction: '', rtpmap: new Map(), crypto: new Set() };
             sections.push(current);
         } else if (line.startsWith('c=')) {
             if (current) current.connection = line.slice(2).trim();
@@ -67,6 +69,9 @@ function parseMediaSections(sdp: string): MediaSection[] {
             if (DIRECTIONS.has(attribute)) {
                 if (current) current.direction = attribute;
                 else sessionDirection = attribute;
+            } else if (current && attribute.startsWith('crypto:')) {
+                const [, suite, params] = attribute.split(/\s+/);
+                if (suite && params) current.crypto.add(`${suite} ${params}`);
             } else if (current && attribute.startsWith('rtpmap:')) {
                 const match = /^rtpmap:(\d+)\s+([^/\s]+)\/(\d+)/.exec(attribute);
                 if (match) current.rtpmap.set(match[1], `${match[2].toLowerCase()}/${match[3]}`);
@@ -118,48 +123,50 @@ const STATIC_ENCODINGS: Record<string, string> = {
     '18': 'g729/8000'
 };
 
-/** Identity of a payload type independent of its number: `encoding/clock` from the rtpmap or the static assignment. */
-function codecIdentity(section: MediaSection, pt: string): string | undefined {
-    return section.rtpmap.get(pt) ?? (Number(pt) < 96 ? (STATIC_ENCODINGS[pt] ?? `static:${pt}`) : undefined);
+/**
+ * Identity of a payload type independent of its number: `encoding/clock`. Static types (< 96) have a fixed meaning
+ * (RFC 3551), so any rtpmap is ignored for them on both sides; a dynamic type unmapped in `section` takes the mapping of
+ * `fallbacks` (RFC 3264 6.1: an answer keeps the meaning the offer gave a type it leaves unmapped).
+ */
+function codecIdentity(section: MediaSection, pt: string, ...fallbacks: (MediaSection | undefined)[]): string {
+    if (Number(pt) < 96) return STATIC_ENCODINGS[pt] ?? `static:${pt}`;
+    for (const source of [section, ...fallbacks]) {
+        const mapped = source?.rtpmap.get(pt);
+        if (mapped) return mapped;
+    }
+    return `dynamic:${pt}`;
+}
+
+/** The set of voice-codec identities of a stream (telephone-event, CN and repair formats excluded). */
+function voiceCodecs(section: MediaSection, ...fallbacks: (MediaSection | undefined)[]): Set<string> {
+    const found = new Set<string>();
+    for (const pt of section.formats) {
+        if (
+            isVoiceFormat(
+                section,
+                pt,
+                fallbacks.find(other => other?.rtpmap.has(pt))
+            )
+        )
+            found.add(codecIdentity(section, pt, ...fallbacks));
+    }
+    return found;
 }
 
 /**
- * The voice codec the untouched leg keeps sending on every stream active in both: the first voice format of its
- * description (RFC 3264 5.1: the first format is the preferred one) that the other negotiated descriptions also carry.
- * Constraints that no format satisfies are dropped, last first, so the leg's own first voice codec is the floor.
+ * The voice codecs the untouched leg and the carrier negotiated on each audio stream both still use: the
+ * intersection of the leg's description and the carrier's previous one.
  */
-function selectedVoiceCodecs(leg: string, ...negotiated: string[]): Map<number, string> {
-    const selected = new Map<number, string>();
-    const others = negotiated.map(parseMediaSections);
+function negotiatedVoiceCodecs(leg: string, previousRemoteSdp: string): Map<number, Set<string>> {
+    const negotiated = new Map<number, Set<string>>();
+    const before = parseMediaSections(previousRemoteSdp);
     for (const [index, section] of parseMediaSections(leg).entries()) {
-        if (section.type !== 'audio' || !(section.port > 0)) continue;
-        const voice = section.formats.filter(pt => isVoiceFormat(section, pt));
-        const peers = others.map(sections => sections[index]).filter(other => other?.port > 0);
-        let pt: string | undefined;
-        for (let count = peers.length; count >= 0 && !pt; count--) {
-            pt = voice.find(candidate => peers.slice(0, count).every(other => sharesFormat(other, { ...section, formats: [candidate] })));
-        }
-        const identity = pt && codecIdentity(section, pt);
-        if (identity) selected.set(index, identity);
+        const other = before[index];
+        if (section.type !== 'audio' || !(section.port > 0) || !other || !(other.port > 0)) continue;
+        const theirs = voiceCodecs(other, section);
+        negotiated.set(index, new Set([...voiceCodecs(section, other)].filter(identity => theirs.has(identity))));
     }
-    return selected;
-}
-
-/**
- * True when every stream that is active (port > 0) in both descriptions shares a real voice codec. Used to prove a
- * restored answer still matches what the other leg is sending.
- */
-export function sharesVoiceCodec(a: string, b: string): boolean {
-    const left = parseMediaSections(a);
-    const right = parseMediaSections(b);
-    let compared = false;
-    for (const [index, media] of right.entries()) {
-        const other = left[index];
-        if (!other || !(media.port > 0) || !(other.port > 0) || media.type !== 'audio') continue;
-        compared = true;
-        if (!sharesFormat(other, media)) return false;
-    }
-    return compared;
+    return negotiated;
 }
 
 /**
@@ -195,9 +202,12 @@ const ANSWER_DIRECTION: Record<string, string> = {
  * asked for (an answer that turns a bidirectional stream into inactive or one-way leaves the call on hold), and at
  * least one audio stream must remain active. Streams the restore offer declined (port 0) are not compared. Extra
  * payload types are allowed (RFC 3264 6.1); anything that changes the carrier's media address cannot be repaired.
- * When `otherLegSdp` (the SDP the untouched leg negotiated and keeps sending against) is given, the answer must also
- * still include the voice codec that leg selected (its first voice format also present in `previousRemoteSdp` and the restore offer); a
- * restored answer that only lists some other shared codec leaves the untouched leg sending a format nobody expects.
+ * SDES keys cannot be re-derived by the restored side: an active stream whose previous carrier description had
+ * a=crypto must answer only with keys it already had.
+ * When `otherLegSdp` (the SDP the untouched leg negotiated and keeps sending against) is given, the answer's voice codecs
+ * must equal, per stream, the set negotiated before (the voice codecs in both `otherLegSdp` and `previousRemoteSdp`):
+ * dropping one leaves the untouched leg sending a format nobody expects, and adding one the untouched leg may not decode.
+ * Non-voice formats (telephone-event, CN) are ignored.
  */
 export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string, otherLegSdp?: string) {
     const restored = parseMediaSections(restoreOffer);
@@ -214,17 +224,20 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
             throw new Error('Rollback changed the carrier media address');
         }
         if (media.direction !== ANSWER_DIRECTION[offered.direction]) throw new Error('Rollback did not restore the media direction');
+        if (before.crypto.size && (!media.crypto.size || [...media.crypto].some(key => !before.crypto.has(key)))) {
+            throw new Error('Rollback changed the SDES crypto keys');
+        }
         if (media.type === 'audio') audioActive = true;
     }
     if (!audioActive) throw new Error('Rollback audio was rejected');
-    // The other leg keeps sending the codec it already negotiated: the restored answer must still accept a real voice codec of it.
+    // The other leg keeps using the codecs it negotiated: the restored answer must offer exactly that voice set.
     if (otherLegSdp) {
-        if (!sharesVoiceCodec(otherLegSdp, answer)) throw new Error('Rollback answer shares no voice codec with the other leg');
-        for (const [index, identity] of selectedVoiceCodecs(otherLegSdp, previousRemoteSdp, restoreOffer)) {
+        for (const [index, expected] of negotiatedVoiceCodecs(otherLegSdp, previousRemoteSdp)) {
             const media = answered[index];
-            if (!media || !(media.port > 0)) continue;
-            if (!media.formats.some(pt => isVoiceFormat(media, pt) && codecIdentity(media, pt) === identity)) {
-                throw new Error('Rollback answer dropped the voice codec the other leg selected');
+            if (!media || !(media.port > 0) || !expected.size) continue;
+            const actual = voiceCodecs(media, restored[index]);
+            if (actual.size !== expected.size || [...actual].some(identity => !expected.has(identity))) {
+                throw new Error('Rollback answer changed the negotiated voice codecs of the other leg');
             }
         }
     }
@@ -237,6 +250,35 @@ function canonicalConnection(connection: string): string {
     const canonical = sourceIp(host);
     // A mapped IPv6 address canonicalizes to its IPv4 form, which is the same endpoint.
     return canonical ? canonical : `${nettype}|${addrtype}|${host.toLowerCase()}`.toLowerCase();
+}
+
+/**
+ * True when an active stream's connection address is not an IP literal. A hostname cannot be compared to another
+ * description without resolving it, so endpoint exclusivity cannot be established for such media.
+ */
+export function usesHostnameMedia(sdp: string): boolean {
+    let session = '';
+    let current: { port: number; connection: string } | undefined;
+    let found = false;
+    const flush = () => {
+        if (!current || !(current.port > 0) || !current.connection) return;
+        const host = (current.connection.trim().split(/\s+/)[2] ?? '')
+            .split('/')[0]
+            .replace(/^\[(.*)\]$/, '$1')
+            .split('%')[0];
+        if (host && !isIP(host)) found = true;
+    };
+    for (const line of sdp.trim().split(/\r?\n/)) {
+        if (line.startsWith('m=')) {
+            flush();
+            current = { port: Number(line.slice(2).split(/\s+/)[1]), connection: session };
+        } else if (line.startsWith('c=')) {
+            if (current) current.connection = line.slice(2).trim();
+            else session = line.slice(2).trim();
+        }
+    }
+    flush();
+    return found;
 }
 
 /** True when two session descriptions send media to a common address and port (an RTP endpoint shared by two calls). */
