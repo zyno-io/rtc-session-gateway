@@ -514,6 +514,11 @@ export class MediaSessionService implements GatewayMediaController {
             if (unknownOutcome && this.sessions.get(sessionId) === session) this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
             throw err;
         }
+        if (typeof result?.recordingId !== 'string' || !result.recordingId) {
+            // Defensive: never track a recording under an undefined id; reconcile through session.info on the next handoff.
+            if (this.sessions.get(sessionId) === session) this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
+            throw new RtpbridgeRequestError('rtpbridge protocol error: recording.start reply has no recording_id', 'protocol_error');
+        }
         const metadata = this.recordingMetadata(session, filePath);
         this.recordings.set(result.recordingId, { sessionId, ...metadata });
         return { ...result, ...metadata };

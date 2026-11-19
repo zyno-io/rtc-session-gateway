@@ -243,7 +243,12 @@ export class RtpbridgeClient extends EventEmitter {
     }
 
     async startRecording(sessionId: string, params: { endpointId?: string; filePath: string }): Promise<{ recordingId: string }> {
-        return this.sendRequest('recording.start', { sessionId, ...params });
+        const reply = await this.sendRequest('recording.start', { sessionId, ...params });
+        // A reply without a usable id cannot be tracked or stopped: treat it as an unknown outcome (the worker may be recording).
+        if (typeof reply?.recordingId !== 'string' || !reply.recordingId) {
+            throw new RtpbridgeRequestError('rtpbridge protocol error: recording.start reply has no recording_id', 'protocol_error');
+        }
+        return reply as { recordingId: string };
     }
 
     /** Recordings rtpbridge currently holds for this connection's session (`session.info`). */

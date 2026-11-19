@@ -83,3 +83,23 @@ test('hostile reply and deeply nested event frames are contained; matching pendi
         wss.close();
     }
 });
+
+test('startRecording rejects a reply without a usable recording id as protocol_error', async () => {
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise(resolve => wss.once('listening', resolve));
+    const port = (wss.address() as { port: number }).port;
+    const client = new RtpbridgeClient({ url: `ws://127.0.0.1:${port}` } as never);
+    try {
+        await (client as unknown as { ready: Promise<void> }).ready;
+        const internals = client as unknown as { sendRequest: (...args: unknown[]) => Promise<unknown> };
+        for (const reply of [{}, { recordingId: '' }, { recordingId: 5 }]) {
+            internals.sendRequest = async () => reply;
+            await assert.rejects(client.startRecording('s', { filePath: 'a.pcap' }), (err: { code?: string }) => err.code === 'protocol_error');
+        }
+        internals.sendRequest = async () => ({ recordingId: 'rec-1' });
+        assert.deepEqual(await client.startRecording('s', { filePath: 'a.pcap' }), { recordingId: 'rec-1' });
+    } finally {
+        client.close();
+        wss.close();
+    }
+});

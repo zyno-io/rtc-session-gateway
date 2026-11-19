@@ -4674,3 +4674,96 @@ test('r26: an uncertain BYE refusal never drops the caller headers', async () =>
     await assert.rejects(f.gateway.bye('caller', 'app-hangup', { 'X-Reason': 'a' }));
     assert.equal(seen.filter(h => !h).length, 0);
 });
+
+test('carrier referrer: an HTTP owner never receives bye before the in-flight return-failed POST', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const started: string[] = [];
+    const finished: string[] = [];
+    const gate = Promise.withResolvers<void>();
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = body as { event?: string; reason?: string };
+        if (event.event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        const label = `${event.event}:${event.reason ?? ''}`;
+        started.push(label);
+        if (event.reason === 'return-failed') await gate.promise;
+        finished.push(label);
+        return {};
+    };
+    f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
+    f.caller.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(f.registry.size, 1, 'the call continues');
+    assert.deepEqual(started, ['terminated:return-failed']);
+    f.center.emit('ended', 'bye');
+    await settle(40);
+    assert.equal(f.registry.size, 0, 'SIP teardown does not wait');
+    assert.deepEqual(started, ['terminated:return-failed'], 'bye is held behind return-failed');
+    gate.resolve();
+    await settle(40);
+    assert.match(started[1] ?? '', /^(bye|terminated):/);
+});
+
+test('the outcome hold is not held across SIP work, so bye goes out while the final NOTIFY is pending', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const started: string[] = [];
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = body as { event?: string; reason?: string };
+        if (event.event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        started.push(`${event.event}:${event.reason ?? ''}`);
+        return {};
+    };
+    const notifyGate = Promise.withResolvers<void>();
+    const origRequest = f.center.request.bind(f.center);
+    f.center.request = async (method: string, options: { body?: string } = {}) => {
+        if (method === 'NOTIFY' && options.body?.includes('Return Failed')) {
+            await notifyGate.promise;
+        }
+        return origRequest(method, options);
+    };
+    f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(f.registry.size, 1, 'the call continues');
+    f.caller.emit('ended', 'bye');
+    await settle(60);
+    assert.equal(f.registry.size, 0);
+    assert.ok(
+        started.some(e => e.startsWith('bye:')),
+        `bye delivered immediately: ${JSON.stringify(started)}`
+    );
+    notifyGate.resolve();
+    await settle(60);
+});
+
+test('a WS-owned call sip.bye is not delayed by an HTTP return owner return-failed POST', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://other.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    const gate = Promise.withResolvers<void>();
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = body as { event?: string; reason?: string };
+        if (event.event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        if (event.reason === 'return-failed') await gate.promise;
+        return {};
+    };
+    f.events.length = 0;
+    f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    f.caller.emit('ended', 'bye');
+    await settle(60);
+    assert.ok(eventNames(f).includes('sip.bye'), `sip.bye not delayed: ${JSON.stringify(eventNames(f))}`);
+    gate.resolve();
+    await settle(60);
+});
