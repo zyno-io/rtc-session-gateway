@@ -2744,7 +2744,216 @@ test('Replaces parsing: a quote in the Call-ID, generic-param values and a trail
     assert.equal(parseReplaces('abc"def@host;to-tag=a;from-tag=b').callId, 'abc"def@host');
     assert.throws(() => parseReplaces('abc@host;to-tag=a;from-tag=b;x=a,b'), /Invalid Replaces parameter/);
     assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;x="a,b"').toTag, 'a');
-    assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;x=host.example:5060').toTag, 'a');
+    // gen-value = token / host / quoted-string: a host carries no port (RFC 3261 25.1).
+    assert.throws(() => parseReplaces('abc@host;to-tag=a;from-tag=b;x=host.example:5060'), /Invalid Replaces parameter/);
+    assert.throws(() => parseReplaces('abc@host;to-tag=a;from-tag=b;x=[2001:db8::1]:5060'), /Invalid Replaces parameter/);
+    assert.throws(() => parseReplaces('abc@host;to-tag=a;from-tag=b;x=a]b['), /Invalid Replaces parameter/);
+    assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;x=host.example').toTag, 'a');
+    assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;x=[2001:db8::1]').toTag, 'a');
+    assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;x="host.example:5060"').toTag, 'a');
+    // SEMI = SWS ";" SWS: whitespace before the first semicolon is legal.
+    assert.equal(parseReplaces('abc@host ;to-tag=a;from-tag=b').callId, 'abc@host');
     assert.equal(parseReplaces('abc@host;to-tag=a;from-tag=b;').fromTag, 'b');
     assert.throws(() => parseReplaces('abc@host;to-tag=a;from-tag=b;;x=1'), /Invalid Replaces parameter/);
+});
+
+const media = (ip: string, port: number, pts: string, maps: string[], addrType = 'IP4') =>
+    [
+        'v=0',
+        `o=- 100 1 IN ${addrType} ${ip}`,
+        's=-',
+        `c=IN ${addrType} ${ip}`,
+        't=0 0',
+        `m=audio ${port} RTP/AVP ${pts}`,
+        ...maps,
+        'a=sendrecv',
+        ''
+    ].join('\r\n');
+const PCMU = 'a=rtpmap:0 PCMU/8000';
+const PCMA = 'a=rtpmap:8 PCMA/8000';
+const TELEPHONE_EVENT = 'a=rtpmap:101 telephone-event/8000';
+
+test('endpoint sharing canonicalizes IPv6 spelling, brackets, mapped IPv4 and numeric ports', () => {
+    const v6 = (ip: string, port: number | string) =>
+        media(ip, Number(port), '0', [PCMU], 'IP6').replace(`m=audio ${Number(port)}`, `m=audio ${port}`);
+    assert.equal(sharesMediaEndpoint(v6('2001:db8::10', 40000), v6('2001:0db8:0:0:0:0:0:10', 40000)), true);
+    assert.equal(sharesMediaEndpoint(v6('2001:db8::10', 40000), v6('2001:0DB8::0010', '040000')), true);
+    assert.equal(sharesMediaEndpoint(v6('2001:db8::10', 40000), v6('2001:db8::11', 40000)), false);
+    assert.equal(sharesMediaEndpoint(v6('2001:db8::10', 40000), v6('2001:db8::10', 40002)), false);
+    assert.equal(sharesMediaEndpoint(v6('::ffff:10.0.0.3', 40000), media('10.0.0.3', 40000, '0', [PCMU])), true);
+});
+
+test('a rollback answer must keep the voice codec the untouched leg selected', () => {
+    const previousSdp = media('10.0.0.3', 40000, '0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]);
+    const previousRemoteSdp = media('10.0.0.1', 30000, '0 101', [PCMU, TELEPHONE_EVENT]);
+    const answer = (pts: string, maps: string[]) => media('10.0.0.1', 30000, pts, maps);
+    // Transfer rollback: the untouched leg is the application endpoint, which negotiated PCMU.
+    assert.throws(() => assertRollbackAnswer(answer('8 101', [PCMA, TELEPHONE_EVENT]), previousRemoteSdp, previousSdp, previousRemoteSdp), /codec/);
+    assertRollbackAnswer(answer('0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]), previousRemoteSdp, previousSdp, previousRemoteSdp);
+    assertRollbackAnswer(answer('8 0', [PCMA, PCMU]), previousRemoteSdp, previousSdp, previousRemoteSdp);
+    // REFER rollback: the destination holds PCMU+PCMA but sends the first one (PCMU) that the carrier also had.
+    const destination = media('10.0.0.2', 45000, '0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]);
+    assert.throws(() => assertRollbackAnswer(answer('8', [PCMA]), previousRemoteSdp, previousSdp, destination), /codec/);
+    assertRollbackAnswer(answer('0 8', [PCMU, PCMA]), previousRemoteSdp, previousSdp, destination);
+    // Static payload types match without an rtpmap.
+    assertRollbackAnswer(answer('0', []), previousRemoteSdp, previousSdp, previousRemoteSdp);
+});
+
+test('a direct-media answer is classified by the offer rtpmap when the answer leaves a payload type unmapped', () => {
+    const offer = media('10.0.0.5', 5000, '0 101', [PCMU, TELEPHONE_EVENT]);
+    assert.throws(() => assertDirectMediaAnswer(offer, media('10.0.0.6', 6000, '101', [])), /Incompatible/);
+    assertDirectMediaAnswer(offer, media('10.0.0.6', 6000, '0', []));
+    assertDirectMediaAnswer(offer, media('10.0.0.6', 6000, '0 101', [PCMU.toLowerCase(), 'a=rtpmap:101 TELEPHONE-EVENT/8000']));
+});
+
+test('a transfer rollback whose carrier answers only a codec the application does not send ends the call', async () => {
+    const f = await fixture();
+    f.caller.remoteSdp = media('10.0.0.1', 30000, '0 101', [PCMU, TELEPHONE_EVENT]);
+    f.call.localSdp = media('10.0.0.3', 40000, '0 8 101', [PCMU, PCMA, TELEPHONE_EVENT]);
+    f.call.remoteSdp = f.caller.remoteSdp;
+    let reinvites = 0;
+    // The destination's audio is rejected, so the carrier is restored, and answers PCMA only.
+    f.caller.reinviteHook = async () =>
+        ++reinvites === 1 ? media('10.0.0.1', 0, '0 101', [PCMU, TELEPHONE_EVENT]) : media('10.0.0.1', 30000, '8 101', [PCMA, TELEPHONE_EVENT]);
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /audio was rejected/);
+    await settle(30);
+    assert.equal(f.registry.get('caller'), undefined, 'the unrepairable rollback ended the call');
+    assert.ok(f.caller.byes >= 1);
+});
+
+test('a transfer of a returned call is not blocked by the return claim while the old legs are retired', async () => {
+    const f = await handedOff();
+    f.call.peerHost = '10.0.0.2';
+    const byeGate = Promise.withResolvers<void>();
+    const origBye = f.caller.bye.bind(f.caller);
+    f.caller.bye = async () => {
+        await byeGate.promise;
+        return origBye();
+    };
+    f.hub.request = async () => ({ action: 'answer', sdp: sdp('10.0.0.7', 47000) }) as never;
+    const replacement = new Dialog('replacement', 'rep-local', 'rep-remote');
+    const returning = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        new Response(replacement) as never
+    );
+    await settle(5);
+    const returned = f.registry.get('replacement');
+    assert.ok(returned, 'return activated');
+    assert.equal(returned!.ownership, 'application');
+    const result = await f.gateway.transfer({ ...f.params, sessionId: 'replacement', transferId: 'transfer-2' }, 'app').then(
+        () => 'ok',
+        (err: Error) => err.message
+    );
+    assert.equal(result, 'ok');
+    byeGate.resolve();
+    await returning;
+});
+
+test('a Replaces return naming the destination is refused with 603 when the carrier already ended', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    f.hub.request = async () => {
+        await gate.promise;
+        return { action: 'answer', sdp: sdp('10.0.0.3') } as never;
+    };
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await turn();
+    f.caller.isEnded = true; // a command result marked it ended; the terminal event is still pending
+    gate.resolve();
+    await pending;
+    await turn();
+    assert.deepEqual(response.statuses, [603]);
+    assert.equal(response.answered, undefined);
+});
+
+test('a Replaces return naming the destination tears down the replacement when the carrier ends during the answer', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    response.answerGate = gate.promise;
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await settle(5);
+    f.caller.isEnded = true;
+    gate.resolve();
+    await pending;
+    await turn();
+    assert.equal(f.registry.get('replacement'), undefined);
+    assert.equal(replacement.byes, 1);
+});
+
+test('a fenced carrier does not block a Replaces return naming the destination', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    f.caller.fence();
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    await f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        new Response(replacement) as never
+    );
+    await settle(5);
+    assert.ok(f.registry.get('replacement'));
+    assert.equal(replacement.byes, 0);
+});
+
+test('an application-owned Replaces whose old dialog ended during the answer BYEs the replacement', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    response.answerGate = gate.promise;
+    f.hub.request = async () => ({ action: 'answer', sdp: sdp('10.0.0.8', 48000) }) as never;
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(5);
+    f.caller.isEnded = true;
+    gate.resolve();
+    await pending;
+    await settle(5);
+    assert.equal(replacement.byes, 1);
+    assert.equal(f.registry.get('caller')?.dialog, f.caller, 'the ended dialog was not swapped out');
+});
+
+test('a failed application-owned Replaces whose restored media moved renegotiates the original peer', async () => {
+    const f = await fixture();
+    const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
+    f.hub.request = async () => ({ action: 'answer', sdp: answers.shift()! }) as never;
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(10);
+    assert.equal(f.caller.reinvites.length, 1);
+    assert.match(f.caller.reinvites[0], /c=IN IP4 10\.0\.0\.9/);
+    assert.match(f.registry.get('caller')!.localSdp!, /10\.0\.0\.9/);
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a failed application-owned Replaces ends the call when the original peer refuses the restored media', async () => {
+    const f = await fixture();
+    const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
+    f.hub.request = async () => ({ action: 'answer', sdp: answers.shift()! }) as never;
+    f.caller.reinviteFailure = new Error('488');
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(30);
+    assert.equal(f.registry.get('caller'), undefined);
 });

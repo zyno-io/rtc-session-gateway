@@ -67,6 +67,11 @@ export class FirewallReconciler {
         this.status.receivedAt = new Date(this.now()).toISOString();
     }
 
+    /** An identical re-publication replaces the object but not the desired state; only instance/revision changes matter. */
+    private sameRevision(snapshot: FirewallSnapshot): boolean {
+        return this.current?.instanceId === snapshot.instanceId && this.current?.revision === snapshot.revision;
+    }
+
     get state() {
         return {
             ...this.status,
@@ -172,7 +177,10 @@ export class FirewallReconciler {
                 // (remove, add, restore on failure) so a failed add never drops protection.
                 // A newer revision accepted mid-pass makes every remaining mutation (planned from this snapshot) suspect:
                 // stop, keep the mirror as it stands, and let the loop restart against the latest revision.
-                const stale = () => this.current !== snapshot;
+                const stale = () => !this.sameRevision(snapshot);
+                // A newer revision that still asks for this target must not abort its install (a stream of new bans would
+                // otherwise starve a covering range); only a dropped/allow-listed target is abandoned.
+                const latestExpiry = (target: string) => (this.sameRevision(snapshot) ? undefined : this.requestedBy(this.current!).get(target));
                 const pendingAdds = [...desired].filter(([target, expiresAt]) => this.mirror.get(target) !== expiresAt).map(([target]) => target);
                 for (const target of [...this.mirror.keys()]) {
                     if (desired.has(target)) continue;
@@ -200,12 +208,12 @@ export class FirewallReconciler {
                         // A newer snapshot may have been accepted while this pass ran (it is queued for the next one):
                         // never resurrect an entry it dropped, and use its TTL for the ones it keeps.
                         let seen = this.current;
-                        let latest = seen === snapshot ? undefined : this.requestedBy(seen!);
+                        let latest = this.sameRevision(snapshot) ? undefined : this.requestedBy(seen!);
                         for (const [other, previous] of covered) {
                             // A snapshot may also arrive while an earlier restore below is awaited.
                             if (this.current !== seen) {
                                 seen = this.current;
-                                latest = seen === snapshot ? undefined : this.requestedBy(seen!);
+                                latest = this.sameRevision(snapshot) ? undefined : this.requestedBy(seen!);
                             }
                             const otherExpiry = latest ? latest.get(other) : previous;
                             if (otherExpiry === undefined) continue;
@@ -225,7 +233,7 @@ export class FirewallReconciler {
                     let clearFailed = false;
                     for (const [other] of [...this.mirror]) {
                         if (other === target || !covers(range, rangeFor(other))) continue;
-                        if (stale()) break;
+                        if (stale() && latestExpiry(target) === undefined) break;
                         if (await attempt('remove', other, () => this.backend.remove(other))) {
                             // Restore only what the current snapshot still requests, with the snapshot's TTL (not the mirror's).
                             const wanted = requested.get(other);
@@ -233,14 +241,19 @@ export class FirewallReconciler {
                             this.mirror.delete(other);
                         } else clearFailed = true;
                     }
+                    let installExpiry = expiresAt;
                     if (stale()) {
                         // The range may have been dropped while covered entries were being removed: do not install it, and
-                        // put back whatever the latest snapshot still requests.
-                        await restore();
-                        break;
+                        // put back whatever the latest snapshot still requests. If it is still requested, install it now.
+                        const latest = latestExpiry(target);
+                        if (latest === undefined) {
+                            await restore();
+                            break;
+                        }
+                        installExpiry = latest;
                     }
                     // Removals above may have outlasted the deadline; never install an already-expired ban.
-                    const remainingAtAdd = expiresAt - this.now();
+                    const remainingAtAdd = installExpiry - this.now();
                     if (!clearFailed && remainingAtAdd <= 0) {
                         recompute = true;
                         await restore();
@@ -248,7 +261,7 @@ export class FirewallReconciler {
                     }
                     // A failed clear means the kernel would reject the add as overlapping; keep existing protection.
                     if (!clearFailed && (await attempt('add', target, () => this.backend.add(target, Math.ceil(remainingAtAdd / 1000))))) {
-                        this.mirror.set(target, expiresAt);
+                        this.mirror.set(target, installExpiry);
                         this.addFailed.delete(target);
                         installedThisPass.push(range);
                     } else {
@@ -278,7 +291,7 @@ export class FirewallReconciler {
                                   .slice(0, 5)
                                   .join(', ')}`
                     );
-                    if (this.current !== snapshot || this.pending) {
+                    if (!this.sameRevision(snapshot) || this.pending) {
                         // A newer revision (or trigger) arrived during this pass: count this failure, then apply the
                         // newer state now instead of leaving it queued until the next timer tick.
                         this.status.errors++;

@@ -33,6 +33,7 @@ import type { SipTransferParams, SipTransferStatus } from './sip-handoff-contrac
 import {
     assertDirectMediaAnswer,
     assertRollbackAnswer,
+    mediaAddressKey,
     parseReferTarget,
     parseReplaces,
     rejectSdpOffer,
@@ -341,7 +342,10 @@ export class SipGateway {
             // replaced dialog no longer exists to be replaced). Checked synchronously before and after the answer.
             const claimHeld = () => !replacing || (this.registry.get(replacing.callId) === replacing && replacing.ownership === 'returning');
             // The named dialog must still be an attached, live leg: its end detaches it but leaves the call `returning`.
-            const replacedLegHeld = () => !replacing || (!!replacedDialog && !replacedDialog.isEnded && this.isLiveLeg(replacing, replacedDialog));
+            // A carrier that hung up leaves the call over (an ended leg differs from a fenced one, which is retired anyway): the
+            // return must not commit onto it, even when the named leg is the destination.
+            const replacedLegHeld = () =>
+                !replacing || (!!replacedDialog && !replacedDialog.isEnded && this.isLiveLeg(replacing, replacedDialog) && !replacing.dialog.isEnded);
             // The selected owner must still be connected: a replacement committed to a dead connection would have nobody
             // to terminate it while both old legs are torn down.
             const ownerLive = () => !replacing || !controlRoute || !!this.controlHub?.isConnected(controlRoute.connectionId);
@@ -395,6 +399,9 @@ export class SipGateway {
 
             this.bindDialog(call);
             answeredDialog = undefined;
+            // The call now holds the endpoint through its committed SDP; the owner-less claim would only block a transfer
+            // of the returned call while the old legs are retired below.
+            releaseMedia();
             this.logger.info({ call: sipCallLogContext(call) }, 'SIP dialog answered');
             // Published at commit, before the old legs are awaited: a replacement that hangs up meanwhile must reach the
             // owner as answered then bye, never the reverse.
@@ -588,7 +595,8 @@ export class SipGateway {
             this.assertMediaUnreserved(action.sdp, call);
             releaseMedia = this.claimLocalMedia(action.sdp, call);
             const replacement = await res.answer(action.sdp, action.headers);
-            if (this.registry.get(call.callId) !== call) {
+            // The original dialog may have hung up while the answer was written (its terminal event is still pending).
+            if (this.registry.get(call.callId) !== call || call.dialog.isEnded) {
                 await this.byeLeg(replacement).catch(() => undefined);
                 return;
             }
@@ -622,7 +630,21 @@ export class SipGateway {
                         true
                     );
                     if (restored.action !== 'answer') throw new Error('Application could not restore replaced media');
-                    this.updateCallSdp(call, { localSdp: restored.sdp, remoteSdp: previousRemoteSdp });
+                    const committed = call.localSdp;
+                    if (committed && mediaAddressKey(restored.sdp) !== mediaAddressKey(committed)) {
+                        // The application restored different local media: the original peer still sends to the old
+                        // address, so it must be renegotiated onto the new one (or the call ends).
+                        this.assertLiveCall(call);
+                        if (call.dialog.isFenced) throw new InvalidCallStateError('Original dialog is fenced');
+                        this.assertMediaUnreserved(restored.sdp, call);
+                        const offer = relaySdp(restored.sdp, committed);
+                        this.sentSdp.set(call.dialog, offer);
+                        const answer = await call.dialog.reinvite(offer);
+                        assertDirectMediaAnswer(offer, answer);
+                        this.updateCallSdp(call, { localSdp: offer, remoteSdp: answer });
+                    } else {
+                        this.updateCallSdp(call, { localSdp: restored.sdp, remoteSdp: previousRemoteSdp });
+                    }
                 } catch {
                     await this.byeCall(call, 'replacement-restore-failed').catch(() => undefined);
                 }
@@ -1025,8 +1047,8 @@ export class SipGateway {
                     const answer = await call.dialog.reinvite(restore);
                     // The app's RTP endpoint still sends to the carrier's previous media address: a rejected audio stream
                     // or a moved address cannot be repaired here, so the call ends. Extra formats are legal (RFC 3264 6.1).
-                    // It must also keep a real voice codec the application's RTP endpoint still speaks.
-                    assertRollbackAnswer(answer, previousRemoteSdp!, restore, previousSdp);
+                    // It must also keep the voice codec the application's RTP endpoint negotiated against the carrier's previous SDP.
+                    assertRollbackAnswer(answer, previousRemoteSdp!, restore, previousRemoteSdp);
                     this.updateCallSdp(call, { localSdp: restore, remoteSdp: answer });
                 } catch {
                     await this.byeCall(call, 'transfer-restore-failed').catch(() => undefined);

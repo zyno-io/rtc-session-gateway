@@ -516,3 +516,103 @@ for (const hostStillRequested of [false, true]) {
         assert.equal(reconciler.state.active, hostStillRequested ? 1 : 0);
     });
 }
+
+test('identical re-publications mid-pass do not roll back a covering CIDR pass', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 600_000).toISOString();
+    const hosts = ['192.0.2.1', '192.0.2.2', '192.0.2.3'].map(target => ({ target, expiresAt }));
+    reconciler.accept(snapshot(1, hosts));
+    await reconciler.reconcile();
+    const blocks2 = [...hosts, { target: '192.0.2.0/24', expiresAt }];
+    reconciler.accept(snapshot(2, blocks2));
+    let heartbeats = 0;
+    const remove = backend.remove.bind(backend);
+    backend.remove = async (target: string) => {
+        await remove(target);
+        if (heartbeats < 20) {
+            heartbeats++;
+            reconciler.accept(snapshot(2, blocks2));
+        }
+    };
+    backend.calls.length = 0;
+    await reconciler.reconcile();
+    assert.equal(heartbeats, 3);
+    assert.deepEqual(backend.calls, ['remove 192.0.2.1', 'remove 192.0.2.2', 'remove 192.0.2.3', 'add 192.0.2.0/24 600']);
+    assert.equal(reconciler.state.appliedRevision, 2);
+});
+
+test('20 identical re-publications cost about 4 kernel ops', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 600_000).toISOString();
+    const hosts = ['192.0.2.1', '192.0.2.2', '192.0.2.3'].map(target => ({ target, expiresAt }));
+    reconciler.accept(snapshot(1, hosts));
+    await reconciler.reconcile();
+    reconciler.accept(snapshot(2, [...hosts, { target: '192.0.2.0/24', expiresAt }]));
+    backend.calls.length = 0;
+    let heartbeats = 0;
+    const remove = backend.remove.bind(backend);
+    backend.remove = async (target: string) => {
+        await remove(target);
+        // Heartbeats keep landing for the whole pass.
+        for (let i = 0; i < 7 && heartbeats < 20; i++, heartbeats++)
+            reconciler.accept(snapshot(2, [...hosts, { target: '192.0.2.0/24', expiresAt }]));
+    };
+    await reconciler.reconcile();
+    assert.equal(heartbeats, 20);
+    assert.equal(backend.calls.length, 4);
+});
+
+test('a newer revision that still requests the covering CIDR does not abort its install', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 600_000).toISOString();
+    const hosts = ['192.0.2.1', '192.0.2.2'].map(target => ({ target, expiresAt }));
+    reconciler.accept(snapshot(1, hosts));
+    await reconciler.reconcile();
+    const cidr = { target: '192.0.2.0/24', expiresAt };
+    reconciler.accept(snapshot(2, [...hosts, cidr]));
+    let bans = 0;
+    const remove = backend.remove.bind(backend);
+    backend.remove = async (target: string) => {
+        await remove(target);
+        // A fresh ban arrives (new revision, longer TTL for the CIDR) during every clear.
+        bans++;
+        reconciler.accept(
+            snapshot(2 + bans, [
+                ...hosts,
+                { target: '192.0.2.0/24', expiresAt: new Date(start + 600_000 + bans * 1000).toISOString() },
+                { target: `198.51.100.${bans}`, expiresAt }
+            ])
+        );
+    };
+    backend.calls.length = 0;
+    await reconciler.reconcile();
+    // Installed at the latest TTL despite the stream; never rolled back by restoring the hosts.
+    assert.ok(backend.calls.includes('add 192.0.2.0/24 ' + (600 + bans)), backend.calls.join('|'));
+    assert.equal(backend.calls.filter(c => c.startsWith('add 192.0.2.1 ')).length, 0);
+});
+
+test('a newer revision that drops the covering CIDR abandons its install and restores hosts', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 600_000).toISOString();
+    const hosts = ['192.0.2.1', '192.0.2.2'].map(target => ({ target, expiresAt }));
+    reconciler.accept(snapshot(1, hosts));
+    await reconciler.reconcile();
+    reconciler.accept(snapshot(2, [...hosts, { target: '192.0.2.0/24', expiresAt }]));
+    const remove = backend.remove.bind(backend);
+    let dropped = false;
+    backend.remove = async (target: string) => {
+        await remove(target);
+        if (!dropped) {
+            dropped = true;
+            reconciler.accept(snapshot(3, hosts));
+        }
+    };
+    backend.calls.length = 0;
+    await reconciler.reconcile();
+    assert.ok(!backend.calls.some(c => c.startsWith('add 192.0.2.0/24')));
+    assert.ok(backend.calls.some(c => c.startsWith('add 192.0.2.1 ')));
+});

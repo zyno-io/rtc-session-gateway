@@ -37,6 +37,7 @@ import {
     RtpbridgeDtmfEvent,
     RtpbridgeRecordingInfo,
     RtpbridgeServerInfo,
+    RtpbridgeRequestError,
     RtpbridgeTimeoutError
 } from './rtpbridge-client';
 import type { FinalizedSipRecording } from './sip-handoff-contract';
@@ -497,8 +498,10 @@ export class MediaSessionService implements GatewayMediaController {
                 filePath
             });
         } catch (err) {
-            if (err instanceof RtpbridgeTimeoutError && this.sessions.get(sessionId) === session)
-                this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
+            // SESSION_UNRESPONSIVE means rtpbridge's own reply deadline expired; the worker may still have installed it.
+            const unknownOutcome =
+                err instanceof RtpbridgeTimeoutError || (err instanceof RtpbridgeRequestError && err.code === 'SESSION_UNRESPONSIVE');
+            if (unknownOutcome && this.sessions.get(sessionId) === session) this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
             throw err;
         }
         const metadata = this.recordingMetadata(session, filePath);

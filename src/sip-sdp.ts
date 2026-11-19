@@ -1,3 +1,7 @@
+import { isIP } from 'node:net';
+
+import { sourceIp } from './firewall-address';
+
 /** Keep the SDP origin and media ordering of an established dialog across relayed offers. */
 export function relaySdp(remoteSdp: string, previousLocalSdp?: string): string {
     const lines = remoteSdp.trim().split(/\r?\n/);
@@ -80,8 +84,9 @@ function parseMediaSections(sdp: string): MediaSection[] {
 const NON_VOICE_ENCODINGS = new Set(['telephone-event', 'cn', 'red', 'ulpfec', 'flexfec', 'flexfec-03', 'rtx']);
 
 /** True when the payload type is a real voice codec: not telephone-event, CN (static PT 13), red, ulpfec, flexfec or rtx. */
-function isVoiceFormat(section: MediaSection, pt: string): boolean {
-    const encoding = section.rtpmap.get(pt)?.split('/')[0];
+function isVoiceFormat(section: MediaSection, pt: string, offered?: MediaSection): boolean {
+    // A payload type the answer leaves unmapped keeps the meaning the offer gave it (RFC 3264 6.1).
+    const encoding = (section.rtpmap.get(pt) ?? offered?.rtpmap.get(pt))?.split('/')[0];
     if (encoding) return !NON_VOICE_ENCODINGS.has(encoding);
     return pt !== '13';
 }
@@ -92,7 +97,7 @@ function isVoiceFormat(section: MediaSection, pt: string): boolean {
  */
 function sharesFormat(offered: MediaSection, answered: MediaSection): boolean {
     return answered.formats.some(pt => {
-        if (!isVoiceFormat(answered, pt)) return false;
+        if (!isVoiceFormat(answered, pt, offered)) return false;
         if (offered.formats.includes(pt)) {
             const left = offered.rtpmap.get(pt);
             const right = answered.rtpmap.get(pt);
@@ -102,6 +107,42 @@ function sharesFormat(offered: MediaSection, answered: MediaSection): boolean {
         const encoding = answered.rtpmap.get(pt);
         return !!encoding && offered.formats.some(other => offered.rtpmap.get(other) === encoding);
     });
+}
+
+const STATIC_ENCODINGS: Record<string, string> = {
+    '0': 'pcmu/8000',
+    '3': 'gsm/8000',
+    '4': 'g723/8000',
+    '8': 'pcma/8000',
+    '9': 'g722/8000',
+    '18': 'g729/8000'
+};
+
+/** Identity of a payload type independent of its number: `encoding/clock` from the rtpmap or the static assignment. */
+function codecIdentity(section: MediaSection, pt: string): string | undefined {
+    return section.rtpmap.get(pt) ?? (Number(pt) < 96 ? (STATIC_ENCODINGS[pt] ?? `static:${pt}`) : undefined);
+}
+
+/**
+ * The voice codec the untouched leg keeps sending on every stream active in both: the first voice format of its
+ * description (RFC 3264 5.1: the first format is the preferred one) that the other negotiated descriptions also carry.
+ * Constraints that no format satisfies are dropped, last first, so the leg's own first voice codec is the floor.
+ */
+function selectedVoiceCodecs(leg: string, ...negotiated: string[]): Map<number, string> {
+    const selected = new Map<number, string>();
+    const others = negotiated.map(parseMediaSections);
+    for (const [index, section] of parseMediaSections(leg).entries()) {
+        if (section.type !== 'audio' || !(section.port > 0)) continue;
+        const voice = section.formats.filter(pt => isVoiceFormat(section, pt));
+        const peers = others.map(sections => sections[index]).filter(other => other?.port > 0);
+        let pt: string | undefined;
+        for (let count = peers.length; count >= 0 && !pt; count--) {
+            pt = voice.find(candidate => peers.slice(0, count).every(other => sharesFormat(other, { ...section, formats: [candidate] })));
+        }
+        const identity = pt && codecIdentity(section, pt);
+        if (identity) selected.set(index, identity);
+    }
+    return selected;
 }
 
 /**
@@ -154,7 +195,9 @@ const ANSWER_DIRECTION: Record<string, string> = {
  * asked for (an answer that turns a bidirectional stream into inactive or one-way leaves the call on hold), and at
  * least one audio stream must remain active. Streams the restore offer declined (port 0) are not compared. Extra
  * payload types are allowed (RFC 3264 6.1); anything that changes the carrier's media address cannot be repaired.
- * When `otherLegSdp` (the SDP the other leg currently holds) is given, the answer must also share a real voice codec with it.
+ * When `otherLegSdp` (the SDP the untouched leg negotiated and keeps sending against) is given, the answer must also
+ * still include the voice codec that leg selected (its first voice format also present in `previousRemoteSdp` and the restore offer); a
+ * restored answer that only lists some other shared codec leaves the untouched leg sending a format nobody expects.
  */
 export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string, otherLegSdp?: string) {
     const restored = parseMediaSections(restoreOffer);
@@ -175,7 +218,25 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
     }
     if (!audioActive) throw new Error('Rollback audio was rejected');
     // The other leg keeps sending the codec it already negotiated: the restored answer must still accept a real voice codec of it.
-    if (otherLegSdp && !sharesVoiceCodec(otherLegSdp, answer)) throw new Error('Rollback answer shares no voice codec with the other leg');
+    if (otherLegSdp) {
+        if (!sharesVoiceCodec(otherLegSdp, answer)) throw new Error('Rollback answer shares no voice codec with the other leg');
+        for (const [index, identity] of selectedVoiceCodecs(otherLegSdp, previousRemoteSdp, restoreOffer)) {
+            const media = answered[index];
+            if (!media || !(media.port > 0)) continue;
+            if (!media.formats.some(pt => isVoiceFormat(media, pt) && codecIdentity(media, pt) === identity)) {
+                throw new Error('Rollback answer dropped the voice codec the other leg selected');
+            }
+        }
+    }
+}
+
+/** `IN IP6 2001:0db8::10/127` -> comparable `ip6 2001:db8:0:0:0:0:0:10`: spelling, brackets, TTL suffix and ::ffff: forms collapse. */
+function canonicalConnection(connection: string): string {
+    const [nettype, addrtype, address = ''] = connection.trim().split(/\s+/);
+    const host = address.split('/')[0].replace(/^\[(.*)\]$/, '$1');
+    const canonical = sourceIp(host);
+    // A mapped IPv6 address canonicalizes to its IPv4 form, which is the same endpoint.
+    return canonical ? canonical : `${nettype}|${addrtype}|${host.toLowerCase()}`.toLowerCase();
 }
 
 /** True when two session descriptions send media to a common address and port (an RTP endpoint shared by two calls). */
@@ -185,7 +246,8 @@ export function sharesMediaEndpoint(a: string, b: string): boolean {
         let session = '';
         let current: { port: string; connection: string } | undefined;
         const flush = () => {
-            if (current && Number(current.port) > 0 && current.connection) found.add(`${current.connection}|${current.port}`);
+            const port = Number(current?.port);
+            if (current && port > 0 && current.connection) found.add(`${canonicalConnection(current.connection)}|${port}`);
         };
         for (const line of sdp.trim().split(/\r?\n/)) {
             if (line.startsWith('m=')) {
@@ -253,14 +315,15 @@ function splitOutsideQuotes(value: string, separator: string): string[] {
 }
 
 const TOKEN = /^[A-Za-z0-9\-.!%*_+`'~]+$/;
-/** gen-value = token / host (RFC 3261 25.1): token characters plus the host additions `:` `[` `]`. */
-const TOKEN_OR_HOST = /^[A-Za-z0-9\-.!%*_+`'~:[\]]+$/;
+/** host = hostname / IPv4address / IPv6reference (RFC 3261 25.1); a hostname is already a token, so only `[IPv6]` is extra. A port is not part of host. */
+const IPV6_REFERENCE = /^\[[A-Fa-f0-9:.]+\]$/;
+const isGenValue = (value: string) => TOKEN.test(value) || (IPV6_REFERENCE.test(value) && isIP(value.slice(1, -1)) === 6);
 const QUOTED_STRING = /^"(?:[^"\\\r\n]|\\.)*"$/;
 
 export function parseReplaces(value: string): ReplacesIdentity {
     // A Call-ID word may contain a DQUOTE but never `;`, so split it off before any quote-aware parameter parsing.
     const first = value.indexOf(';');
-    const callId = first < 0 ? value : value.slice(0, first);
+    const callId = (first < 0 ? value : value.slice(0, first)).trim(); // SEMI = SWS ";" SWS
     const parameters = first < 0 ? [] : splitOutsideQuotes(value.slice(first + 1), ';');
     const values = new Map<string, string | undefined>();
     for (const [position, parameter] of parameters.entries()) {
@@ -271,7 +334,7 @@ export function parseReplaces(value: string): ReplacesIdentity {
         const generic = separator < 0 ? undefined : parameter.slice(separator + 1).trim();
         if (
             !TOKEN.test(key) ||
-            (generic !== undefined && !generic.startsWith('"') && !TOKEN_OR_HOST.test(generic)) ||
+            (generic !== undefined && !generic.startsWith('"') && !isGenValue(generic)) ||
             (generic?.startsWith('"') && !QUOTED_STRING.test(generic))
         ) {
             throw new Error('Invalid Replaces parameter');

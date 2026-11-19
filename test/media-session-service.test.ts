@@ -5,7 +5,7 @@ import http from 'node:http';
 import test from 'node:test';
 
 import { MediaActionConflictError, MediaSessionService, MediaUnavailableError } from '../src/media-session-service';
-import { RtpbridgeTimeoutError } from '../src/rtpbridge-client';
+import { RtpbridgeRequestError, RtpbridgeTimeoutError } from '../src/rtpbridge-client';
 import { RtpbridgeTransport } from '../src/rtpbridge-transport';
 
 test('media session service forwards rtpbridge events to the owner control connection', async () => {
@@ -1023,6 +1023,40 @@ test('a timed-out recording.start is reconciled at handoff by stopping unknown a
     assert.deepEqual(stopped, ['ghost-1']);
     assert.equal(results[0].recordingId, 'ghost-1');
     // The mark is cleared: a later handoff does not query again.
+    client.listSessionRecordings = async () => {
+        throw new Error('should not be called');
+    };
+    await service.prepareHandoff('media-session-1', 'owner', {});
+});
+
+test('a recording.start failing with SESSION_UNRESPONSIVE is reconciled at handoff like a timeout', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    client.startRecording = async () => {
+        client.sessionRecordings = [{ recordingId: 'ghost-2', filePath: 'ghost.pcap', state: 'active' }];
+        throw new RtpbridgeRequestError('Session did not reply within timeout', 'SESSION_UNRESPONSIVE');
+    };
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeRequestError);
+    const stopped: string[] = [];
+    client.stopRecording = async (recordingId?: string) => {
+        stopped.push(recordingId!);
+        return { filePath: 'ghost.pcap', durationMs: 1, packets: 1 };
+    };
+    await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.deepEqual(stopped, ['ghost-2']);
+});
+
+test('a definitive recording.start error does not mark recording uncertainty', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    client.startRecording = async () => {
+        throw new RtpbridgeRequestError('bad path', 'INVALID_PARAMS');
+    };
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeRequestError);
     client.listSessionRecordings = async () => {
         throw new Error('should not be called');
     };

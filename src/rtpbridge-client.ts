@@ -58,6 +58,17 @@ export class RtpbridgeTimeoutError extends Error {
     }
 }
 
+/** An error response from rtpbridge, preserving its backend error code (e.g. SESSION_UNRESPONSIVE). */
+export class RtpbridgeRequestError extends Error {
+    constructor(
+        message: string,
+        readonly code?: string
+    ) {
+        super(message);
+        this.name = 'RtpbridgeRequestError';
+    }
+}
+
 export interface RtpbridgeRecordingInfo {
     recordingId: string;
     endpointId?: string | null;
@@ -324,7 +335,8 @@ export class RtpbridgeClient extends EventEmitter {
 
         if (parsed.error) {
             const message = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message ?? JSON.stringify(parsed.error));
-            pending.reject(new Error(message));
+            const code = typeof parsed.error === 'object' && typeof parsed.error?.code === 'string' ? parsed.error.code : undefined;
+            pending.reject(new RtpbridgeRequestError(message, code));
             return;
         }
         pending.resolve(toCamelCase(parsed.result ?? {}));
