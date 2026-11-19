@@ -133,6 +133,7 @@ export class FirewallReconciler {
                 }
                 for (const target of this.addFailed) if (!desired.has(target)) this.addFailed.delete(target);
                 // Each kernel operation is isolated: one rejected target must not abort or wipe the rest.
+                let recompute = false;
                 const failures: { target: string; op: 'add' | 'remove'; error: unknown }[] = [];
                 const attempt = async (op: 'add' | 'remove', target: string, fn: () => Promise<void>) => {
                     try {
@@ -176,7 +177,9 @@ export class FirewallReconciler {
                     }
                     const remaining = expiresAt - this.now();
                     if (remaining <= 0) {
-                        // Nothing to add; an unexpired old entry keeps its protection.
+                        // Nothing to add; an unexpired old entry keeps its protection. Narrower targets were left out of
+                        // `desired` because of this covering range, so recompute now that it is known to be expired.
+                        recompute = true;
                         for (const [other, otherExpiry] of covered) {
                             const left = otherExpiry - this.now();
                             if (left > 0 && (await attempt('add', other, () => this.backend.add(other, Math.ceil(left / 1000)))))
@@ -199,8 +202,15 @@ export class FirewallReconciler {
                                 this.mirror.set(other, otherExpiry);
                         }
                     };
+                    // Removals above may have outlasted the deadline; never install an already-expired ban.
+                    const remainingAtAdd = expiresAt - this.now();
+                    if (!clearFailed && remainingAtAdd <= 0) {
+                        recompute = true;
+                        await restore();
+                        continue;
+                    }
                     // A failed clear means the kernel would reject the add as overlapping; keep existing protection.
-                    if (!clearFailed && (await attempt('add', target, () => this.backend.add(target, Math.ceil(remaining / 1000))))) {
+                    if (!clearFailed && (await attempt('add', target, () => this.backend.add(target, Math.ceil(remainingAtAdd / 1000))))) {
                         this.mirror.set(target, expiresAt);
                         this.addFailed.delete(target);
                         installedThisPass.push(range);
@@ -232,6 +242,11 @@ export class FirewallReconciler {
                                   .join(', ')}`
                     );
                     throw error;
+                }
+                if (recompute) {
+                    // A skipped expired covering range hid narrower targets from this pass; run again before reporting applied.
+                    this.pending = true;
+                    continue;
                 }
                 this.status.appliedAt = new Date(this.now()).toISOString();
                 this.status.appliedInstanceId = snapshot.instanceId;

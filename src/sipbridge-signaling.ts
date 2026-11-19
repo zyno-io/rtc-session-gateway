@@ -93,6 +93,8 @@ export interface IncomingSipRequest {
     body: string;
     /** CSeq number of the request (0 when absent or malformed). */
     cseq: number;
+    /** sipbridge's identity for this request notification; distinct requests never share one, even with equal Call-ID and CSeq. */
+    requestId?: string;
     headers: Record<string, string>;
     /** Source observed by sipbridge for this request; absent when the flow is unknown. */
     source?: SipSource;
@@ -831,6 +833,7 @@ export class SipbridgeSignaling extends EventEmitter {
             callId: request.snapshot!.callId,
             body: Buffer.from(message.body).toString('utf8'),
             cseq: Number.parseInt(headers['cseq'] ?? '', 10) || 0,
+            requestId: request.requestId,
             headers,
             source: sourceOf(request),
             get: name => headers[name.toLowerCase()]
@@ -886,8 +889,8 @@ export class SipbridgeSignaling extends EventEmitter {
         } else if (message.method === 'OPTIONS') await response.respond(200, { headers: { Allow: ALLOW } });
         else if (!['ACK', 'CANCEL', 'BYE'].includes(message.method)) await response.respond(405, { headers: { Allow: ALLOW } });
     }
-    private enqueue<T>(state: Context, work: () => Promise<T>): Promise<T> {
-        if ((state.pendingCommands ?? 0) >= 8) throw new NativeOperationError('Native context command capacity');
+    private enqueue<T>(state: Context, work: () => Promise<T>, terminal = false): Promise<T> {
+        if ((state.pendingCommands ?? 0) >= 8 + (terminal ? 2 : 0)) throw new NativeOperationError('Native context command capacity');
         state.pendingCommands = (state.pendingCommands ?? 0) + 1;
         const result = state.tail.then(work).finally(() => {
             state.pendingCommands!--;
@@ -953,7 +956,9 @@ export class SipbridgeSignaling extends EventEmitter {
                 throw error instanceof NativeOperationError ? error : new NativeOperationError('Native command outcome unknown', true);
             }
         };
-        return this.enqueue(state, work);
+        const terminal =
+            action.$case === 'cancel' || (action.$case === 'dialogRequest' && ['ACK', 'BYE'].includes(action.dialogRequest.method.toUpperCase()));
+        return this.enqueue(state, work, terminal);
     }
     openDialog(params: OutboundSipCallParams): OutboundAttempt {
         let state: Context | undefined;

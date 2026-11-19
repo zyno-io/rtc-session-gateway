@@ -153,6 +153,7 @@ export class MediaSessionService implements GatewayMediaController {
             this.sessions.set(sessionId, record);
             client.onClose(() => this.dropSession(sessionId!));
             client.on('rtpbridge.event', event => this.publishRtpbridgeEvent(record, event));
+            client.on('recording.stopped', event => this.onBackendRecordingStopped(record, event));
             return snapshotSession(record);
         } catch (err) {
             if (sessionId) await client.destroySession(sessionId).catch(() => undefined);
@@ -513,7 +514,21 @@ export class MediaSessionService implements GatewayMediaController {
             // Snapshot: a recording the application starts after a failed handoff must not be stopped by it.
             for (const [recordingId, metadata] of [...this.recordings]) {
                 if (metadata.sessionId !== sessionId) continue;
-                await this.stopRecording(recordingId);
+                try {
+                    await this.stopRecording(recordingId);
+                } catch (err) {
+                    // Not-found or a lost reply: trust rtpbridge's own view of what is still recording.
+                    if (await this.isRecordingActive(session, recordingId)) throw err;
+                    this.recordings.delete(recordingId);
+                    // The stop took effect but its reply was lost: keep the finalized entry (deduped by id when a
+                    // recording.stopped event already recorded it). Size and duration are unknown here.
+                    this.appendFinalizedRecording(
+                        session,
+                        recordingId,
+                        { filePath: metadata.filePath, durationMs: 0, packets: 0 },
+                        metadata.filePath
+                    );
+                }
             }
             if (this.recordingUncertain.has(sessionId)) await this.stopUnknownRecordings(session);
             return [...results];
@@ -521,6 +536,33 @@ export class MediaSessionService implements GatewayMediaController {
             this.releaseHandoff(sessionId, token);
             throw err;
         }
+    }
+
+    /** True if rtpbridge still reports the recording active. Fails closed when state cannot be verified. */
+    private async isRecordingActive(session: MediaSessionRecord, recordingId: string) {
+        try {
+            return (await session.client.listSessionRecordings()).some(info => info.recordingId === recordingId && info.state === 'active');
+        } catch (err) {
+            throw new MediaActionConflictError(`Cannot verify recording state for handoff: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
+    /** rtpbridge stops recordings itself (endpoint removed/transferred); drop the id and keep the finalized metadata. */
+    private onBackendRecordingStopped(
+        session: MediaSessionRecord,
+        event: { recordingId?: string; filePath?: string; durationMs?: number; packets?: number }
+    ) {
+        const recordingId = event?.recordingId;
+        if (!recordingId) return;
+        const metadata = this.recordings.get(recordingId);
+        if (!metadata || metadata.sessionId !== session.sessionId) return;
+        this.recordings.delete(recordingId);
+        this.appendFinalizedRecording(
+            session,
+            recordingId,
+            { filePath: event.filePath ?? '', durationMs: event.durationMs ?? 0, packets: event.packets ?? 0 },
+            metadata.filePath
+        );
     }
 
     /** Stops recordings rtpbridge reports active that the gateway never learned of (a timed-out recording.start). Fails closed. */
@@ -568,8 +610,11 @@ export class MediaSessionService implements GatewayMediaController {
 
     private appendFinalizedRecording(session: MediaSessionRecord, recordingId: string, result: RecordingResult, fallbackPath: string) {
         const finalized = { ...result, ...this.recordingMetadata(session, result.filePath || fallbackPath) };
+        // A late reply for a dropped session must not resurrect history that nothing will clean up.
+        if (this.sessions.get(session.sessionId) !== session) return finalized;
         const completed = this.handoffRecordings.get(session.sessionId) ?? [];
         this.handoffRecordings.set(session.sessionId, completed);
+        if (completed.some(item => item.recordingId === recordingId)) return finalized;
         completed.push({ recordingId, ...finalized });
         if (completed.length > MAX_HANDOFF_RECORDINGS) completed.splice(0, completed.length - MAX_HANDOFF_RECORDINGS);
         return finalized;

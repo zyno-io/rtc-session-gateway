@@ -45,6 +45,10 @@ class Dialog extends EventEmitter {
     reinviteHook?: (offer: string) => Promise<string>;
     offerlessGate?: Promise<void>;
     ackFailure?: Error;
+    /** Fails only the first N ACKs (default: every ACK while ackFailure is set). */
+    ackFailureLimit = Infinity;
+    byeFailure?: Error;
+    byeFailureLimit = Infinity;
     fenceOnAckFailure = false;
     private buffered = new Map<number, string>();
     private waiters = new Map<number, { resolve: (body: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
@@ -72,7 +76,7 @@ class Dialog extends EventEmitter {
     }
     async ackAnswer(answer: string) {
         this.log?.push(`${this.name}:ack`);
-        if (this.ackFailure) {
+        if (this.ackFailure && this.ackFailureLimit-- > 0) {
             if (this.fenceOnAckFailure) this.isFenced = true;
             throw this.ackFailure;
         }
@@ -85,6 +89,7 @@ class Dialog extends EventEmitter {
         this.log?.push(`${this.name}:${method.toLowerCase()}${status ? `-${status}` : ''}`);
     }
     async bye() {
+        if (this.byeFailure && this.byeFailureLimit-- > 0) throw this.byeFailure;
         this.log?.push(`${this.name}:bye`);
         this.byes++;
     }
@@ -175,7 +180,16 @@ function request(method: string, body = '', cseq = 42, headers: Record<string, s
     } as never;
 }
 
-async function fixture(options: { timeout?: number; lifecycle?: GatewayLifecycle; firewall?: SipFirewall; centerAddress?: string } = {}) {
+async function fixture(
+    options: {
+        timeout?: number;
+        lifecycle?: GatewayLifecycle;
+        firewall?: SipFirewall;
+        centerAddress?: string;
+        ackGiveUpMs?: number;
+        retryDelays?: number[];
+    } = {}
+) {
     const registry = new CallRegistry();
     const log: string[] = [];
     const caller = new Dialog('caller', 'gateway-tag', 'caller-tag');
@@ -194,6 +208,7 @@ async function fixture(options: { timeout?: number; lifecycle?: GatewayLifecycle
     let prepareHook: (() => Promise<void>) | undefined;
     let dialHook: (() => Promise<void>) | undefined;
     let replacementFailure: Error | undefined;
+    let destroyHook: (() => Promise<void>) | undefined;
     const finalized = {
         recordingId: 'recording',
         backendId: 'media-a',
@@ -250,6 +265,7 @@ async function fixture(options: { timeout?: number; lifecycle?: GatewayLifecycle
         },
         releaseHandoff() {},
         async destroySession() {
+            if (destroyHook) await destroyHook();
             log.push('delete-media');
         }
     };
@@ -264,7 +280,13 @@ async function fixture(options: { timeout?: number; lifecycle?: GatewayLifecycle
         signaling,
         hub as never,
         options.lifecycle,
-        { mediaController: media as never, handoffAckTimeoutMs: options.timeout ?? 1000, firewall: options.firewall }
+        {
+            mediaController: media as never,
+            handoffAckTimeoutMs: options.timeout ?? 1000,
+            firewall: options.firewall,
+            terminalRetryDelaysMs: options.retryDelays ?? [1, 2, 3],
+            ackGiveUpMs: options.ackGiveUpMs ?? 40
+        }
     );
     await gateway.handleInvite(invite() as never, new Response(caller) as never);
     await turn();
@@ -295,6 +317,9 @@ async function fixture(options: { timeout?: number; lifecycle?: GatewayLifecycle
         },
         delayRecording: (hook: () => Promise<void>) => {
             prepareHook = hook;
+        },
+        delayDestroy: (hook: () => Promise<void>) => {
+            destroyHook = hook;
         },
         failReplacement: () => {
             replacementFailure = new Error('Replacement dialog failed');
@@ -1194,11 +1219,37 @@ test('an offerless relay whose peer offer has no media ACKs the peer before the 
     assert.equal(f.registry.size, 0);
 });
 
-test('a definitely refused destination ACK is still followed by a BYE on that leg', async () => {
+test('a destination ACK refused once is retried and succeeds before the BYE', async () => {
     const f = await fixture();
     f.center.ackFailure = new NativeOperationError('ACK refused');
+    f.center.ackFailureLimit = 2; // the answer ACK, then the first rejection ACK
     await assert.rejects(f.gateway.transfer(f.params, 'app'));
-    assert.equal(f.center.byes, 1, 'nothing else cleans the unacknowledged leg up');
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:ack', 'center:ack', 'center:bye']
+    );
+    assert.equal(f.center.acks.length, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('an always-refused destination ACK defers the BYE until the peer has given up waiting for it', async () => {
+    const f = await fixture({ ackGiveUpMs: 80 });
+    f.center.ackFailure = new NativeOperationError('ACK refused');
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    assert.equal(f.center.byes, 0, 'no BYE without the ACK the peer is owed');
+    assert.equal(f.center.acks.length, 0);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(f.center.byes, 1, 'BYE follows once the ACK window has passed');
+});
+
+test('a deferred BYE is dropped when the leg ends first', async () => {
+    const f = await fixture({ ackGiveUpMs: 60 });
+    f.center.ackFailure = new NativeOperationError('ACK refused');
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    f.center.isEnded = true;
+    f.center.emit('ended', 'bye');
+    await new Promise(resolve => setTimeout(resolve, 120));
+    assert.equal(f.center.byes, 0);
 });
 
 test('an uncertain destination ACK fences the leg and it is never commanded', async () => {
@@ -1209,7 +1260,23 @@ test('an uncertain destination ACK fences the leg and it is never commanded', as
     assert.equal(f.center.byes, 0);
 });
 
-test('a refused peer ACK on an offerless relay still BYEs that leg and ends the call', async () => {
+test('a peer ACK refused once on an offerless relay is retried, then the call ends with ACK before BYE', async () => {
+    const f = await handedOff();
+    f.center.acks.length = 0;
+    f.center.ackFailure = new NativeOperationError('ACK refused');
+    f.center.ackFailureLimit = 2;
+    f.caller.emit('request', request('INVITE', '', 43), new Response());
+    await turn();
+    f.caller.deliverAck(43, sdp('10.0.0.1'));
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+    assert.ok(f.log.indexOf('center:bye') > f.log.lastIndexOf('center:ack'), 'a written ACK precedes the BYE');
+    assert.equal(f.center.acks.length, 1, 'the retried rejection ACK was written');
+});
+
+test('an always-refused peer ACK on an offerless relay ends the call but defers that leg BYE', async () => {
     const f = await handedOff();
     f.center.ackFailure = new NativeOperationError('ACK refused');
     f.caller.emit('request', request('INVITE', '', 43), new Response());
@@ -1218,7 +1285,32 @@ test('a refused peer ACK on an offerless relay still BYEs that leg and ends the 
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(f.registry.size, 0);
     assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 0, 'not BYEd without its ACK');
+    await new Promise(resolve => setTimeout(resolve, 80));
     assert.equal(f.center.byes, 1);
+});
+
+test('a BYE refused once after registry removal is retried and sent', async () => {
+    const f = await handedOff();
+    f.caller.byeFailure = new NativeOperationError('control operation capacity', false, true);
+    f.caller.byeFailureLimit = 1;
+    f.center.emit('ended', 'bye');
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1, 'the surviving leg is still ended');
+});
+
+test('a BYE that is refused every time gives up after the bounded retries', async () => {
+    const f = await handedOff();
+    let attempts = 0;
+    f.caller.bye = async () => {
+        attempts++;
+        throw new NativeOperationError('control operation capacity', false, true);
+    };
+    f.center.emit('ended', 'bye');
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(attempts, 4, 'one attempt plus three retries');
+    assert.equal(f.registry.size, 0);
 });
 
 test('an uncertain cross-leg re-INVITE ends the call once, never commanding a fenced leg', async () => {
@@ -1319,4 +1411,233 @@ test('a NOTIFY that times out (COMPLETED error, status 0) ends the REFER subscri
     assert.equal(notifies, 1);
     assert.equal(f.caller.byes, 0);
     assert.equal(f.registry.size, 1);
+});
+
+test('an application disconnect during post-commit media cleanup cannot cancel or BYE the committed destination', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.delayDestroy(() => gate.promise);
+    const transfer = f.gateway.transfer(f.params, 'app');
+    for (let i = 0; i < 50 && !f.events.some(event => (event as { event?: string }).event === 'sip.transferred'); i++) await turn();
+    assert.ok(
+        f.events.some(event => (event as { event?: string }).event === 'sip.transferred'),
+        'commit published'
+    );
+    await f.gateway.terminateCallsForControlConnection('app');
+    assert.equal(f.cancelled(), 0, 'the committed destination attempt is no longer cancellable');
+    assert.equal(f.center.byes, 0);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.registry.size, 1);
+    gate.resolve();
+    assert.equal((await transfer).state, 'completed');
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.center.byes, 0);
+});
+
+const sentEvents = (f: Fixture, name: string) => f.events.filter(event => (event as { event?: string }).event === name);
+
+test('an uncertain carrier re-INVITE during transfer is terminal: ACK then BYE the destination, the fenced carrier is never commanded', async () => {
+    const f = await fixture();
+    f.caller.reinviteFailure = new NativeOperationError('Native outcome unknown', true);
+    f.caller.fenceOnReinviteFailure = true;
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), (err: unknown) => err instanceof NativeOperationError && err.uncertain);
+    assert.equal(f.registry.size, 0);
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:bye']
+    );
+    assert.match(f.center.acks[0], /m=audio 0 /, 'the destination offer is rejected');
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.caller.reinvites.length, 1, 'no restore re-INVITE');
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('the handoff timer ends the call (registry first) even when the queued carrier BYE fails at a fence', async () => {
+    const f = await fixture({ timeout: 20 });
+    f.caller.reinviteHook = () => new Promise<string>(() => undefined);
+    f.caller.bye = async () => {
+        assert.equal(f.registry.size, 0, 'removal precedes every command');
+        throw new NativeOperationError('Native call is ended or uncertain', true);
+    };
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    assert.equal(f.registry.size, 0);
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:bye']
+    );
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('an uncertain carrier re-INVITE on a REFER return ends the call: NOTIFY then BYE the destination, carrier untouched', async () => {
+    const f = await handedOff();
+    f.caller.reinviteFailure = new NativeOperationError('Native outcome unknown', true);
+    f.caller.fenceOnReinviteFailure = true;
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 0, 'the fenced carrier is never commanded');
+    assert.equal(f.center.byes, 1);
+    assert.ok(f.log.indexOf('center:notify-503') >= 0 && f.log.indexOf('center:notify-503') < f.log.indexOf('center:bye'), 'NOTIFY precedes BYE');
+    assert.ok(sentEvents(f, 'sip.terminated').length >= 1, 'the application is told the call ended');
+});
+
+test('an owner that disconnects during the Replaces answer write gets the replacement BYEd and the original pair keeps its state', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    response.answerGate = gate.promise;
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(f.call.ownership, 'returning');
+    f.hub.isConnected = () => false;
+    await f.gateway.terminateCallsForControlConnection('app');
+    gate.resolve();
+    await pending;
+    await turn();
+    assert.equal(replacement.byes, 1, 'the replacement dialog is ended');
+    assert.equal(f.registry.get('replacement'), undefined);
+    assert.equal(f.registry.get('caller'), f.call);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.center.byes, 0);
+});
+
+test('a Replaces return whose owner disconnected before the answer is refused with 603 and the pair stays handed off', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    f.hub.request = async () => {
+        await gate.promise;
+        return { action: 'answer', sdp: sdp('10.0.0.3') } as never;
+    };
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await turn();
+    f.hub.isConnected = () => false;
+    gate.resolve();
+    await pending;
+    assert.deepEqual(response.statuses, [603]);
+    assert.equal(response.answered, undefined);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.center.byes, 0);
+});
+
+test('distinct rejected requests sharing Call-ID and CSeq each score; a redelivered request id scores once', async () => {
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL: 'enforce' } as never));
+    const f = await handedOff({ firewall });
+    const bad = (requestId: string) => ({ ...invite({ replaces: 'not a replaces header' }, 'same-call', '10.0.0.8', 'INVITE', 7), requestId });
+    for (const requestId of ['req-1', 'req-2', 'req-2']) await f.gateway.handleInvite(bad(requestId) as never, new Response() as never);
+    assert.equal(firewall.status().counters.observations, 2);
+});
+
+test('an uncertain restore re-INVITE after a refused destination ACK leaves nothing registered and terminates once', async () => {
+    const f = await fixture();
+    let invites = 0;
+    f.caller.reinviteHook = async () => {
+        if (++invites === 1) return sdp('10.0.0.1');
+        f.caller.isFenced = true;
+        throw new NativeOperationError('Native outcome unknown', true);
+    };
+    f.center.ackFailure = new NativeOperationError('ACK refused');
+    f.center.ackFailureLimit = 1;
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    assert.equal(f.registry.size, 0, 'the call is not left registered');
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    assert.equal(f.caller.byes, 0, 'the fenced carrier is never commanded');
+    assert.equal(f.caller.reinvites.length, 2);
+});
+
+test('a REFER return whose destination left and whose restore is uncertain does not strand the call in returning', async () => {
+    const f = await handedOff();
+    let invites = 0;
+    f.caller.reinviteHook = async () => {
+        if (++invites === 1) {
+            f.center.isEnded = true;
+            f.center.emit('ended', 'bye');
+            f.hub.isConnected = () => false;
+            return sdp('10.0.0.1');
+        }
+        f.caller.isFenced = true;
+        throw new NativeOperationError('Native outcome unknown', true);
+    };
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a single-leg application BYE refused every time still removes the call and reports it once', async () => {
+    const f = await fixture();
+    f.caller.bye = async () => {
+        throw new NativeOperationError('control operation capacity', false, true);
+    };
+    await assert.rejects(f.gateway.bye('caller', 'app-hangup'), (err: unknown) => err instanceof NativeOperationError && err.unavailable);
+    assert.equal(f.registry.size, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a BYE refused through the whole extended schedule is retried every time', async () => {
+    const f = await fixture({ retryDelays: [1, 1, 1, 1, 1, 1, 1] });
+    let attempts = 0;
+    f.caller.bye = async () => {
+        attempts++;
+        throw new NativeOperationError('control operation capacity', false, true);
+    };
+    await assert.rejects(f.gateway.bye('caller'));
+    assert.equal(attempts, 8, 'one attempt plus seven retries');
+});
+
+test('after the handoff deadline the terminal event and the transfer result do not wait for the hung carrier re-INVITE', async () => {
+    const f = await fixture({ timeout: 20 });
+    const gate = Promise.withResolvers<void>();
+    f.caller.reinviteHook = async () => {
+        await gate.promise;
+        return sdp('10.0.0.1');
+    };
+    const realBye = f.caller.bye.bind(f.caller);
+    f.caller.bye = async () => {
+        await gate.promise; // the native per-context queue runs the BYE behind the re-INVITE
+        return realBye();
+    };
+    await assert.rejects(f.gateway.transfer(f.params, 'app'));
+    assert.equal(f.registry.size, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    assert.equal(f.caller.byes, 0, 'the carrier BYE is still queued behind the re-INVITE');
+    gate.resolve();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(f.caller.byes, 1);
+});
+
+test('shutdown wakes a sleeping BYE retry and schedules nothing afterwards', async () => {
+    const f = await fixture({ retryDelays: [60_000, 60_000] });
+    let attempts = 0;
+    f.caller.bye = async () => {
+        attempts++;
+        throw new NativeOperationError('control operation capacity', false, true);
+    };
+    const ending = f.gateway.bye('caller').catch(() => undefined);
+    await turn();
+    assert.equal(attempts, 1);
+    assert.equal((f.gateway as any).retrySleeps.size, 1);
+    await f.gateway.shutdown();
+    await ending;
+    assert.equal(attempts, 1, 'no retry after shutdown');
+    assert.equal((f.gateway as any).retrySleeps.size, 0);
+    // A refused ACK during shutdown does not schedule a deferred BYE either.
+    (f.gateway as any).deferBye(new Dialog(), undefined, Date.now());
+    assert.equal((f.gateway as any).deferredByes.size, 0);
 });

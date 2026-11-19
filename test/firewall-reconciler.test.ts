@@ -336,3 +336,55 @@ test('a persistently failing covering CIDR never costs the fallback host its pro
         assert.deepEqual([...backend.installed.keys()], ['192.0.2.1']);
     }
 });
+
+test('a covering range whose covered removals outlast its TTL is not installed and the covered host is restored', async () => {
+    let now = start;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.5', expiresAt: new Date(start + 60000).toISOString() }]));
+    await reconciler.reconcile();
+    backend.calls.length = 0;
+    const originalRemove = backend.remove.bind(backend);
+    backend.remove = async (target: string) => {
+        await originalRemove(target);
+        now += 6000; // the removal outlasts the range's remaining TTL
+    };
+    reconciler.accept(
+        snapshot(2, [
+            { target: '192.0.2.0/24', expiresAt: new Date(start + 5000).toISOString() },
+            { target: '192.0.2.5', expiresAt: new Date(start + 60000).toISOString() }
+        ])
+    );
+    await reconciler.reconcile();
+    assert.deepEqual(backend.calls, ['remove 192.0.2.5', 'add 192.0.2.5 54']);
+    assert.equal(
+        backend.calls.some(call => call.startsWith('add 192.0.2.0/24')),
+        false
+    );
+});
+
+test('a skipped expired covering range does not leave a new narrower ban uninstalled', async () => {
+    let now = start;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.5', expiresAt: new Date(start + 60000).toISOString() }]));
+    await reconciler.reconcile();
+    const originalRemove = backend.remove.bind(backend);
+    backend.remove = async (target: string) => {
+        await originalRemove(target);
+        now += 6000; // the covering range expires while the covered entry is removed
+    };
+    reconciler.accept(
+        snapshot(2, [
+            { target: '192.0.2.0/24', expiresAt: new Date(start + 5000).toISOString() },
+            { target: '192.0.2.5', expiresAt: new Date(start + 60000).toISOString() },
+            { target: '192.0.2.7', expiresAt: new Date(start + 60000).toISOString() }
+        ])
+    );
+    await reconciler.reconcile();
+    assert.ok(
+        backend.calls.some(call => call.startsWith('add 192.0.2.7 ')),
+        'the narrower ban is installed by the follow-up pass'
+    );
+    assert.equal(reconciler.state.appliedRevision, 2);
+});

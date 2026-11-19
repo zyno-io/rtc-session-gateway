@@ -138,7 +138,7 @@ export class SipFirewall extends EventEmitter {
         return false;
     }
 
-    observe(value: unknown, target: string | undefined, reason: string, transactionId?: string, replacement = false): void {
+    observe(value: unknown, target: string | undefined, reason: string, requestId?: string, replacement = false): void {
         if (this.config.mode === 'off') return;
         // Unknown-Replaces observations are opt-in; callers flag them with replacement=true.
         if (replacement && !this.config.observeUnknownReplaces) return;
@@ -152,8 +152,9 @@ export class SipFirewall extends EventEmitter {
         if (overlapsLoopback(addressRange(ip)) || overlapsLoopback(addressRange(key))) return;
         if (this.isAllowed(key) || this.shouldReject(ip)) return;
         const now = this.now();
-        if (transactionId) {
-            const key = createHash('sha256').update(ip).update('\0').update(transactionId).digest('hex');
+        // Deduplicates redelivery of one sipbridge request; distinct requests (even with equal Call-ID/CSeq) each score.
+        if (requestId) {
+            const key = createHash('sha256').update(ip).update('\0').update(requestId).digest('hex');
             if ((this.markers.get(key) ?? 0) > now) return;
             if (this.markers.size >= this.config.maxRecords) {
                 this.counters.skipped++;

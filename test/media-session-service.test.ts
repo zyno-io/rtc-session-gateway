@@ -757,6 +757,7 @@ test('recording-stop failure aborts media preparation without forgetting the act
     client.stopRecording = async () => {
         throw new Error('stop rejected');
     };
+    client.sessionRecordings = [{ recordingId: 'rec-1', filePath: client.recordingFilePath, state: 'active' }];
     await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), /stop rejected/);
     client.stopRecording = original;
     const result = await service.stopRecording('rec-1');
@@ -798,6 +799,84 @@ test('handoff guard is owner-scoped: a stale token cannot release a newer attemp
     await assert.rejects(service.startRecording('media-session-1', {}), MediaActionConflictError);
     service.releaseHandoff('media-session-1', b);
     await service.startRecording('media-session-1', {});
+});
+
+test('handoff drops a tracked recording rtpbridge no longer has when stop reports not found', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    client.stopRecording = async () => {
+        throw new Error('Recording not found');
+    };
+    client.sessionRecordings = [];
+    const first = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.deepEqual(
+        first.map(item => [item.recordingId, item.durationMs, item.packets]),
+        [['rec-1', 0, 0]]
+    );
+    await assert.rejects(service.stopRecording('rec-1'), /not found/);
+    // A retry no longer trips over the stale id, and the entry is not duplicated.
+    assert.equal((await service.prepareHandoff('media-session-1', 'owner', {})).length, 1);
+});
+
+test('a lost stop reply for a recording absent from session.info still yields its finalized entry', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    client.stopRecording = async () => {
+        throw new Error('timeout waiting for reply');
+    };
+    client.sessionRecordings = [];
+    const results = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.equal(results.length, 1);
+    assert.equal(results[0].recordingId, 'rec-1');
+    assert.equal(results[0].filePath, client.recordingFilePath);
+});
+
+test('rtpbridge recording.stopped event removes the tracked recording and records its metadata', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    client.stopRecording = async () => {
+        throw new Error('stop must not be called for an already-stopped recording');
+    };
+    client.emit('recording.stopped', {
+        recordingId: 'rec-1',
+        filePath: client.recordingFilePath,
+        durationMs: 42,
+        packets: 7,
+        reason: 'endpoint_removed'
+    });
+    const results = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.equal(results.length, 1);
+    assert.equal(results[0].recordingId, 'rec-1');
+    assert.equal(results[0].durationMs, 42);
+});
+
+test('a late recording-stop reply for a destroyed session does not recreate handoff history', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    const pending = Promise.withResolvers<void>();
+    const original = client.stopRecording.bind(client);
+    client.stopRecording = async (...args: Parameters<typeof original>) => {
+        await pending.promise;
+        return original(...args);
+    };
+    const stop = service.stopRecording('rec-1');
+    const destruction = service.destroySessionsForOwner('owner');
+    pending.resolve();
+    await stop;
+    await destruction;
+    assert.equal((service as any).handoffRecordings.has('media-session-1'), false);
 });
 
 test('finalized handoff recordings are capped at 256, dropping the oldest', async () => {

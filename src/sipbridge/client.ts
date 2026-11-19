@@ -108,6 +108,24 @@ export class SipbridgeControlDeadlineError extends Error {
     }
 }
 
+export const TERMINAL_COMMAND_RESERVE = 16;
+/**
+ * Most in-flight non-terminal commands per sipbridge peer. sipbridge's engine runs at most 64 commands at once
+ * (`work: make(chan struct{}, 64)`; a full engine answers NOT_ACCEPTED immediately) and each one holds its slot until it
+ * completes or its 40 s budget expires, so capping ordinary commands below that leaves slots for ACK, BYE and CANCEL.
+ */
+export const NON_TERMINAL_COMMAND_LIMIT = 48;
+
+/** True for commands that finish a dialog obligation: ACK, BYE and CANCEL. */
+export function isTerminalCommand(payload: NonNullable<Envelope['payload']>): boolean {
+    if (payload.$case !== 'command') return false;
+    const action = payload.command.action;
+    if (action?.$case === 'cancel') return true;
+    if (action?.$case !== 'dialogRequest') return false;
+    const method = action.dialogRequest.method.toUpperCase();
+    return method === 'ACK' || method === 'BYE';
+}
+
 function controlContext(payload: NonNullable<Envelope['payload']>): ContextRef | undefined {
     switch (payload.$case) {
         case 'command':
@@ -139,7 +157,10 @@ export class SipbridgeControlClient {
     private pendingWrites = 0;
     private stopped = false;
     private stopReason: SipbridgeControlCloseReason | undefined;
-    private readonly pending = new Map<string, { resolve: (value: Envelope) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+    private readonly pending = new Map<
+        string,
+        { resolve: (value: Envelope) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; nonTerminalCommand: boolean }
+    >();
     private readonly expired = new Map<string, number>();
     private readonly helloId = randomUUID();
 
@@ -438,7 +459,17 @@ export class SipbridgeControlClient {
         if (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > sipbridgeOperationBudget(payload))
             throw new SipbridgeControlNotSentError('invalid control operation budget');
         for (const [id, until] of this.expired) if (until <= performance.now()) this.expired.delete(id);
-        if (this.pending.size >= 128 || this.expired.size >= 1024) throw new SipbridgeControlNotSentError('control operation capacity');
+        // ACK, BYE and CANCEL end or complete dialogs; a small reserve keeps them sendable when ordinary commands fill the limit.
+        const terminal = isTerminalCommand(payload);
+        const reserve = terminal ? TERMINAL_COMMAND_RESERVE : 0;
+        const nonTerminalCommand = payload.$case === 'command' && !terminal;
+        if (nonTerminalCommand) {
+            let inFlight = 0;
+            for (const entry of this.pending.values()) if (entry.nonTerminalCommand) inFlight++;
+            if (inFlight >= NON_TERMINAL_COMMAND_LIMIT) throw new SipbridgeControlNotSentError('control operation capacity');
+        }
+        if (this.pending.size >= 128 + reserve || this.expired.size >= 1024 + reserve)
+            throw new SipbridgeControlNotSentError('control operation capacity');
         const id = randomUUID();
         const startedAt = performance.now();
         const context = controlContext(payload);
@@ -463,7 +494,7 @@ export class SipbridgeControlClient {
                     })
                 );
             }, budgetMs);
-            this.pending.set(id, { resolve, reject, timer });
+            this.pending.set(id, { resolve, reject, timer, nonTerminalCommand });
         });
         // A session can close while its write callback is still pending. Observe rejection immediately.
         void result.catch(() => undefined);
