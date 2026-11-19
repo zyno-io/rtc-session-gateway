@@ -616,3 +616,33 @@ test('a newer revision that drops the covering CIDR abandons its install and res
     assert.ok(!backend.calls.some(c => c.startsWith('add 192.0.2.0/24')));
     assert.ok(backend.calls.some(c => c.startsWith('add 192.0.2.1 ')));
 });
+
+test('the requested-block index is computed once per newer revision, not per removed host', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 600_000).toISOString();
+    const hosts = Array.from({ length: 2000 }, (_, i) => ({ target: `10.1.${i >> 8}.${i & 255}`, expiresAt }));
+    reconciler.accept(snapshot(1, hosts));
+    await reconciler.reconcile();
+    const cidr = { target: '10.1.0.0/16', expiresAt };
+    reconciler.accept(snapshot(2, [...hosts, cidr]));
+    const computed: number[] = [];
+    const internals = reconciler as unknown as { computeRequested(s: FirewallSnapshot): Map<string, number> };
+    const compute = internals.computeRequested.bind(reconciler);
+    internals.computeRequested = s => {
+        computed.push(s.revision);
+        return compute(s);
+    };
+    const remove = backend.remove.bind(backend);
+    let arrived = false;
+    backend.remove = async (target: string) => {
+        await remove(target);
+        if (arrived) return;
+        arrived = true;
+        reconciler.accept(snapshot(3, [...hosts, cidr, { target: '198.51.100.1', expiresAt }]));
+    };
+    backend.calls.length = 0;
+    await reconciler.reconcile();
+    assert.ok(backend.calls.includes('add 10.1.0.0/16 600'), 'covering CIDR installed');
+    assert.equal(computed.filter(revision => revision === 3).length, 1, `index recomputed: ${computed.join(',')}`);
+});

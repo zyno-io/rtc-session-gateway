@@ -98,6 +98,17 @@ export class FirewallReconciler {
 
     /** Eligible targets (unexpired, not allow-listed) a snapshot asks for, with the latest expiry per target. */
     private requestedBy(snapshot: FirewallSnapshot): Map<string, number> {
+        const cached = this.requestedIndex.get(snapshot);
+        if (cached) return cached;
+        const requested = this.computeRequested(snapshot);
+        this.requestedIndex.set(snapshot, requested);
+        return requested;
+    }
+
+    /** The per-snapshot index is reused by every per-mutation recheck of a pass (rebuilding it per removal is O(N^2)). */
+    private readonly requestedIndex = new WeakMap<FirewallSnapshot, Map<string, number>>();
+
+    private computeRequested(snapshot: FirewallSnapshot): Map<string, number> {
         const allow = [...snapshot.allowlist.map(addressRange), ...this.protectedRanges];
         const requested = new Map<string, number>();
         for (const block of snapshot.blocks) {

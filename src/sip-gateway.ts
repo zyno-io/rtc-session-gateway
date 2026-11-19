@@ -33,11 +33,11 @@ import type { SipTransferParams, SipTransferStatus } from './sip-handoff-contrac
 import {
     assertDirectMediaAnswer,
     assertRollbackAnswer,
-    mediaAddressKey,
     parseReferTarget,
     parseReplaces,
     rejectSdpOffer,
     relaySdp,
+    preservesMediaParameters,
     sharesMediaEndpoint,
     usesHostnameMedia
 } from './sip-sdp';
@@ -633,7 +633,7 @@ export class SipGateway {
                     );
                     if (restored.action !== 'answer') throw new Error('Application could not restore replaced media');
                     const committed = call.localSdp;
-                    if (committed && mediaAddressKey(restored.sdp) !== mediaAddressKey(committed)) {
+                    if (committed && !preservesMediaParameters(committed, restored.sdp)) {
                         // The application restored different local media: the original peer still sends to the old
                         // address, so it must be renegotiated onto the new one (or the call ends).
                         this.assertLiveCall(call);
@@ -646,7 +646,7 @@ export class SipGateway {
                         const answer = await call.dialog.reinvite(offer);
                         // The application never sees this answer, so it must leave the carrier exactly where it was
                         // (address, direction, codecs, SDES keys); anything else cannot be kept and ends the call.
-                        assertRollbackAnswer(answer, previousRemoteSdp, offer, previousRemoteSdp);
+                        assertRollbackAnswer(answer, previousRemoteSdp, offer);
                         this.assertLiveCall(call);
                         this.assertMediaUnreserved(restored.sdp, call);
                         this.updateCallSdp(call, { localSdp: offer, remoteSdp: answer });
@@ -814,7 +814,9 @@ export class SipGateway {
     private assertMediaUnreserved(sdp: string | undefined, owner?: ActiveCall) {
         if (!sdp) return;
         for (const [call, reserved] of this.mediaReservations) {
-            if (call !== owner && sharesMediaEndpoint(sdp, reserved)) {
+            if (call === owner) continue;
+            // A hostname cannot be compared with the reserved endpoint without resolving it: exclusivity is unknown.
+            if (usesHostnameMedia(sdp) || sharesMediaEndpoint(sdp, reserved)) {
                 throw new SipOperationConflictError('Media endpoint is reserved by a SIP handoff in progress');
             }
         }
@@ -823,11 +825,17 @@ export class SipGateway {
     /** Registers `sdp` as claimed local media until the returned release runs (call it in a `finally`). */
     private claimLocalMedia(sdp: string | undefined, owner?: ActiveCall): () => void {
         if (!sdp) return () => {};
+        this.assertMediaUnreserved(sdp, owner);
         const claim = { owner, sdp };
         this.pendingLocalMedia.add(claim);
         return () => {
             this.pendingLocalMedia.delete(claim);
         };
+    }
+
+    /** Registered calls whose localSdp can name a local endpoint: a pair with an external peer holds that peer's SDP instead. */
+    private localMediaSdps() {
+        return this.registry.list().filter(other => !this.registry.get(other.callId)?.peerDialog);
     }
 
     /**
@@ -840,7 +848,7 @@ export class SipGateway {
         const hostname = (sdp: string | undefined) => !!sdp && usesHostnameMedia(sdp);
         if (
             hostname(call.localSdp) ||
-            this.registry.list().some(other => hostname(other.localSdp)) ||
+            this.localMediaSdps().some(other => hostname(other.localSdp)) ||
             [...this.pendingLocalMedia].some(claim => hostname(claim.sdp))
         ) {
             throw new InvalidCallStateError(
@@ -856,7 +864,7 @@ export class SipGateway {
             }
         };
         const shared =
-            this.registry.list().some(other => other.callId !== call.callId && shares(other.localSdp)) ||
+            this.localMediaSdps().some(other => other.callId !== call.callId && shares(other.localSdp)) ||
             [...this.pendingLocalMedia].some(claim => claim.owner !== call && shares(claim.sdp));
         if (shared) throw new InvalidCallStateError('Handoff media endpoint is shared with another SIP call');
     }
@@ -1068,7 +1076,7 @@ export class SipGateway {
                     // The app's RTP endpoint still sends to the carrier's previous media address: a rejected audio stream
                     // or a moved address cannot be repaired here, so the call ends. Extra formats are legal (RFC 3264 6.1).
                     // It must also keep the voice codec the application's RTP endpoint negotiated against the carrier's previous SDP.
-                    assertRollbackAnswer(answer, previousRemoteSdp!, restore, previousRemoteSdp);
+                    assertRollbackAnswer(answer, previousRemoteSdp!, restore);
                     this.updateCallSdp(call, { localSdp: restore, remoteSdp: answer });
                 } catch {
                     await this.byeCall(call, 'transfer-restore-failed').catch(() => undefined);
@@ -1617,7 +1625,9 @@ export class SipGateway {
         }
         let uri: string;
         try {
-            const target = parseReferTarget(readHeader(req, 'refer-to') ?? '');
+            const referTo = [...headerValues(req, 'refer-to'), ...headerValues(req, 'r')];
+            if (referTo.length !== 1) throw new Error('Expected exactly one Refer-To');
+            const target = parseReferTarget(referTo[0]);
             uri = target.uri;
             if (target.replaces) {
                 const match = this.registry.findDialog(target.replaces);
@@ -1858,7 +1868,7 @@ export class SipGateway {
                     // The destination still sends to the carrier's previous media address: a rejected audio stream or a
                     // moved address leaves one-way audio, so the call ends. Extra formats are legal (RFC 3264 6.1).
                     // The destination still holds its earlier answer: the restored one must share a real voice codec with it.
-                    assertRollbackAnswer(answer, previousRemoteSdp!, restored, call.peerDialog && this.legSdp(call.peerDialog));
+                    assertRollbackAnswer(answer, previousRemoteSdp!, restored);
                     this.updateCallSdp(call, { localSdp: restored, remoteSdp: answer });
                 } catch {
                     await this.byeCall(call, 'return-restore-failed').catch(() => undefined);
@@ -2179,6 +2189,21 @@ function readHeaderRaw(req: Pick<IncomingSipRequest, 'get' | 'headers'>, name: s
 /** Number of Replaces header field instances on the request (the header map keeps only the last one). */
 function replacesInstances(req: Pick<IncomingSipRequest, 'headers'> & Partial<Pick<IncomingSipRequest, 'getAll'>>) {
     return req.getAll ? req.getAll('replaces').length : req.headers?.['replaces'] !== undefined ? 1 : 0;
+}
+
+/** Every instance of a header (case-insensitive), from the request's getAll when available, else the header map. */
+function headerValues(req: Pick<IncomingSipRequest, 'headers'> & Partial<Pick<IncomingSipRequest, 'getAll'>>, name: string): string[] {
+    try {
+        const all = req.getAll?.(name);
+        if (all?.length) return all.map(String);
+    } catch {
+        // Fall back to the header map.
+    }
+    const found: string[] = [];
+    for (const [key, value] of Object.entries(req.headers ?? {})) {
+        if (key.toLowerCase() === name && typeof value === 'string') found.push(value);
+    }
+    return found;
 }
 
 function readHeader(req: Pick<IncomingSipRequest, 'get' | 'headers'>, name: string) {

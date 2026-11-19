@@ -45,6 +45,8 @@ interface MediaSection {
     direction: string;
     /** Payload type to lowercase `encoding/clock`. */
     rtpmap: Map<string, string>;
+    /** Payload type to normalized fmtp parameters (lowercase, sorted `key=value` pairs joined by `;`). */
+    fmtp: Map<string, string>;
     /** SDES `suite key-params` of every a=crypto line (the tag is not part of the key identity). */
     crypto: Set<string>;
 }
@@ -59,7 +61,17 @@ function parseMediaSections(sdp: string): MediaSection[] {
     for (const line of sdp.trim().split(/\r?\n/)) {
         if (line.startsWith('m=')) {
             const [type, port, protocol, ...formats] = line.slice(2).trim().split(/\s+/);
-            current = { type, port: Number(port), protocol, formats, connection: '', direction: '', rtpmap: new Map(), crypto: new Set() };
+            current = {
+                type,
+                port: Number(port),
+                protocol,
+                formats,
+                connection: '',
+                direction: '',
+                rtpmap: new Map(),
+                fmtp: new Map(),
+                crypto: new Set()
+            };
             sections.push(current);
         } else if (line.startsWith('c=')) {
             if (current) current.connection = line.slice(2).trim();
@@ -75,6 +87,21 @@ function parseMediaSections(sdp: string): MediaSection[] {
             } else if (current && attribute.startsWith('rtpmap:')) {
                 const match = /^rtpmap:(\d+)\s+([^/\s]+)\/(\d+)/.exec(attribute);
                 if (match) current.rtpmap.set(match[1], `${match[2].toLowerCase()}/${match[3]}`);
+            } else if (current && attribute.startsWith('fmtp:')) {
+                const match = /^fmtp:(\d+)\s+(.*)$/.exec(attribute);
+                if (match) {
+                    const params = match[2]
+                        .split(';')
+                        .map(part =>
+                            part
+                                .trim()
+                                .toLowerCase()
+                                .replace(/\s*=\s*/, '=')
+                        )
+                        .filter(Boolean)
+                        .sort();
+                    current.fmtp.set(match[1], params.join(';'));
+                }
             }
         }
     }
@@ -124,17 +151,17 @@ const STATIC_ENCODINGS: Record<string, string> = {
 };
 
 /**
- * Identity of a payload type independent of its number: `encoding/clock`. Static types (< 96) have a fixed meaning
+ * Identity of a payload type: static types are `encoding/clock`, dynamic ones `pt:encoding/clock|fmtp`. Static types (< 96) have a fixed meaning
  * (RFC 3551), so any rtpmap is ignored for them on both sides; a dynamic type unmapped in `section` takes the mapping of
  * `fallbacks` (RFC 3264 6.1: an answer keeps the meaning the offer gave a type it leaves unmapped).
  */
 function codecIdentity(section: MediaSection, pt: string, ...fallbacks: (MediaSection | undefined)[]): string {
     if (Number(pt) < 96) return STATIC_ENCODINGS[pt] ?? `static:${pt}`;
-    for (const source of [section, ...fallbacks]) {
-        const mapped = source?.rtpmap.get(pt);
-        if (mapped) return mapped;
-    }
-    return `dynamic:${pt}`;
+    const sources = [section, ...fallbacks];
+    const mapped = sources.map(source => source?.rtpmap.get(pt)).find(Boolean);
+    const fmtp = sources.map(source => source?.fmtp.get(pt)).find(value => value !== undefined) ?? '';
+    // A dynamic type is only the same codec when its number and format parameters agree (AMR 97 octet-align=0 is not 98 octet-align=1).
+    return `${pt}:${mapped ?? 'dynamic'}|${fmtp}`;
 }
 
 /** The set of voice-codec identities of a stream (telephone-event, CN and repair formats excluded). */
@@ -204,12 +231,12 @@ const ANSWER_DIRECTION: Record<string, string> = {
  * payload types are allowed (RFC 3264 6.1); anything that changes the carrier's media address cannot be repaired.
  * SDES keys cannot be re-derived by the restored side: an active stream whose previous carrier description had
  * a=crypto must answer only with keys it already had.
- * When `otherLegSdp` (the SDP the untouched leg negotiated and keeps sending against) is given, the answer's voice codecs
- * must equal, per stream, the set negotiated before (the voice codecs in both `otherLegSdp` and `previousRemoteSdp`):
+ * The restore offer is the untouched leg's own description, so the answer's voice codecs must equal, per stream, the
+ * set negotiated before (the voice codecs in both `restoreOffer` and `previousRemoteSdp`; dynamic types by number and fmtp):
  * dropping one leaves the untouched leg sending a format nobody expects, and adding one the untouched leg may not decode.
  * Non-voice formats (telephone-event, CN) are ignored.
  */
-export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string, otherLegSdp?: string) {
+export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string) {
     const restored = parseMediaSections(restoreOffer);
     const answered = parseMediaSections(answer);
     const previous = parseMediaSections(previousRemoteSdp);
@@ -231,14 +258,12 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
     }
     if (!audioActive) throw new Error('Rollback audio was rejected');
     // The other leg keeps using the codecs it negotiated: the restored answer must offer exactly that voice set.
-    if (otherLegSdp) {
-        for (const [index, expected] of negotiatedVoiceCodecs(otherLegSdp, previousRemoteSdp)) {
-            const media = answered[index];
-            if (!media || !(media.port > 0) || !expected.size) continue;
-            const actual = voiceCodecs(media, restored[index]);
-            if (actual.size !== expected.size || [...actual].some(identity => !expected.has(identity))) {
-                throw new Error('Rollback answer changed the negotiated voice codecs of the other leg');
-            }
+    for (const [index, expected] of negotiatedVoiceCodecs(restoreOffer, previousRemoteSdp)) {
+        const media = answered[index];
+        if (!media || !(media.port > 0) || !expected.size) continue;
+        const actual = voiceCodecs(media, restored[index]);
+        if (actual.size !== expected.size || [...actual].some(identity => !expected.has(identity))) {
+            throw new Error('Rollback answer changed the negotiated voice codecs of the other leg');
         }
     }
 }
@@ -306,6 +331,29 @@ export function sharesMediaEndpoint(a: string, b: string): boolean {
     const left = endpoints(a);
     for (const endpoint of endpoints(b)) if (left.has(endpoint)) return true;
     return false;
+}
+
+/**
+ * True when `next` keeps every media parameter a peer negotiated against `previous`: address/port/protocol, direction,
+ * SDES keys and voice codec identities on each stream. Anything else needs a renegotiation.
+ */
+export function preservesMediaParameters(previous: string, next: string): boolean {
+    try {
+        if (mediaAddressKey(previous) !== mediaAddressKey(next)) return false;
+    } catch {
+        return false;
+    }
+    const before = parseMediaSections(previous);
+    const after = parseMediaSections(next);
+    if (before.length !== after.length) return false;
+    return before.every((media, index) => {
+        const other = after[index];
+        if (media.direction !== other.direction) return false;
+        if (media.crypto.size !== other.crypto.size || [...media.crypto].some(key => !other.crypto.has(key))) return false;
+        const left = voiceCodecs(media);
+        const right = voiceCodecs(other);
+        return left.size === right.size && [...left].every(identity => right.has(identity));
+    });
 }
 
 export function mediaAddressKey(sdp: string): string {
