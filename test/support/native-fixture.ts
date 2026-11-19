@@ -161,6 +161,14 @@ export async function nativeFixture() {
             SIPBRIDGE_TLS_KEY_FILE: join(directory, 'client.key'),
             SIPBRIDGE_TLS_CA_FILE: join(directory, 'ca.crt')
         },
+        async waitForSipReady() {
+            // A reconciled control connection can precede sipbridge receiving its readiness update.
+            await until(async () => {
+                const response = await fetch(`http://127.0.0.1:${adminPort}/sip-readyz`);
+                await response.text();
+                return response.ok;
+            });
+        },
         async restart() {
             child.kill('SIGKILL');
             await until(() => child.exitCode !== null || child.signalCode !== null);

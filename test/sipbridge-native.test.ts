@@ -33,10 +33,12 @@ test('native memory SIP accepts, ACKs and remotely terminates an inbound dialog 
     const peer = await sipPeer(fixture.sipPort);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         peer.send('INVITE', 1, '', sdp);
-        await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
-        const answer = peer.messages.find(message => message.startsWith('SIP/2.0 200'))!;
+        const isFinal = (message: string) => /^SIP\/2\.0 [2-6]\d\d\b/.test(message);
+        await until(() => peer.messages.some(isFinal), 8000);
+        const answer = peer.messages.find(isFinal)!;
+        assert.match(answer, /^SIP\/2\.0 200\b/);
         const remoteTag = /^To:.*;tag=([^;\r\n]+)/im.exec(answer)?.[1];
         assert.ok(remoteTag);
         peer.send('ACK', 1, remoteTag, '', 'z9hG4bK-ack');
@@ -139,7 +141,7 @@ test('native bootstrap connects to a non-admitting catalog and becomes eligible 
     const signaling = new SipbridgeSignaling(loadConfig(fixture.tls));
     try {
         await signaling.start();
-        await until(async () => (await fetch(`http://127.0.0.1:${fixture.adminPort}/sip-readyz`)).ok);
+        await fixture.waitForSipReady();
         assert.equal(signaling.isConnected, false);
         fixture.publish(true);
         await until(() => signaling.isConnected);
@@ -229,7 +231,7 @@ test('duplicate request notification runs policy once and native CANCEL wins whi
     const peer = await sipPeer(fixture.sipPort);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         peer.send('INVITE', 1, '', sdp);
         await until(() => invites === 1);
         peer.send('INVITE', 1, '', sdp);
@@ -276,7 +278,7 @@ test('a fresh request refused by admission policy receives its selected SIP stat
     const peer = await sipPeer(fixture.sipPort);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         peer.send('INVITE', 1, '', sdp);
         await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 503')), 1500);
         assert.equal(invites, 0);
@@ -518,7 +520,7 @@ test('rejected first requests leave no contexts and capacity refusals do not clo
     const peers = await Promise.all(Array.from({ length: 6 }, () => sipPeer(fixture.sipPort)));
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         await gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' });
         assert.equal(contextCount(signaling), 1);
         // Admission denial, owner rejection and an unsupported first request.
@@ -576,7 +578,7 @@ test('a flood of refused first requests beyond the context limit does not block 
     const final = (peer: (typeof peers)[number]) => peer.messages.some(message => /^SIP\/2.0 [3-6]/.test(message));
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         // 160 distinct refused calls exceed SIPBRIDGE_MEMORY_MAX_GROUPS (128). Refusals keep their transaction state for
         // the SIP timers (~32s on UDP), so they must not hold the slots a new call needs. Batches stay under the
         // per-source limit on requests awaiting a controller decision.
@@ -625,7 +627,7 @@ test('ended contexts do not count against the live-context admission limit and a
     const peer = await sipPeer(fixture.sipPort);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         await gateway.createOutbound({ requestUri: `sip:callee@127.0.0.1:${uas.port};transport=udp`, sdp, receiverUrl: 'https://owner.test/sip' });
         const contexts = (signaling as any).contexts as Map<string, any>;
         const live = [...contexts.values()][0];
@@ -679,7 +681,7 @@ test('a request on a different flow is refused immediately', native, async () =>
     other.on('message', bytes => replies.push({ at: Date.now(), wire: bytes.toString() }));
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         peer.send('INVITE', 1, '', sdp);
         await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
         const toTag = toTagOf(peer.messages.find(message => message.startsWith('SIP/2.0 200'))!)!;
@@ -733,7 +735,7 @@ test('first requests present() would not answer are refused, so out-of-dialog BY
     const peer = await rawSender(fixture.sipPort);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         const count = (prefix: string) => peer.messages.filter(message => message.startsWith(prefix)).length;
         // Under sipbridge's per-window native context limit (128); each must be refused and released.
         for (let i = 0; i < 100; i++) {
@@ -888,7 +890,7 @@ test('a full receipt table evicts the oldest receipts instead of refusing messag
     const peer = await rawSender(fixture.sipPort);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         const events = (signaling as any).events as Map<string, unknown>;
         for (let i = 0; i < 8192; i++) events.set('old' + i, { fingerprint: 'x', expires: Date.now() + 100000 });
         peer.send('INVITE');
@@ -926,7 +928,7 @@ test(
         const peer = await sipPeer(fixture.sipPort);
         try {
             await gateway.start();
-            await until(() => gateway.isConnected);
+            await fixture.waitForSipReady();
             const client = [...(signaling as any).peers.values()][0].client;
             const request = client.request.bind(client);
             let lost = false;
@@ -998,7 +1000,7 @@ test('native firewall refuses a banned source for INVITE and other fresh methods
     const options = await sipPeer(fixture.sipPort, externalAddress);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         peer.send('INVITE', 1, '', sdp);
         await until(() => peer.messages.some(message => message.startsWith('SIP/2.0 403') && /CSeq: 1 INVITE/i.test(message)), 4000);
         options.send('MESSAGE', 1, '', '', 'z9hG4bK-message');
@@ -1044,7 +1046,7 @@ test('native firewall scores each unrouted INVITE once, then refuses the banned 
         peer.messages.filter(message => message.startsWith('SIP/2.0 ' + status) && new RegExp('CSeq: ' + cseq + ' INVITE', 'i').test(message)).length;
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         peer.send('INVITE', 1, '', sdp, 'z9hG4bK-scan1');
         await until(() => status(404, 1) > 0, 4000);
         peer.send('INVITE', 1, '', sdp, 'z9hG4bK-scan1');
@@ -1106,7 +1108,7 @@ test('native firewall scores every distinct fresh request even with a reused Cal
     const responses = () => peer.messages.filter(message => message.startsWith('SIP/2.0 404')).length;
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         for (let i = 0; i < 6; i++) {
             rawInvite(peer, externalAddress!, fixture.sipPort, {
                 user: 'scan' + i,
@@ -1156,7 +1158,7 @@ test('native firewall leaves a forgotten-dialog re-INVITE to the 481 refusal, un
     const peer = await sipPeer(fixture.sipPort, externalAddress);
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         const client = [...(signaling as any).peers.values()][0].client;
         const request = client.request.bind(client);
         let lost = false;
@@ -1469,6 +1471,7 @@ test('native peer 481 to our re-INVITE through gateway.reinvite ends the call wi
 });
 
 async function inboundDialog(fixture: Awaited<ReturnType<typeof nativeFixture>>, signaling: SipbridgeSignaling) {
+    await fixture.waitForSipReady();
     const peer = await sipPeer(fixture.sipPort);
     const dialogs: import('../src/sipbridge-signaling').NativeDialog[] = [];
     signaling.onInvite = async (_request, response) => {
@@ -1604,7 +1607,7 @@ test('native handoff: offerless destination, carrier cutover, paired BYE and a f
     const gatewayRequests = (method: string) => carrier.messages.filter(message => message.startsWith(method + ' '));
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         carrier.send('INVITE', 1, '', offerSdp);
         await until(() => carrier.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
         const remoteTag = /^To:.*;tag=([^;\r\n]+)/im.exec(carrier.messages.find(message => message.startsWith('SIP/2.0 200'))!)![1];
@@ -1705,7 +1708,7 @@ test('native handoff: a BYE during an outstanding offerless re-INVITE reaches th
     };
     try {
         await gateway.start();
-        await until(() => gateway.isConnected);
+        await fixture.waitForSipReady();
         carrier.send('INVITE', 1, '', offerSdp);
         await until(() => carrier.messages.some(message => message.startsWith('SIP/2.0 200')), 8000);
         const remoteTag = /^To:.*;tag=([^;\r\n]+)/im.exec(carrier.messages.find(message => message.startsWith('SIP/2.0 200'))!)![1];
