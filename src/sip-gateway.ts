@@ -586,7 +586,14 @@ export class SipGateway {
                     if (call.dialog.isFenced || destination!.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
                     if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
                     carrierPending = true;
-                    const answer = await call.dialog.reinvite(relayedOffer);
+                    let answer: string;
+                    try {
+                        answer = await call.dialog.reinvite(relayedOffer);
+                    } catch (err) {
+                        // A definite refusal or rejection means the carrier never switched media: no timeout BYE is owed.
+                        if (err instanceof NativeOperationError && !err.uncertain) carrierPending = false;
+                        throw err;
+                    }
                     // The carrier accepted the destination's media; failures from here on must restore its previous media.
                     switched = true;
                     this.sentSdp.set(call.dialog, relayedOffer);
@@ -1457,9 +1464,13 @@ function outboundSipLogContext(params: OutboundSipCallParams) {
     };
 }
 
-/** Cross-leg glare reported by the native layer (an INVITE procedure is already pending on the dialog). */
+/** Glare: the peer answered 491, or sipbridge refused locally because an INVITE procedure is already pending. */
 function isGlare(err: unknown) {
-    return err instanceof Error && /pending|\b491\b/i.test(err.message);
+    if (!(err instanceof NativeOperationError)) return false;
+    if (err.sipStatus === 491) return true;
+    // Text fallback: sipbridge currently refuses local glare as NOT_ACCEPTED ("SIP 491: INVITE procedure pending") with no
+    // status. Remove once sipbridge reports sip_status on refusals.
+    return err.sipStatus === 0 && /\b491\b/.test(err.message);
 }
 
 function normalizeIp(address: string) {

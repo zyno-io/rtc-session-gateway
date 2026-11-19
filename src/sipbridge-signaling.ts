@@ -67,7 +67,9 @@ export class NativeOperationError extends Error {
     constructor(
         message: string,
         readonly uncertain = false,
-        readonly unavailable = false
+        readonly unavailable = false,
+        /** The peer's SIP final status when known (0 = none/unknown). */
+        readonly sipStatus = 0
     ) {
         super(message);
     }
@@ -881,8 +883,17 @@ export class SipbridgeSignaling extends EventEmitter {
                 )
                     throw new NativeOperationError('Native outcome unknown', true);
                 if (result.error || result.certainty === OperationResult_Certainty.NOT_ACCEPTED)
-                    throw new NativeOperationError(result.error || 'Native command refused');
+                    throw new NativeOperationError(result.error || 'Native command refused', false, false, result.sipStatus ?? 0);
                 if (!result.snapshot) throw new NativeOperationError('Native result omitted context', true);
+                if (action.$case === 'dialogRequest' && result.certainty === OperationResult_Certainty.COMPLETED) {
+                    const method = action.dialogRequest.method.toUpperCase();
+                    const status = result.sipStatus ?? 0;
+                    // A peer's non-2xx final is a definite failure: it neither fences the context nor is uncertain. (Status 0
+                    // is not reached at the pinned sipbridge; it is treated as a failure defensively.) The snapshot above is
+                    // already remembered.
+                    if (method !== 'ACK' && method !== 'BYE' && (status < 200 || status >= 300))
+                        throw new NativeOperationError(`SIP non-success response: ${status}`, false, false, status);
+                }
                 return result.snapshot;
             } catch (error) {
                 if (error instanceof SipbridgeControlNotSentError) throw new NativeOperationError(error.message, false, true);

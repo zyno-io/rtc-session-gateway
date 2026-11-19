@@ -840,7 +840,7 @@ test('a destination answering after the caller left is ACKed with a rejection be
 test('a refused return re-INVITE needs no restore and leaves the external conversation working', async () => {
     const f = await handedOff();
     const before = f.caller.reinvites.length;
-    f.caller.reinviteFailure = new Error('491 glare');
+    f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 491', false, false, 491);
     f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(f.caller.reinvites.length, before + 1, 'no restore re-INVITE after a refused one');
@@ -908,11 +908,14 @@ test('Replaces during a cross-leg operation is refused instead of racing it', as
 
 test('a refused offerless relay answers the requester and keeps the call: 491 for glare, 488 otherwise', async () => {
     for (const [message, status] of [
-        ['INVITE procedure pending', 491],
-        ['488 Not Acceptable', 488]
+        [new NativeOperationError('SIP non-success response: 491', false, false, 491), 491],
+        [new NativeOperationError('SIP 491: INVITE procedure pending'), 491],
+        [new NativeOperationError('SIP non-success response: 488', false, false, 488), 488],
+        [new NativeOperationError('INVITE procedure pending'), 488],
+        [new Error('SIP 491: INVITE procedure pending'), 488]
     ] as const) {
         const f = await handedOff();
-        f.center.reinviteFailure = new Error(message);
+        f.center.reinviteFailure = message;
         const response = new Response();
         f.caller.emit('request', request('INVITE', '', 43), response);
         await turn();
@@ -928,7 +931,7 @@ test('a refused offerless relay answers the requester and keeps the call: 491 fo
 
 test('glare on an offered relay is passed through as 491', async () => {
     const f = await handedOff();
-    f.center.reinviteFailure = new Error('INVITE procedure pending');
+    f.center.reinviteFailure = new NativeOperationError('SIP non-success response: 491', false, false, 491);
     const response = new Response();
     f.caller.emit('request', request('INVITE', sdp('10.0.0.1')), response);
     await turn();
