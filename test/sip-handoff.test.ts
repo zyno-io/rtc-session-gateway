@@ -1969,6 +1969,8 @@ test("a reused callId never inherits the previous call's pending transfer or con
         const second = new Dialog('caller', 'gateway-tag-2', 'caller-tag-2');
         second.name = 'caller2';
         second.log = f.log;
+        // The first call's media teardown is still pending, so its endpoint stays reserved: the reused call binds another.
+        f.hub.request = async () => ({ action: 'answer', sdp: sdp('10.0.0.3', 41000) }) as never;
         await f.gateway.handleInvite(invite() as never, new Response(second) as never);
         await turn();
         const callB = f.registry.get('caller')!;
@@ -2399,19 +2401,99 @@ test('a transfer is refused while another registered call uses the same media en
     assert.equal(f.call.ownership, 'application');
 });
 
-test('a transfer is refused when another call claims the endpoint after admission, before media is touched', async () => {
+test('a call the app answers with the source endpoint during a transfer is refused; the transfer proceeds', async () => {
     const f = await fixture();
     const other = new Dialog('other', 'other-tag', 'other-remote');
+    const otherResponse = new Response(other);
     const gate = Promise.withResolvers<void>();
     f.delayDial(() => gate.promise);
+    const transfer = f.gateway.transfer(f.params, 'app');
+    await settle(5);
+    // The app answers call B with call A's endpoint while A's transfer is in progress.
+    await f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, otherResponse as never);
+    await turn();
+    assert.equal(otherResponse.answered, undefined, 'the answer is never sent');
+    assert.deepEqual(otherResponse.statuses, [488]);
+    assert.equal(f.registry.get('other'), undefined);
+    gate.resolve();
+    const status = await transfer;
+    assert.equal(status.state, 'completed');
+    assert.equal(f.call.ownership, 'handed-off');
+    // The reservation is released with the transfer: the endpoint is bindable again.
+    const later = new Response(new Dialog('later', 'later-tag', 'later-remote'));
+    await f.gateway.handleInvite(invite({}, 'later', '10.0.0.8') as never, later as never);
+    assert.ok(later.answered);
+});
+
+test('an answer that was already in flight is refused before activation when a transfer reserves the endpoint meanwhile', async () => {
+    const f = await fixture();
+    const other = new Dialog('other', 'other-tag', 'other-remote');
+    const otherResponse = new Response(other);
+    const answerGate = Promise.withResolvers<void>();
+    otherResponse.answerGate = answerGate.promise;
+    const dialGate = Promise.withResolvers<void>();
+    f.delayDial(() => dialGate.promise);
+    const inbound = f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, otherResponse as never);
+    await settle(5);
     const transfer = f.gateway.transfer(f.params, 'app').catch(err => err);
     await settle(5);
+    answerGate.resolve();
+    await inbound;
+    await settle(5);
+    assert.equal(f.registry.get('other'), undefined, 'never activated');
+    assert.equal(other.byes, 1, 'the answered dialog is torn down');
+    dialGate.resolve();
+    await transfer;
+});
+
+test('an application re-INVITE onto a reserved endpoint is refused with a conflict', async () => {
+    const f = await fixture();
+    const other = new Dialog('other', 'other-tag', 'other-remote');
+    f.hub.request = async () => ({ action: 'answer', sdp: sdp('10.0.0.4', 42000) }) as never;
     await f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, new Response(other) as never);
     await turn();
+    const gate = Promise.withResolvers<void>();
+    f.delayDial(() => gate.promise);
+    const transfer = f.gateway.transfer(f.params, 'app');
+    await settle(5);
+    await assert.rejects(f.gateway.reinvite('other', sdp('10.0.0.3')), SipOperationConflictError);
+    assert.equal(other.reinvites.length, 0);
     gate.resolve();
-    const result = await transfer;
-    assert.match(String(result), /shared with another SIP call/);
-    assert.equal(f.sources.length, 0, 'recording was never stopped');
+    await transfer;
+});
+
+test('a Replaces return naming the carrier dialog commits even when the carrier fences during the consult', async () => {
+    const f = await handedOff();
+    const gate = Promise.withResolvers<void>();
+    f.hub.request = async () => {
+        await gate.promise;
+        return { action: 'answer', sdp: sdp('10.0.0.3', 41000) } as never;
+    };
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await turn();
+    // The replaced carrier dialog fences (an UNKNOWN outcome) while the app is consulted; the replacement retires it anyway.
+    f.caller.fence();
+    f.events.length = 0;
+    gate.resolve();
+    await pending;
+    await settle(20);
+    assert.ok(response.answered, 'the replacement is answered');
+    assert.deepEqual(
+        f.registry.list().map(c => c.callId),
+        ['replacement']
+    );
+    assert.equal(f.caller.byes, 0, 'the fenced carrier is never commanded (I5)');
+    assert.equal(f.center.byes, 1, 'the destination leg is retired');
+    assert.equal(replacement.byes, 0);
+    assert.ok(
+        !(f.events as any[]).some(e => e.data?.reason === 'return-peer-uncertain'),
+        'the committed replacement is not terminated for the old legs'
+    );
 });
 
 test('Refer-Sub: false is echoed in the 202 and suppresses NOTIFY; without it NOTIFYs are sent', async () => {
@@ -2442,9 +2524,57 @@ test('a Replaces whose quoted parameter contains a comma is not rejected as malf
 
 test('rollback and endpoint helpers', () => {
     const prev = sdp('10.0.0.1');
-    assertRollbackAnswer(sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101'), prev);
-    assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 0), prev), /rejected/);
-    assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 40002), prev), /address/);
+    const restore = sdp('10.0.0.3');
+    assertRollbackAnswer(sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101'), prev, restore);
+    assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 0), prev, restore), /rejected/);
+    assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 40002), prev, restore), /address/);
     assert.equal(sharesMediaEndpoint(sdp('10.0.0.3'), sdp('10.0.0.3')), true);
     assert.equal(sharesMediaEndpoint(sdp('10.0.0.3'), sdp('10.0.0.3', 40002)), false);
+});
+
+test('a rollback answer that leaves the call on hold is rejected', () => {
+    const prev = sdp('10.0.0.1');
+    const restore = sdp('10.0.0.3');
+    for (const direction of ['inactive', 'sendonly', 'recvonly'])
+        assert.throws(() => assertRollbackAnswer(prev.replace('a=sendrecv', `a=${direction}`), prev, restore), /direction/, direction);
+    // RFC 3264 6.1: a sendonly offer is answered recvonly.
+    assertRollbackAnswer(prev.replace('a=sendrecv', 'a=recvonly'), prev, restore.replace('a=sendrecv', 'a=sendonly'));
+    // A session-level direction applies to streams without their own.
+    assert.throws(() => assertRollbackAnswer(prev.replace('a=sendrecv', '').replace('t=0 0', 't=0 0\r\na=inactive'), prev, restore), /direction/);
+});
+
+test('a rollback after a multi-stream offer whose rejected video stream was declined by the app is kept', () => {
+    const carrierOffer =
+        'v=0\r\no=- 1 1 IN IP4 1.1.1.1\r\ns=-\r\nc=IN IP4 1.1.1.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 0\r\nm=video 51372 RTP/AVP 31\r\n';
+    const appAnswer = 'v=0\r\no=- 5 5 IN IP4 10.0.0.3\r\ns=-\r\nc=IN IP4 10.0.0.3\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\nm=video 0 RTP/AVP 31\r\n';
+    const destOffer =
+        'v=0\r\no=- 9 9 IN IP4 10.0.0.2\r\ns=-\r\nc=IN IP4 10.0.0.2\r\nt=0 0\r\nm=audio 45000 RTP/AVP 0\r\nm=video 45002 RTP/AVP 31\r\n';
+    const restore = relaySdp(appAnswer, relaySdp(destOffer, appAnswer));
+    const answer = 'v=0\r\no=- 1 3 IN IP4 1.1.1.1\r\ns=-\r\nc=IN IP4 1.1.1.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 0\r\nm=video 0 RTP/AVP 31\r\n';
+    assertRollbackAnswer(answer, carrierOffer, restore);
+    assert.throws(() => assertRollbackAnswer(answer.replace('49170', '49172'), carrierOffer, restore), /address/);
+    assert.throws(() => assertRollbackAnswer(answer.replace('m=audio 49170', 'm=audio 0'), carrierOffer, restore), /rejected/);
+});
+
+test('a forward answer may list extra formats but must keep one offered format', () => {
+    const offer = sdp('10.0.0.2', 45000).replace('RTP/AVP 0 101', 'RTP/AVP 0');
+    const answer = (formats: string, extra = '') => sdp('10.0.0.1').replace('RTP/AVP 0 101', `RTP/AVP ${formats}`) + extra;
+    assertDirectMediaAnswer(offer, answer('0 9'));
+    assertDirectMediaAnswer(offer, answer('9 0'));
+    assert.throws(() => assertDirectMediaAnswer(offer, answer('9')), /Incompatible/);
+    // Renumbered dynamic payload types match by encoding and clock.
+    const dynamicOffer = offer.replace('RTP/AVP 0', 'RTP/AVP 96').replace('a=rtpmap:0 PCMU/8000', 'a=rtpmap:96 opus/48000');
+    const dynamicAnswer = answer('97').replace('a=rtpmap:0 PCMU/8000', 'a=rtpmap:97 OPUS/48000');
+    assertDirectMediaAnswer(dynamicOffer, dynamicAnswer);
+    assert.throws(() => assertDirectMediaAnswer(dynamicOffer, dynamicAnswer.replace('OPUS/48000', 'speex/16000')), /Incompatible/);
+});
+
+test('a quoted Replaces parameter is never read as the early-only flag', () => {
+    const quoted = parseReplaces('abc@h;to-tag=1;from-tag=2;x="note;early-only;end"');
+    assert.equal(quoted.earlyOnly, false);
+    assert.equal(quoted.toTag, '1');
+    assert.equal(parseReplaces('abc@h;to-tag=1;from-tag=2;early-only').earlyOnly, true);
+    assert.equal(parseReplaces('abc@h;to-tag=1;EARLY-ONLY;from-tag=2').earlyOnly, true);
+    assert.equal(parseReplaces('abc@h;to-tag=1;from-tag=2;x="a\\";early-only"').earlyOnly, false);
+    assert.throws(() => parseReplaces('abc@h;to-tag=1;from-tag=2;x="open'), /quoted|Invalid/);
 });

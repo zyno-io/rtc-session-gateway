@@ -450,3 +450,40 @@ test('a host unblocked by a newer snapshot during the covering-CIDR removal is n
     assert.equal(reconciler.state.active, 0);
     assert.equal(reconciler.state.errors, 1, 'the failed pass is still counted');
 });
+
+test('a covered host unblocked by a newer snapshot while an earlier host is being restored is not restored', async () => {
+    class Racing extends OverlapBackend {
+        onAdd?: (target: string) => void;
+        async add(target: string, ttl: number) {
+            await super.add(target, ttl);
+            this.onAdd?.(target);
+        }
+    }
+    const backend = new Racing();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 20000).toISOString();
+    reconciler.accept(
+        snapshot(1, [
+            { target: '192.0.2.1', expiresAt },
+            { target: '192.0.2.2', expiresAt }
+        ])
+    );
+    await reconciler.reconcile();
+    backend.failAdds.set('192.0.2.0/24', 1);
+    reconciler.accept(
+        snapshot(2, [
+            { target: '192.0.2.1', expiresAt },
+            { target: '192.0.2.2', expiresAt },
+            { target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() }
+        ])
+    );
+    backend.onAdd = target => {
+        if (target !== '192.0.2.1') return;
+        backend.onAdd = undefined;
+        reconciler.accept(snapshot(3, [{ target: '192.0.2.1', expiresAt }]));
+        reconciler.schedule();
+    };
+    await reconciler.reconcile();
+    assert.deepEqual([...backend.installed.keys()], ['192.0.2.1']);
+    assert.equal(backend.calls.filter(call => call.startsWith('add 192.0.2.2 ')).length, 1, 'second host was not re-added');
+});

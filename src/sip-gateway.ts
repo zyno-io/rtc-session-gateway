@@ -102,6 +102,10 @@ export class SipGateway {
     private transferRequests = new WeakMap<ActiveCall, PendingOutboundSipCall>();
     /** Calls with a cross-leg SDP operation in flight; at most one per call (I2). Keyed by instance: a reused callId is a different call. */
     private modifyingPairs = new Set<ActiveCall>();
+    /** Local media of calls under transfer, reserved from admission through teardown: no other call may bind to it. */
+    private mediaReservations = new Map<ActiveCall, string>();
+    /** Local media an application re-INVITE is negotiating: not yet on the call, but already claimed. */
+    private pendingLocalMedia = new Map<ActiveCall, string>();
     /** Last SDP this gateway sent on each leg; keeps origin versions monotonic when relaying between legs. */
     private sentSdp = new WeakMap<NativeDialog, string>();
     /** Legs holding an answered late-offer 2xx the gateway has not yet ACKed; the settle function sends the rejection ACK (I6). */
@@ -352,6 +356,9 @@ export class SipGateway {
                 return;
             }
 
+            // The endpoint may be reserved by a transfer in progress: checked before the answer is sent and again before
+            // the call is activated (the answer awaits).
+            this.assertMediaUnreserved(action.sdp);
             const dialog = await res.answer(action.sdp, action.headers);
             answeredDialog = dialog;
             this.lifecycle?.assertRunning();
@@ -360,8 +367,8 @@ export class SipGateway {
             // The owner left while the answer was written: the replacement is BYEd (catch below) and the original pair,
             // still `returning`, is restored to handed-off by the finally block without touching its legs.
             if (!ownerLive()) throw new InvalidCallStateError('Return owner disconnected');
-            // A fenced carrier (the leg being kept) cannot be returned; a fenced destination is retired anyway.
-            if (replacing && replacing.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
+            // Both old legs are retired by the replacement (retireReplaced), so a fenced old leg does not block it.
+            this.assertMediaUnreserved(action.sdp);
             const now = new Date().toISOString();
             const call = this.registry.activate({
                 logicalCallId: inviteRequest.logicalCallId,
@@ -571,10 +578,17 @@ export class SipGateway {
             }
             prepared = true;
             this.assertLiveCall(call);
+            this.assertMediaUnreserved(action.sdp, call);
             const replacement = await res.answer(action.sdp, action.headers);
             if (this.registry.get(call.callId) !== call) {
                 await this.byeLeg(replacement).catch(() => undefined);
                 return;
+            }
+            try {
+                this.assertMediaUnreserved(action.sdp, call);
+            } catch (err) {
+                await this.byeLeg(replacement).catch(() => undefined);
+                throw err;
             }
             // I4: detach the old leg before it can emit anything that touches the call.
             const old = call.dialog;
@@ -606,7 +620,7 @@ export class SipGateway {
                 }
             }
             this.logger.warn({ callId: call.callId, failure: 'replacement-failed' }, 'Failed to replace application SIP dialog');
-            if (!res.finalResponseSent) await res.respond(502).catch(() => undefined);
+            if (!res.finalResponseSent) await res.respond(sipStatusForError(err)).catch(() => undefined);
         } finally {
             this.modifyingPairs.delete(call);
         }
@@ -674,7 +688,9 @@ export class SipGateway {
         if (!call) throw new CallNotFoundError(`Call ${callId} not found`);
         if (call.ownership && call.ownership !== 'application') throw new SipOperationConflictError('Call is owned by a SIP handoff');
         if (this.modifyingPairs.has(call)) throw new SipOperationConflictError('SIP renegotiation is in progress');
+        this.assertMediaUnreserved(sdp, call);
         this.modifyingPairs.add(call);
+        this.pendingLocalMedia.set(call, sdp);
         try {
             const remoteSdp = await call.dialog.reinvite(sdp, headers);
             this.assertLiveCall(call);
@@ -685,6 +701,7 @@ export class SipGateway {
             this.endIfDialogGone(call, err);
             throw new InvalidCallStateError(errorMessage(err));
         } finally {
+            this.pendingLocalMedia.delete(call);
             this.modifyingPairs.delete(call);
         }
     }
@@ -720,6 +737,9 @@ export class SipGateway {
         if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
         const sourceEndpointId = media.assertHandoffMedia(params.mediaSessionId, controlConnectionId, call.localSdp) || undefined;
         this.assertExclusiveMedia(call);
+        // Reserved synchronously with the check above: from here until teardown completes no other call may bind to the
+        // source endpoint, because the handoff destroys the media session behind it.
+        this.mediaReservations.set(call, call.localSdp);
         const handoffSource = { endpointId: sourceEndpointId, sdp: call.localSdp };
         // Registered before ownership is claimed so an ID collision cannot strand the call in `transferring`.
         // Unique per attempt: the internal id is never derived from a callId another call may reuse.
@@ -732,6 +752,17 @@ export class SipGateway {
             return await operation;
         } finally {
             this.transfers.delete(call);
+            if (this.mediaReservations.get(call) === handoffSource.sdp) this.mediaReservations.delete(call);
+        }
+    }
+
+    /** Refuses `sdp` when it binds a local media endpoint reserved by a transfer of another call. */
+    private assertMediaUnreserved(sdp: string | undefined, owner?: ActiveCall) {
+        if (!sdp) return;
+        for (const [call, reserved] of this.mediaReservations) {
+            if (call !== owner && sharesMediaEndpoint(sdp, reserved)) {
+                throw new SipOperationConflictError('Media endpoint is reserved by a SIP handoff in progress');
+            }
         }
     }
 
@@ -739,10 +770,13 @@ export class SipGateway {
     private assertExclusiveMedia(call: ActiveCall) {
         if (!call.localSdp) return;
         for (const other of this.registry.list()) {
-            if (other.callId === call.callId || !other.localSdp) continue;
+            if (other.callId === call.callId) continue;
+            const live = this.registry.get(other.callId);
+            const otherSdp = (live && this.pendingLocalMedia.get(live)) ?? other.localSdp;
+            if (!otherSdp) continue;
             let shared = false;
             try {
-                shared = sharesMediaEndpoint(call.localSdp, other.localSdp);
+                shared = sharesMediaEndpoint(call.localSdp, otherSdp);
             } catch {
                 shared = false;
             }
@@ -953,7 +987,7 @@ export class SipGateway {
                     const answer = await call.dialog.reinvite(restore);
                     // The app's RTP endpoint still sends to the carrier's previous media address: a rejected audio stream
                     // or a moved address cannot be repaired here, so the call ends. Extra formats are legal (RFC 3264 6.1).
-                    assertRollbackAnswer(answer, previousRemoteSdp!);
+                    assertRollbackAnswer(answer, previousRemoteSdp!, restore);
                     this.updateCallSdp(call, { localSdp: restore, remoteSdp: answer });
                 } catch {
                     await this.byeCall(call, 'transfer-restore-failed').catch(() => undefined);
@@ -1007,6 +1041,7 @@ export class SipGateway {
         this.logger.info(logContext, 'Creating outbound SIP dialog');
         let answered: NativeDialog | undefined;
         try {
+            this.assertMediaUnreserved(params.sdp);
             pending.attempt = this.signaling.openDialog(params);
             if (pending.cancelRequested) {
                 // A definitely refused CANCEL leaves setup pending: a destination that answers meanwhile is still
@@ -1037,6 +1072,13 @@ export class SipGateway {
                 throw new InvalidCallStateError('Outbound SIP call was cancelled');
             }
 
+            const localSdp = dialog.localSdp || params.sdp;
+            try {
+                this.assertMediaUnreserved(localSdp);
+            } catch (err) {
+                await this.byeLeg(dialog).catch(() => undefined);
+                throw err;
+            }
             const sipCallId = dialog.sipCallId;
             const callId = this.registry.reserveCallId(sipCallId);
             const now = new Date().toISOString();
@@ -1051,7 +1093,7 @@ export class SipGateway {
                 destinationUri,
                 destinationUser: getSipUser(destinationUri),
                 sourceUri: getSourceUri(params.headers),
-                localSdp: dialog.localSdp || params.sdp,
+                localSdp,
                 remoteSdp: dialog.remoteSdp,
                 createdAt: now,
                 updatedAt: now,
@@ -1621,6 +1663,7 @@ export class SipGateway {
             if (controlRoute && !this.controlHub?.isConnected(controlRoute.connectionId))
                 throw new InvalidCallStateError('Return owner disconnected');
             if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
+            this.assertMediaUnreserved(action.sdp, call);
             localSdp = relaySdp(action.sdp, this.legSdp(call.dialog));
             const answer = await call.dialog.reinvite(localSdp);
             // Only an accepted re-INVITE changed the carrier's media; a refused one needs no restore.
@@ -1707,7 +1750,7 @@ export class SipGateway {
                     const answer = await call.dialog.reinvite(restored);
                     // The destination still sends to the carrier's previous media address: a rejected audio stream or a
                     // moved address leaves one-way audio, so the call ends. Extra formats are legal (RFC 3264 6.1).
-                    assertRollbackAnswer(answer, previousRemoteSdp!);
+                    assertRollbackAnswer(answer, previousRemoteSdp!, restored);
                     this.updateCallSdp(call, { localSdp: restored, remoteSdp: answer });
                 } catch {
                     await this.byeCall(call, 'return-restore-failed').catch(() => undefined);
@@ -1774,6 +1817,7 @@ export class SipGateway {
                 return;
             }
 
+            this.assertMediaUnreserved(action.sdp, call);
             await res.respond(action.status ?? 200, { body: action.sdp, headers: action.headers });
             this.updateCallSdp(call, { localSdp: action.sdp, remoteSdp: req.body });
         } catch (err) {
@@ -2035,6 +2079,8 @@ function sipStatusForError(err: unknown) {
     if (err instanceof GatewayDrainingError) return 503;
     if (err instanceof HttpPostError && err.code === 'ECONNABORTED') return 504;
     if (err instanceof InvalidHttpActionError) return 502;
+    // The application bound media that is reserved by a handoff in progress.
+    if (err instanceof SipOperationConflictError) return 488;
     return 502;
 }
 

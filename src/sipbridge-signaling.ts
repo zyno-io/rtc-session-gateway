@@ -140,6 +140,8 @@ interface Context {
     first?: boolean;
     expiresAt?: number;
     onProvisional?: (status: number) => void;
+    /** Fallback that announces an end learned from a command result if its terminal event never arrives. */
+    endTimer?: NodeJS.Timeout;
     /** Source of the first request of an inbound context; sipbridge reports no delivery flow in snapshots or for outbound contexts. */
     peerSource?: SipSource;
 }
@@ -526,13 +528,32 @@ export class SipbridgeSignaling extends EventEmitter {
     }
     private retire(state: Context, reason: string) {
         if (state.ended) return;
+        this.markEnded(state);
+        state.dialog?.emit('ended', reason);
+    }
+    private markEnded(state: Context) {
         state.ended = true;
         state.retiredAt = Date.now();
         this.trimTombstones();
         if (state.credentials) this.credentials.delete(state.credentials.id);
         state.deferred?.reject(new NativeOperationError('Native call ended'));
-        state.dialog?.emit('ended', reason);
     }
+    /**
+     * An ended snapshot on a command result: the context is ended now (isEnded and every command check see it), but the
+     * reason is only known from the terminal event (a peer BYE racing the command is `bye`, not `terminated`), so the
+     * announcement waits for it. If none arrives the fallback emits `terminated`.
+     */
+    private retireAwaitingEvent(state: Context) {
+        if (state.ended) return;
+        this.markEnded(state);
+        state.endTimer = setTimeout(() => {
+            state.endTimer = undefined;
+            state.dialog?.emit('ended', 'terminated');
+        }, this.endEventGraceMs);
+        state.endTimer.unref();
+    }
+    /** How long a command-result end waits for its terminal event before being announced as `terminated`. */
+    endEventGraceMs = 5000;
     /** True when a snapshot belongs to an earlier authority or term than the current session. */
     private stale(client: SipbridgeControlClient, snapshot: ContextSnapshot): boolean {
         return (
@@ -681,13 +702,21 @@ export class SipbridgeSignaling extends EventEmitter {
             const { created } = this.receipt(key, fingerprint);
             // The terminal flag is set in the same synchronous turn as the snapshot update, before the receipt write is
             // awaited, so isEnded never lags the snapshot.
-            if (created && terminal && !state.ended) {
-                state.ended = true;
-                state.retiredAt = Date.now();
-                this.trimTombstones();
-                state.deferred?.reject(new NativeOperationError(event.error || 'SIP call ended'));
-                state.dialog?.emit('ended', event.kind === DialogEvent_Kind.ENDED ? 'bye' : 'terminated');
-                if (state.credentials) this.credentials.delete(state.credentials.id);
+            if (created && terminal) {
+                const reason = event.kind === DialogEvent_Kind.ENDED ? 'bye' : 'terminated';
+                if (state.endTimer) {
+                    // Ended earlier by a command result: this event supplies the reason, announced exactly once.
+                    clearTimeout(state.endTimer);
+                    state.endTimer = undefined;
+                    state.dialog?.emit('ended', reason);
+                } else if (!state.ended) {
+                    state.ended = true;
+                    state.retiredAt = Date.now();
+                    this.trimTombstones();
+                    state.deferred?.reject(new NativeOperationError(event.error || 'SIP call ended'));
+                    state.dialog?.emit('ended', reason);
+                    if (state.credentials) this.credentials.delete(state.credentials.id);
+                }
             }
             await client.reply(frame.correlationId, { $case: 'result', result: emptyResult() });
             if (!created) return;
@@ -930,9 +959,9 @@ export class SipbridgeSignaling extends EventEmitter {
                 const result = frame.payload.result;
                 if (result.snapshot) {
                     this.remember(state.peer, client, result.snapshot);
-                    // remember() only initializes `ended` for new contexts: an ended snapshot on a command result retires the
-                    // context now. retire() is idempotent and the terminal event handler skips what is already ended.
-                    if (result.snapshot.ended) this.retire(state, 'terminated');
+                    // remember() only initializes `ended` for new contexts: an ended snapshot on a command result ends the
+                    // context now; the terminal event (or a fallback timer) announces it.
+                    if (result.snapshot.ended) this.retireAwaitingEvent(state);
                 }
                 if (
                     ![OperationResult_Certainty.NOT_ACCEPTED, OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(
@@ -1034,10 +1063,17 @@ export class SipbridgeSignaling extends EventEmitter {
                 state = this.remember(peer, client, result.snapshot!, 'force');
                 state.onProvisional = status => attempt.onProvisional?.(status);
                 if (credentialId) state.credentials = { id: credentialId };
-                if (![OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(result.certainty))
+                if (![OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(result.certainty)) {
+                    // sipbridge attaches the current snapshot even to an UNKNOWN result: the context exists but its outcome
+                    // is unknown, so it is fenced (never commanded again) rather than left usable.
+                    this.fence(state);
                     throw new NativeOperationError('Outbound native outcome unknown', true);
+                }
                 if (result.error) throw new NativeOperationError(result.error);
-                if (cancelled) {
+                // The open result can already carry the answer (it projects current state): CANCEL no longer applies to an
+                // answered, ended or fenced context. An answered one is delivered below, so the caller's ACK-aware cleanup
+                // (ACK with a rejection, then BYE) owns it.
+                if (cancelled && !state.ended && !state.uncertain && !state.snapshot.answered) {
                     try {
                         await this.sendCancel(state);
                     } catch (error) {
@@ -1106,7 +1142,10 @@ export class SipbridgeSignaling extends EventEmitter {
         clearInterval(this.timer);
         this.catalog?.destroy();
         for (const peer of this.peers.values()) peer.client?.close();
-        for (const context of this.contexts.values()) context.deferred?.reject(new NativeOperationError('Gateway stopping', true));
+        for (const context of this.contexts.values()) {
+            context.deferred?.reject(new NativeOperationError('Gateway stopping', true));
+            if (context.endTimer) clearTimeout(context.endTimer);
+        }
         this.credentials.clear();
         this.peers.clear();
         this.contexts.clear();

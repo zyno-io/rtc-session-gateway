@@ -100,7 +100,8 @@ export class MediaSessionService implements GatewayMediaController {
     /** Endpoint creations (webrtc, rtp, bridge) in flight per session; a handoff guard is refused while any is pending. */
     private endpointCreations = new Map<string, number>();
     /** Sessions where a recording.start timed out locally: rtpbridge may be recording under an id we never learned. */
-    private recordingUncertain = new Set<string>();
+    private recordingUncertain = new Map<string, number>();
+    private uncertainSeq = 0;
     private recordingStarts = new Map<string, Set<Promise<unknown>>>();
     private handoffRecordings = new Map<string, FinalizedSipRecording[]>();
     private rtpLocalSdp = new Map<string, string>();
@@ -496,7 +497,8 @@ export class MediaSessionService implements GatewayMediaController {
                 filePath
             });
         } catch (err) {
-            if (err instanceof RtpbridgeTimeoutError && this.sessions.get(sessionId) === session) this.recordingUncertain.add(sessionId);
+            if (err instanceof RtpbridgeTimeoutError && this.sessions.get(sessionId) === session)
+                this.recordingUncertain.set(sessionId, ++this.uncertainSeq);
             throw err;
         }
         const metadata = this.recordingMetadata(session, filePath);
@@ -540,17 +542,24 @@ export class MediaSessionService implements GatewayMediaController {
         this.handoffSessions.set(sessionId, token);
         const results = this.handoffRecordings.get(sessionId) ?? [];
         this.handoffRecordings.set(sessionId, results);
+        const holds = () => {
+            if (this.handoffSessions.get(sessionId) !== token) throw new MediaActionConflictError('Handoff attempt is no longer current');
+        };
         try {
             await Promise.allSettled([...(this.recordingStarts.get(sessionId) ?? [])]);
+            holds();
             const session = this.requireSession(sessionId);
             // Snapshot: a recording the application starts after a failed handoff must not be stopped by it.
             for (const [recordingId, metadata] of [...this.recordings]) {
                 if (metadata.sessionId !== sessionId) continue;
+                holds();
                 try {
                     await this.stopRecording(recordingId);
                 } catch (err) {
                     // Not-found or a lost reply: trust rtpbridge's own view of what is still recording.
-                    if (await this.isRecordingActive(session, recordingId)) throw err;
+                    const active = await this.isRecordingActive(session, recordingId);
+                    holds();
+                    if (active) throw err;
                     this.recordings.delete(recordingId);
                     // The stop took effect but its reply was lost: keep the finalized entry (deduped by id when a
                     // recording.stopped event already recorded it). Size and duration are unknown here.
@@ -562,7 +571,9 @@ export class MediaSessionService implements GatewayMediaController {
                     );
                 }
             }
-            if (this.recordingUncertain.has(sessionId)) await this.stopUnknownRecordings(session);
+            holds();
+            if (this.recordingUncertain.has(sessionId)) await this.stopUnknownRecordings(session, holds);
+            holds();
             // Re-validated with the guard held (no endpoint can be added meanwhile): the rule still holds at the end.
             this.assertHandoffMedia(sessionId, ownerConnectionId, source?.sdp, source?.endpointId);
             return [...results];
@@ -600,18 +611,22 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     /** Stops recordings rtpbridge reports active that the gateway never learned of (a timed-out recording.start). Fails closed. */
-    private async stopUnknownRecordings(session: MediaSessionRecord) {
+    private async stopUnknownRecordings(session: MediaSessionRecord, holds: () => void) {
         let active: RtpbridgeRecordingInfo[];
+        // Only starts that timed out before this query are covered by it; a later one stays uncertain.
+        const covered = this.recordingUncertain.get(session.sessionId);
         try {
             active = (await session.client.listSessionRecordings()).filter(info => info.state === 'active' && !this.recordings.has(info.recordingId));
         } catch (err) {
             throw new MediaActionConflictError(`Cannot verify recording state for handoff: ${err instanceof Error ? err.message : String(err)}`);
         }
+        holds();
         for (const info of active) {
             const result = await session.client.stopRecording(info.recordingId);
             this.appendFinalizedRecording(session, info.recordingId, result, info.filePath);
+            holds();
         }
-        this.recordingUncertain.delete(session.sessionId);
+        if (this.recordingUncertain.get(session.sessionId) === covered) this.recordingUncertain.delete(session.sessionId);
     }
 
     /** Releases the handoff guard only if `token` still holds it; a stale attempt cannot release a newer one. */

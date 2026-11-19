@@ -741,10 +741,70 @@ test('a failed handoff attempt never stops a recording the application starts af
         await service.startRecording('media-session-1', {});
         return original(...args);
     };
-    await service.prepareHandoff('media-session-1', 'owner', token);
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', token), /no longer current/);
     assert.equal(stops, 1, 'only the recording present when the handoff began is stopped');
     client.stopRecording = original;
     assert.equal((await service.stopRecording('rec-2')).packets, 10, 'the newer recording is still active');
+});
+
+test('a stale handoff issues no further stops once its guard was released', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    client.startRecording = async () => ({ recordingId: 'rec-2' });
+    await service.startRecording('media-session-1', {});
+    const token = {};
+    const original = client.stopRecording.bind(client);
+    let stops = 0;
+    client.stopRecording = async (...args: Parameters<typeof original>) => {
+        stops++;
+        service.releaseHandoff('media-session-1', token);
+        return original(...args);
+    };
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', token), /no longer current/);
+    assert.equal(stops, 1);
+});
+
+test('an expired handoff stop does not clear uncertainty from a recording start that timed out after its snapshot', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    // An earlier timed-out start makes the session uncertain, so handoff A reconciles via session.info.
+    client.startRecording = async () => {
+        throw new RtpbridgeTimeoutError('start timed out');
+    };
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeTimeoutError);
+    const tokenA = {};
+    const snapshotTaken = Promise.withResolvers<void>();
+    const releaseA = Promise.withResolvers<void>();
+    const originalList = client.listSessionRecordings.bind(client);
+    client.listSessionRecordings = async () => {
+        const snap = await originalList();
+        snapshotTaken.resolve();
+        await releaseA.promise;
+        return snap;
+    };
+    const handoffA = service.prepareHandoff('media-session-1', 'owner', tokenA);
+    const rejectedA = assert.rejects(handoffA, /no longer current/);
+    await snapshotTaken.promise;
+    // A times out and releases; Y starts after A's snapshot and its reply times out.
+    service.releaseHandoff('media-session-1', tokenA);
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeTimeoutError);
+    client.listSessionRecordings = originalList;
+    releaseA.resolve();
+    await rejectedA;
+    // Handoff B still reconciles and stops Y.
+    client.sessionRecordings = [{ recordingId: 'rec-y', filePath: 'y.pcap', state: 'active' }];
+    const tokenB = {};
+    const results = await service.prepareHandoff('media-session-1', 'owner', tokenB);
+    assert.ok(
+        results.some(r => r.recordingId === 'rec-y'),
+        'B stopped the unknown recording'
+    );
+    service.releaseHandoff('media-session-1', tokenB);
 });
 
 test('recording-stop failure aborts media preparation without forgetting the active recording', async () => {

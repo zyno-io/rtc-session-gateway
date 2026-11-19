@@ -149,7 +149,7 @@ test('a definitely refused CANCEL is retried without fencing; an uncertain one i
     assert.equal(calls, 1);
 });
 
-test('a command result with an ended snapshot retires an existing context once; the later terminal event does not re-emit', async () => {
+test('a command result with an ended snapshot ends the context now; the terminal event supplies the reason once', async () => {
     const h = harness();
     try {
         const state = h.signaling.remember(h.peer, h.client, h.snapshot('D'));
@@ -160,11 +160,111 @@ test('a command result with an ended snapshot retires an existing context once; 
             payload: { $case: 'result', result: { certainty: 2, snapshot: { ...h.snapshot('D', true), revision: 2n, commandSequence: 2n } } }
         });
         await h.signaling.command(state, { $case: 'cancel', cancel: {} }).catch(() => undefined);
-        assert.equal(state.ended, true);
-        assert.deepEqual(emitted, ['ended:terminated']);
+        assert.equal(state.ended, true, 'ended synchronously');
+        assert.deepEqual(emitted, [], 'announcement waits for the terminal event');
         await h.receive(h.event('D', 'evD'));
-        assert.deepEqual(emitted, ['ended:terminated'], 'terminal handling is idempotent');
+        assert.deepEqual(emitted, ['ended:bye'], 'a peer BYE racing the command is a bye');
+        await h.receive(h.event('D', 'evD2'));
+        assert.deepEqual(emitted, ['ended:bye'], 'terminal handling is idempotent');
+        assert.equal(state.endTimer, undefined);
         assert.equal(h.live(), 0);
+    } finally {
+        h.signaling.stopped = true;
+    }
+});
+
+test('a command-result end with no terminal event is announced as terminated by the fallback timer', async () => {
+    const h = harness();
+    try {
+        h.signaling.endEventGraceMs = 10;
+        const state = h.signaling.remember(h.peer, h.client, h.snapshot('F'));
+        const emitted: string[] = [];
+        state.dialog = { emit: (name: string, reason: string) => emitted.push(`${name}:${reason}`) };
+        h.client.request = async () => ({
+            payload: { $case: 'result', result: { certainty: 2, snapshot: { ...h.snapshot('F', true), revision: 2n, commandSequence: 2n } } }
+        });
+        await h.signaling.command(state, { $case: 'cancel', cancel: {} }).catch(() => undefined);
+        assert.deepEqual(emitted, []);
+        await new Promise(resolve => setTimeout(resolve, 40));
+        assert.deepEqual(emitted, ['ended:terminated']);
+        // A terminal event arriving after the fallback does not announce it again.
+        await h.receive(h.event('F', 'evF'));
+        assert.deepEqual(emitted, ['ended:terminated']);
+    } finally {
+        h.signaling.stopped = true;
+    }
+});
+
+function openHarness(resultSnapshot: (h: ReturnType<typeof harness>) => any, certainty = 2) {
+    const h = harness();
+    h.signaling.peers = new Map([['sb', { ...h.peer, endpoint: { id: 'sb', acceptNew: true } }]]);
+    h.peer.endpoint = h.signaling.peers.get('sb').endpoint;
+    h.signaling.peers.get('sb').client = h.client;
+    Object.defineProperty(h.signaling, 'isConnected', { get: () => true });
+    h.signaling.config = { SIP_ALLOWED_DOMAINS: ['gw.example'] };
+    h.client.negotiated.sipbridge = { id: 'sipbridge' };
+    const commands: string[] = [];
+    h.client.request = async (frame: any) => {
+        const action = frame.command.action.$case;
+        commands.push(action);
+        if (action === 'openUac') {
+            h.signaling.peers.get('sb').client = h.client;
+            return { payload: { $case: 'result', result: { certainty, snapshot: resultSnapshot(h) } } };
+        }
+        return { payload: { $case: 'result', result: { certainty: 2, snapshot: h.snapshot('O') } } };
+    };
+    return { h, commands };
+}
+
+test('a CANCEL queued during OpenUac is skipped when the open result is already answered; the dialog is delivered', async () => {
+    const { h, commands } = openHarness(h => ({ ...h.snapshot('O'), answered: true }));
+    try {
+        const attempt = h.signaling.openDialog({ requestUri: 'sip:x@y.example', sdp: '' });
+        await attempt.cancel();
+        const dialog = await attempt.completed;
+        assert.ok(dialog, 'answered dialog resolves for the caller ACK-aware cleanup');
+        assert.deepEqual(commands, ['openUac'], 'no CANCEL is sent once the answer is observed');
+    } finally {
+        h.signaling.stopped = true;
+    }
+});
+
+test('a CANCEL queued during OpenUac is skipped when the open result is ended', async () => {
+    const { h, commands } = openHarness(h => ({ ...h.snapshot('O'), ended: true }));
+    try {
+        const attempt = h.signaling.openDialog({ requestUri: 'sip:x@y.example', sdp: '' });
+        await attempt.cancel();
+        await assert.rejects(attempt.completed, /ended/);
+        assert.deepEqual(commands, ['openUac']);
+    } finally {
+        h.signaling.stopped = true;
+    }
+});
+
+test('a CANCEL queued during OpenUac is still sent when the setup is pending', async () => {
+    const { h, commands } = openHarness(h => h.snapshot('O'));
+    try {
+        const attempt = h.signaling.openDialog({ requestUri: 'sip:x@y.example', sdp: '' });
+        await attempt.cancel();
+        const state = [...h.contexts.values()].find((context: any) => context.snapshot.context.id === 'O');
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(commands.slice(0, 2), ['openUac', 'cancel']);
+        state.deferred.reject(new Error('test cleanup'));
+        await attempt.completed.catch(() => undefined);
+    } finally {
+        h.signaling.stopped = true;
+    }
+});
+
+test('an UNKNOWN OpenUac result that carries a snapshot fences the context', async () => {
+    const { h, commands } = openHarness(h => h.snapshot('O'), 0);
+    try {
+        const attempt = h.signaling.openDialog({ requestUri: 'sip:x@y.example', sdp: '' });
+        await assert.rejects(attempt.completed, (error: any) => error instanceof NativeOperationError && error.uncertain);
+        const state = [...h.contexts.values()].find((context: any) => context.snapshot.context.id === 'O');
+        assert.equal(state.uncertain, true);
+        await assert.rejects(attempt.cancel(), (error: any) => error instanceof NativeOperationError && error.uncertain);
+        assert.deepEqual(commands, ['openUac'], 'a fenced context is never commanded');
     } finally {
         h.signaling.stopped = true;
     }

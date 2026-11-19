@@ -194,8 +194,14 @@ export class FirewallReconciler {
                     const restore = async () => {
                         // A newer snapshot may have been accepted while this pass ran (it is queued for the next one):
                         // never resurrect an entry it dropped, and use its TTL for the ones it keeps.
-                        const latest = this.current === snapshot ? undefined : this.requestedBy(this.current!);
+                        let seen = this.current;
+                        let latest = seen === snapshot ? undefined : this.requestedBy(seen!);
                         for (const [other, previous] of covered) {
+                            // A snapshot may also arrive while an earlier restore below is awaited.
+                            if (this.current !== seen) {
+                                seen = this.current;
+                                latest = seen === snapshot ? undefined : this.requestedBy(seen!);
+                            }
                             const otherExpiry = latest ? latest.get(other) : previous;
                             if (otherExpiry === undefined) continue;
                             const left = otherExpiry - this.now();
