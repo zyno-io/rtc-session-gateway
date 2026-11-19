@@ -49,6 +49,10 @@ interface MediaSection {
     fmtp: Map<string, string>;
     /** SDES `suite key-params` of every a=crypto line (the tag is not part of the key identity). */
     crypto: Set<string>;
+    /** Normalized `hash-func value` pairs (lowercase) of the section's and the session's a=fingerprint lines (DTLS-SRTP). */
+    fingerprints: Set<string>;
+    /** a=setup role (lowercase) of the section, else the session; empty when absent. */
+    setup: string;
 }
 
 const DIRECTIONS = new Set(['sendrecv', 'sendonly', 'recvonly', 'inactive']);
@@ -57,6 +61,8 @@ function parseMediaSections(sdp: string): MediaSection[] {
     const sections: MediaSection[] = [];
     let sessionConnection = '';
     let sessionDirection = '';
+    const sessionFingerprints = new Set<string>();
+    let sessionSetup = '';
     let current: MediaSection | undefined;
     for (const line of sdp.trim().split(/\r?\n/)) {
         if (line.startsWith('m=')) {
@@ -70,7 +76,9 @@ function parseMediaSections(sdp: string): MediaSection[] {
                 direction: '',
                 rtpmap: new Map(),
                 fmtp: new Map(),
-                crypto: new Set()
+                crypto: new Set(),
+                fingerprints: new Set(),
+                setup: ''
             };
             sections.push(current);
         } else if (line.startsWith('c=')) {
@@ -81,6 +89,14 @@ function parseMediaSections(sdp: string): MediaSection[] {
             if (DIRECTIONS.has(attribute)) {
                 if (current) current.direction = attribute;
                 else sessionDirection = attribute;
+            } else if (attribute.startsWith('fingerprint:')) {
+                const [hash, value] = attribute.slice('fingerprint:'.length).trim().split(/\s+/);
+                const pair = `${(hash ?? '').toLowerCase()} ${(value ?? '').toLowerCase()}`;
+                (current ? current.fingerprints : sessionFingerprints).add(pair);
+            } else if (attribute.startsWith('setup:')) {
+                const role = attribute.slice('setup:'.length).trim().toLowerCase();
+                if (current) current.setup = role;
+                else sessionSetup = role;
             } else if (current && attribute.startsWith('crypto:')) {
                 const [, suite, params] = attribute.split(/\s+/);
                 if (suite && params) current.crypto.add(`${suite} ${params}`);
@@ -107,6 +123,8 @@ function parseMediaSections(sdp: string): MediaSection[] {
     }
     for (const section of sections) {
         section.connection ||= sessionConnection;
+        for (const pair of sessionFingerprints) section.fingerprints.add(pair);
+        section.setup ||= sessionSetup;
         section.direction ||= sessionDirection || 'sendrecv';
     }
     return sections;
@@ -220,14 +238,6 @@ export function assertDirectMediaAnswer(offer: string, answer: string) {
     mediaAddressKey(answer);
 }
 
-/** RFC 3264 6.1: the answer direction that keeps the media flow the offer asked for. */
-const ANSWER_DIRECTION: Record<string, string> = {
-    sendrecv: 'sendrecv',
-    sendonly: 'recvonly',
-    recvonly: 'sendonly',
-    inactive: 'inactive'
-};
-
 /**
  * Validates a rollback answer to `restoreOffer`. The restored side keeps sending media to the carrier address it
  * already holds, so every stream both sides still use must keep that address and port, keep the direction the offer
@@ -241,11 +251,19 @@ const ANSWER_DIRECTION: Record<string, string> = {
  * must be the same set (payload number, encoding/clock and AMR framing parameters); other fmtp parameters are ignored.
  * Non-voice formats (telephone-event, CN) are ignored.
  */
+const DIRECTION_BITS: Record<string, number> = { inactive: 0, recvonly: 1, sendonly: 2, sendrecv: 3 };
+/** The direction an answerer takes in response to an offered direction (RFC 3264 6.1). */
+const ANSWER_DIRECTION: Record<string, string> = { sendrecv: 'sendrecv', sendonly: 'recvonly', recvonly: 'sendonly', inactive: 'inactive' };
+
 export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string) {
     const restored = parseMediaSections(restoreOffer);
     const answered = parseMediaSections(answer);
     const previous = parseMediaSections(previousRemoteSdp);
     if (answered.length !== restored.length) throw new Error('Rollback answer changed the media sections');
+    // A stream active in both the restore offer and the previous carrier description cannot be dropped by the answer.
+    for (const [index, media] of answered.entries()) {
+        if (restored[index].port > 0 && previous[index]?.port > 0 && !(media.port > 0)) throw new Error('Rollback answer rejected an active stream');
+    }
     let audioActive = false;
     for (const [index, media] of answered.entries()) {
         const offered = restored[index];
@@ -255,9 +273,30 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
         if (!before || before.port !== media.port || before.protocol !== media.protocol || before.connection !== media.connection) {
             throw new Error('Rollback changed the carrier media address');
         }
-        if (media.direction !== ANSWER_DIRECTION[offered.direction]) throw new Error('Rollback did not restore the media direction');
-        if (before.crypto.size && (!media.crypto.size || [...media.crypto].some(key => !before.crypto.has(key)))) {
+        // The untouched leg still holds the carrier's previously negotiated direction (e.g. inactive = held). The answer
+        // to the restore offer is valid only when it equals the effective direction: the previous direction limited by
+        // what the offer allows (RFC 3264 6.1), so a one-way call is restored one-way and a held call stays held. The
+        // answer is compared by its effective direction too, so a non-compliant answer that keeps the flow is accepted.
+        const allowed = DIRECTION_BITS[ANSWER_DIRECTION[offered.direction]];
+        const want = DIRECTION_BITS[before.direction] & allowed;
+        if ((DIRECTION_BITS[media.direction] & allowed) !== want) {
+            throw new Error('Rollback did not restore the media direction');
+        }
+        // The security mode follows what the restore offer asked for and what the carrier previously negotiated: an offer
+        // without crypto gets none; with crypto on both sides the answer must pick keys the carrier already had; crypto
+        // appearing where the carrier previously had none switches the mode.
+        if (!offered.crypto.size || !before.crypto.size) {
+            if (media.crypto.size) throw new Error('Rollback added SDES crypto to a plain stream');
+        } else if (!media.crypto.size || [...media.crypto].some(key => !before.crypto.has(key))) {
             throw new Error('Rollback changed the SDES crypto keys');
+        }
+        // DTLS-SRTP: the fingerprints (and the role, when both sides state one; an actpass offer allows either) must be unchanged.
+        if (
+            media.fingerprints.size !== before.fingerprints.size ||
+            [...media.fingerprints].some(pair => !before.fingerprints.has(pair)) ||
+            (media.setup && before.setup && before.setup !== 'actpass' && media.setup !== before.setup)
+        ) {
+            throw new Error('Rollback changed the DTLS fingerprint mode');
         }
         if (media.type === 'audio') audioActive = true;
     }
@@ -267,13 +306,24 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
         const offered = restored[index];
         const before = previous[index];
         if (media.type !== 'audio' || !(media.port > 0) || !(offered.port > 0) || !before) continue;
-        const known = new Set(voiceFormats(offered).map(format => format.encoding));
-        const within = (section: MediaSection) =>
-            new Set(
-                voiceFormats(section, offered)
-                    .filter(format => known.has(format.encoding))
+        const kindOf = (format: VoiceFormat) => `${format.encoding}|${format.framing}`;
+        const offeredFormats = voiceFormats(offered);
+        const offeredByPt = new Map(offeredFormats.map(format => [format.pt, kindOf(format)]));
+        // Keep a format only if O lists the same payload number with the same encoding/framing; a format renumbered
+        // relative to O counts only when none of O's payload numbers for that encoding/framing are in the section.
+        const within = (section: MediaSection) => {
+            const formats = voiceFormats(section, offered);
+            const pts = new Set(formats.map(format => format.pt));
+            return new Set(
+                formats
+                    .filter(format => {
+                        if (offeredByPt.get(format.pt) === kindOf(format)) return true;
+                        const same = offeredFormats.filter(o => kindOf(o) === kindOf(format));
+                        return same.length > 0 && !same.some(o => pts.has(o.pt));
+                    })
                     .map(rollbackIdentity)
             );
+        };
         const expected = within(before);
         const actual = within(media);
         if (actual.size !== expected.size || [...actual].some(identity => !expected.has(identity))) {
@@ -353,7 +403,7 @@ function sharedVoice(section: MediaSection, other: MediaSection | undefined): Se
     return new Set(
         voiceFormats(section, other)
             .filter(format => theirs.has(format.encoding))
-            .map(format => `${format.encoding}|${format.framing}`)
+            .map(rollbackIdentity)
     );
 }
 
@@ -461,6 +511,8 @@ export function parseReplaces(value: string): ReplacesIdentity {
     }
     const toTag = values.get('to-tag');
     const fromTag = values.get('from-tag');
+    // RFC 3891 7.1: to-tag and from-tag are tokens, never quoted strings.
+    if (!callId.trim() || !toTag || !fromTag || !TOKEN.test(toTag) || !TOKEN.test(fromTag)) throw new Error('Invalid Replaces tag');
     if (!callId.trim() || !toTag || !fromTag || /[\s\r\n]/.test(callId + toTag + fromTag)) throw new Error('Invalid Replaces header');
     // early-only is a flag: only the bare parameter name sets it, never a value or text inside a quoted string.
     return { callId: callId.trim(), toTag, fromTag, earlyOnly: values.has('early-only') && values.get('early-only') === undefined };

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { CallRegistry } from '../src/call-registry';
+import { InvalidHttpActionError } from '../src/http-contract';
 import { GatewayLifecycle } from '../src/gateway-lifecycle';
 import { controlErrorForCommand } from '../src/session-commands';
 import { SipGateway, SipOperationConflictError } from '../src/sip-gateway';
@@ -42,6 +43,8 @@ class Dialog extends EventEmitter {
     remoteSdp = sdp('10.0.0.1');
     isEnded = false;
     isFenced = false;
+    /** True for a dialog the gateway opened (UAC), as NativeDialog.isOutbound. */
+    isOutbound = false;
     peerSource: { ip: string; port: number; transport: string } | undefined;
     byes = 0;
     reinvites: string[] = [];
@@ -89,6 +92,12 @@ class Dialog extends EventEmitter {
             return this.remoteSdp;
         }
         return this.reinviteHook ? this.reinviteHook(offer) : this.remoteSdp;
+    }
+    /** False models a 2xx whose body is not SDP (sipbridge already ACKed it): no late offer, no ACK owed. */
+    offerlessIsSdp = true;
+    async reinviteOffer() {
+        const offer = await this.reinvite('');
+        return this.offerlessIsSdp ? { sdp: offer, offered: true } : { sdp: '', offered: false };
     }
     async ackAnswer(answer: string) {
         this.log?.push(`${this.name}:ack`);
@@ -170,11 +179,17 @@ class Response {
 }
 
 function invite(headers: Record<string, string> = {}, callId = 'caller', address = '10.0.0.1', method = 'INVITE', cseq = 1) {
-    const all: Record<string, string> = { 'call-id': callId, from: '<sip:18055550123@carrier.example>', ...headers };
+    const body = method === 'INVITE' && !('nobody' in headers) ? sdp(address) : '';
+    const all: Record<string, string> = {
+        'call-id': callId,
+        from: '<sip:18055550123@carrier.example>',
+        ...(body && { 'content-type': 'application/sdp' }),
+        ...headers
+    };
     return {
         method,
         uri: 'sip:inbound@gateway.example',
-        body: method === 'INVITE' && !('nobody' in headers) ? sdp(address) : '',
+        body,
         callId,
         cseq,
         source: { ip: address, port: 5060, transport: 'udp' },
@@ -184,7 +199,7 @@ function invite(headers: Record<string, string> = {}, callId = 'caller', address
 }
 
 function request(method: string, body = '', cseq = 42, headers: Record<string, string> = {}) {
-    const all: Record<string, string> = { cseq: `${cseq} ${method}`, ...headers };
+    const all: Record<string, string> = { cseq: `${cseq} ${method}`, ...(body ? { 'content-type': 'application/sdp' } : {}), ...headers };
     return {
         method,
         uri: 'sip:inbound@gateway.example',
@@ -204,6 +219,7 @@ async function fixture(
         centerAddress?: string;
         ackGiveUpMs?: number;
         retryDelays?: number[];
+        glareDelayMs?: (originated: boolean) => number;
     } = {}
 ) {
     const registry = new CallRegistry();
@@ -213,6 +229,7 @@ async function fixture(
     caller.log = log;
     const center = new Dialog('center', 'center-gateway-tag', 'center-tag');
     center.name = 'center';
+    center.isOutbound = true;
     center.log = log;
     center.remoteSdp = sdp('10.0.0.2', 45000);
     const events: unknown[] = [];
@@ -237,8 +254,11 @@ async function fixture(
         packets: 100
     };
     const hub = {
-        findRoute: () => ({ connectionId: 'app', route: { url: 'control://app' } }),
-        isConnected: () => true,
+        findRoute: (): { connectionId: string; route: { url: string } } | undefined => ({ connectionId: 'app', route: { url: 'control://app' } }),
+        isConnected: (_id?: string) => true,
+        holdsRoute(id: string, destination?: unknown) {
+            return hub.isConnected(id) && hub.findRoute()?.connectionId === id;
+        },
         async request(_id: string, method: string, params: unknown) {
             requests.push({ method, params });
             return { action: 'answer', sdp: sdp('10.0.0.3') };
@@ -306,6 +326,8 @@ async function fixture(
             handoffAckTimeoutMs: options.timeout ?? 1000,
             firewall: options.firewall,
             terminalRetryDelaysMs: options.retryDelays ?? [1, 2, 3],
+            restoreRetryDelaysMs: [1, 2, 3],
+            glareDelayMs: options.glareDelayMs ?? (() => 1),
             ackGiveUpMs: options.ackGiveUpMs ?? 40
         }
     );
@@ -336,6 +358,9 @@ async function fixture(
         dials: () => opened.length,
         failRecording: () => {
             prepareFailure = new Error('recorder unavailable');
+        },
+        healRecording: () => {
+            prepareFailure = undefined;
         },
         delayRecording: (hook: () => Promise<void>) => {
             prepareHook = hook;
@@ -737,6 +762,28 @@ test('Replaces from an outbound leg is authorized against the configured destina
     assert.equal(ok.answered !== undefined, true);
 });
 
+test('an offerless or non-SDP Replaces INVITE is rejected before the app is consulted and keeps the pair intact', async () => {
+    const f = await handedOff();
+    f.call.peerHost = '10.0.0.2';
+    const replaces = 'center;to-tag=center-gateway-tag;from-tag=center-tag';
+    const requestsBefore = f.requests.length;
+    const offerless = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    await f.gateway.handleInvite(invite({ replaces, nobody: '1' }, 'replacement', '10.0.0.2') as never, offerless as never);
+    assert.equal(offerless.status, 488);
+    const wrongType = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    const nonSdp = { ...invite({ replaces, 'content-type': 'text/plain' }, 'replacement', '10.0.0.2'), body: 'hello' };
+    await f.gateway.handleInvite(nonSdp as never, wrongType as never);
+    assert.equal(wrongType.status, 415);
+    assert.equal(offerless.answered, undefined);
+    assert.equal(wrongType.answered, undefined);
+    assert.equal(f.requests.length, requestsBefore, 'the application was not consulted');
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.registry.get('caller'), f.call);
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.center.byes, 0);
+});
+
 test('SDP relay preserves session identity and large origin versions without precision loss', () => {
     const result = relaySdp(sdp('10.0.0.2'), sdp('10.0.0.3', 40000, '9007199254740993'));
     assert.match(result, /o=- 100 9007199254740994 IN IP4 10\.0\.0\.3/);
@@ -769,6 +816,9 @@ test('authorized replacement of a handoff creates one returned call and retires 
     const returned = f.requests.findLast(r => r.method === 'sip.invite')!.params;
     assert.equal(returned.returning, true);
     assert.equal(returned.previousSessionId, 'caller');
+    assert.ok(returned.returnAttemptId);
+    const answeredEvent = f.events.findLast(e => (e as { event?: string }).event === 'sip.answered') as { data: { returnAttemptId?: string } };
+    assert.equal(answeredEvent.data.returnAttemptId, returned.returnAttemptId);
     f.caller.emit('ended', 'bye');
     f.center.emit('ended', 'bye');
     await turn();
@@ -793,6 +843,24 @@ test('authorized replacement of an application call renegotiates its existing ep
     f.caller.emit('ended', 'bye');
     await turn();
     assert.equal(f.registry.size, 1, 'the replaced leg no longer speaks for the call');
+});
+
+test('an offerless or non-SDP Replaces of an application-owned call is rejected before the owner is consulted', async () => {
+    const f = await fixture();
+    const replaces = 'caller;to-tag=gateway-tag;from-tag=caller-tag';
+    const reinvitesBefore = f.requests.filter(r => r.method === 'sip.reinvite').length;
+    const offerless = new Response(new Dialog('replacement', 'rep-local', 'rep-remote'));
+    await f.gateway.handleInvite(invite({ replaces, nobody: '1' }, 'replacement') as never, offerless as never);
+    assert.equal(offerless.status, 488);
+    const wrongType = new Response(new Dialog('replacement', 'rep-local', 'rep-remote'));
+    const nonSdp = { ...invite({ replaces, 'content-type': 'text/plain' }, 'replacement'), body: 'hello' };
+    await f.gateway.handleInvite(nonSdp as never, wrongType as never);
+    assert.equal(wrongType.status, 415);
+    assert.equal(offerless.answered, undefined);
+    assert.equal(wrongType.answered, undefined);
+    assert.equal(f.requests.filter(r => r.method === 'sip.reinvite').length, reinvitesBefore);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.registry.get('caller'), f.call);
 });
 
 test('encoded Refer-To Replaces uses standard dialog tags without a special destination URI', async () => {
@@ -1185,7 +1253,8 @@ test('dialog-gone carrier rejection on a return ends the whole call once', async
     assert.equal(f.registry.size, 0);
     assert.equal(f.caller.byes, 1);
     assert.equal(f.center.byes, 1);
-    assert.ok(f.log.indexOf('center:notify-503') >= 0 && f.log.indexOf('center:notify-503') < f.log.indexOf('center:bye'), 'NOTIFY precedes BYE');
+    // The destination referred, so the call's end is not held behind its final NOTIFY (R2): the NOTIFY is no longer ordered before the BYE.
+    assert.ok(f.log.includes('center:notify-100'));
 });
 
 test('a NOTIFY 481 on either leg is not dialog-gone and keeps the call', async () => {
@@ -1723,7 +1792,13 @@ test('an uncertain final NOTIFY on the retained carrier ends the call without si
     assert.equal(f.caller.byes, 0, 'the fenced carrier is never commanded');
     assert.equal(f.center.byes, 1);
     assert.equal(sentEvents(f, 'sip.answered').length, 0);
-    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    // The call's own end is followed by the attempt's correlated outcome (R1).
+    const terminated = sentEvents(f, 'sip.terminated') as { data: { reason: string; returnAttemptId?: string } }[];
+    assert.deepEqual(
+        terminated.map(event => event.data.reason),
+        ['return-carrier-uncertain', 'return-aborted']
+    );
+    assert.equal(terminated[1].data.returnAttemptId, f.requests.findLast(r => r.method === 'sip.invite')!.params.returnAttemptId);
 });
 
 test('a retained leg hanging up during the final NOTIFY never yields sip.answered after sip.bye', async () => {
@@ -1904,6 +1979,31 @@ test('a definitely refused REFER 202 after the destination hung up ends the call
     assert.equal(f.registry.size, 0);
     assert.equal(f.caller.byes, 1);
     assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a carrier that hangs up while the REFER 202 is pending is never offered the return: no invite after bye', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    const invitesBefore = f.requests.filter(r => r.method === 'sip.invite').length;
+    const gate = Promise.withResolvers<void>();
+    const response = new Response();
+    const respond = response.respond.bind(response);
+    response.respond = async (status: number, options?: never) => {
+        await gate.promise;
+        return respond(status, options);
+    };
+    f.center.emit('request', refer(), response);
+    await turn();
+    f.caller.emit('ended', 'bye');
+    await turn();
+    assert.equal(f.registry.size, 0);
+    gate.resolve();
+    await settle();
+    assert.equal(f.requests.filter(r => r.method === 'sip.invite').length, invitesBefore, 'the return was never offered');
+    assert.equal(sentEvents(f, 'sip.bye').length, 1);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 0);
+    assert.equal(f.caller.reinvites.length, 1, 'no return re-INVITE');
+    assert.equal(f.center.byes, 1, 'the end handler BYEd the destination once');
 });
 
 test('a definitely refused REFER 202 with the destination still attached restores handed-off', async () => {
@@ -2186,6 +2286,96 @@ test('duplicate or comma-joined Replaces header fields are malformed: 400 and in
     assert.equal(f.registry.get('caller'), f.call);
 });
 
+test('a Replaces with a quoted to-tag is malformed: 400 and invalid-replaces', async () => {
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL: 'enforce' } as never));
+    const observed: string[] = [];
+    const original = firewall.observe.bind(firewall);
+    firewall.observe = ((...args: Parameters<SipFirewall['observe']>) => {
+        observed.push(args[2]);
+        return original(...args);
+    }) as SipFirewall['observe'];
+    const f = await handedOff({ firewall });
+    f.call.peerAddresses = ['10.0.0.2'];
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag="center-gateway-tag";from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    assert.equal(response.status, 400);
+    assert.deepEqual(observed, ['invalid-replaces']);
+    assert.throws(() => parseReplaces('abc@h;to-tag=1;from-tag="2"'), /tag/);
+    assert.equal(f.registry.get('caller'), f.call);
+});
+
+test('rollback keeps the security mode and every previously active stream', () => {
+    const two = (videoPort: number, extra: string[] = [], videoExtra: string[] = []) =>
+        [
+            'v=0',
+            'o=- 100 1 IN IP4 10.0.0.1',
+            's=-',
+            'c=IN IP4 10.0.0.1',
+            't=0 0',
+            'm=audio 30000 RTP/AVP 0',
+            'a=rtpmap:0 PCMU/8000',
+            'a=sendrecv',
+            ...extra,
+            `m=video ${videoPort} RTP/AVP 96`,
+            'a=rtpmap:96 VP8/90000',
+            'a=sendrecv',
+            ...videoExtra,
+            ''
+        ].join('\r\n');
+    const restore = two(40002).replaceAll('10.0.0.1', '10.0.0.3');
+    // audio + video previously active: the answer cannot drop video.
+    assert.throws(() => assertRollbackAnswer(two(0), two(30002), restore), /active stream/);
+    assertRollbackAnswer(two(30002), two(30002), restore);
+    // video previously rejected: staying at 0 is fine.
+    assertRollbackAnswer(two(0), two(0), restore);
+    // plain RTP before: a rollback answer adding crypto or a fingerprint switches the security mode.
+    const crypto = 'a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:abcd';
+    assert.throws(() => assertRollbackAnswer(two(0, [crypto]), two(0), restore), /plain stream/);
+    assert.throws(() => assertRollbackAnswer(two(0, ['a=fingerprint:sha-256 AA:BB']), two(0), restore), /fingerprint/);
+    assert.throws(() => assertRollbackAnswer(two(0), two(0, ['a=fingerprint:sha-256 AA:BB']), restore), /fingerprint/);
+    // The restore offer carries crypto too: keys already negotiated stay valid.
+    const restoreCrypto = two(40002, ['a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:zzzz']).replaceAll('10.0.0.1', '10.0.0.3');
+    assertRollbackAnswer(two(0, [crypto]), two(0, [crypto]), restoreCrypto);
+    // R2: the DTLS fingerprint value (case-insensitive hash and value) and the role must be unchanged.
+    const fp = (value: string) => `a=fingerprint:sha-256 ${value}`;
+    assertRollbackAnswer(two(0, [fp('AA:BB')]), two(0, [fp('aa:bb').replace('sha-256', 'SHA-256')]), restore);
+    assert.throws(() => assertRollbackAnswer(two(0, [fp('CC:DD')]), two(0, [fp('AA:BB')]), restore), /fingerprint/);
+    assert.throws(() => assertRollbackAnswer(two(0, [fp('AA:BB'), fp('CC:DD')]), two(0, [fp('AA:BB')]), restore), /fingerprint/);
+    assert.throws(
+        () => assertRollbackAnswer(two(0, [fp('AA:BB'), 'a=setup:active']), two(0, [fp('AA:BB'), 'a=setup:passive']), restore),
+        /fingerprint/
+    );
+    assertRollbackAnswer(two(0, [fp('AA:BB'), 'a=setup:active']), two(0, [fp('AA:BB'), 'a=setup:actpass']), restore);
+});
+
+test('the SDES check follows the restore offer: opportunistic SRTP answered plain stays valid (R1)', () => {
+    const sdp = (extra: string[] = [], proto = 'RTP/AVP') => media('10.0.0.1', 30000, '0', [PCMU, ...extra]).replace('RTP/AVP', proto);
+    const key = (value: string) => `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${value}`;
+    const plainRestore = media('10.0.0.3', 40000, '0', [PCMU]);
+    const cryptoRestore = media('10.0.0.3', 40000, '0', [PCMU, key('RRRR')]);
+    // The carrier offered opportunistic SRTP, the application answered plain: a plain restore answer is kept.
+    assertRollbackAnswer(sdp(), sdp([key('AAAA')]), plainRestore);
+    // The offer carries no crypto: an answer with crypto is invalid whatever the carrier had.
+    assert.throws(() => assertRollbackAnswer(sdp([key('AAAA')]), sdp([key('AAAA')]), plainRestore), /plain stream/);
+    // Both sides have crypto: the answer needs crypto, with keys the carrier already had.
+    assertRollbackAnswer(sdp([key('AAAA')]), sdp([key('AAAA')]), cryptoRestore);
+    assert.throws(() => assertRollbackAnswer(sdp(), sdp([key('AAAA')]), cryptoRestore), /SDES/);
+    assert.throws(() => assertRollbackAnswer(sdp([key('BBBB')]), sdp([key('AAAA')]), cryptoRestore), /SDES/);
+    // The offer has crypto but the carrier had none: the answer must stay plain.
+    assertRollbackAnswer(sdp(), sdp(), cryptoRestore);
+    assert.throws(() => assertRollbackAnswer(sdp([key('BBBB')]), sdp(), cryptoRestore), /plain stream/);
+});
+
+test('preservesMediaParameters treats a remapped dynamic payload type as a change', () => {
+    const opus = (pt: string) => media('10.0.0.3', 40000, `${pt} 101`, [`a=rtpmap:${pt} opus/48000/2`, 'a=rtpmap:101 telephone-event/48000']);
+    const carrier = media('10.0.0.1', 30000, '111 101', ['a=rtpmap:111 opus/48000/2', 'a=rtpmap:101 telephone-event/48000']);
+    assert.equal(preservesMediaParameters(opus('111'), opus('111'), carrier), true);
+    assert.equal(preservesMediaParameters(opus('111'), opus('96'), carrier), false);
+});
+
 test('an app cancel that preceded the failed open result still gets the deadline CANCEL', async () => {
     const f = await fixture();
     const gate = Promise.withResolvers<void>();
@@ -2240,7 +2430,13 @@ test('a carrier fenced while the application is consulted ends the return once: 
     assert.equal(f.registry.size, 0);
     assert.equal(f.caller.byes, 0, 'a fenced carrier is never commanded');
     assert.equal(f.center.byes, 1);
-    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    // The call's own end precedes the attempt's outcome, which carries the attempt id of the return invite.
+    const terminated = sentEvents(f, 'sip.terminated') as { data: { reason: string; returnAttemptId?: string } }[];
+    assert.deepEqual(
+        terminated.map(event => event.data.reason),
+        ['return-carrier-uncertain', 'return-aborted']
+    );
+    assert.equal(terminated[1].data.returnAttemptId, f.requests.findLast(r => r.method === 'sip.invite')!.params.returnAttemptId);
     assert.equal(sentEvents(f, 'sip.answered').length, 0);
     const notify = f.log.findIndex(entry => entry === 'center:notify-503');
     assert.ok(notify >= 0 && notify < f.log.indexOf('center:bye'), 'final NOTIFY precedes the destination BYE');
@@ -2257,7 +2453,12 @@ test('a carrier fenced by the return re-INVITE itself is not committed', async (
     await settle(60);
     assert.equal(f.registry.size, 0);
     assert.equal(sentEvents(f, 'sip.answered').length, 0);
-    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    const terminated = sentEvents(f, 'sip.terminated') as { data: { reason: string; returnAttemptId?: string } }[];
+    assert.deepEqual(
+        terminated.map(event => event.data.reason),
+        ['return-carrier-uncertain', 'return-aborted']
+    );
+    assert.equal(terminated[1].data.returnAttemptId, f.requests.findLast(r => r.method === 'sip.invite')!.params.returnAttemptId);
     assert.equal(f.caller.byes, 0);
 });
 
@@ -2536,8 +2737,20 @@ test('a rollback answer that leaves the call on hold is rejected', () => {
     const restore = sdp('10.0.0.3');
     for (const direction of ['inactive', 'sendonly', 'recvonly'])
         assert.throws(() => assertRollbackAnswer(prev.replace('a=sendrecv', `a=${direction}`), prev, restore), /direction/, direction);
-    // RFC 3264 6.1: a sendonly offer is answered recvonly.
-    assertRollbackAnswer(prev.replace('a=sendrecv', 'a=recvonly'), prev, restore.replace('a=sendrecv', 'a=sendonly'));
+    const dir = (sdpText: string, direction: string) => sdpText.replace('a=sendrecv', `a=${direction}`);
+    // Effective direction = previous direction limited by the restore offer's answer direction (RFC 3264 6.1).
+    // Carrier offered sendrecv, local answered sendonly: restore offer sendonly, carrier answers recvonly -> kept.
+    assertRollbackAnswer(dir(prev, 'recvonly'), dir(prev, 'recvonly'), dir(restore, 'sendonly'));
+    // Carrier answered inactive previously, restore offer sendrecv: answer inactive kept, answer sendrecv rejected.
+    assertRollbackAnswer(dir(prev, 'inactive'), dir(prev, 'inactive'), restore);
+    assert.throws(() => assertRollbackAnswer(prev, dir(prev, 'inactive'), restore), /direction/);
+    // Carrier offered sendrecv, destination answered recvonly: restore offer recvonly, carrier answers sendonly -> kept.
+    assertRollbackAnswer(dir(prev, 'sendonly'), prev, dir(restore, 'recvonly'));
+    // Previously sendrecv, restore offer sendonly: the effective direction is recvonly. A non-compliant sendrecv answer
+    // keeps that flow (its effective direction under the offer is recvonly) and is kept; sendonly is rejected.
+    assertRollbackAnswer(prev, prev, dir(restore, 'sendonly'));
+    assert.throws(() => assertRollbackAnswer(dir(prev, 'sendonly'), prev, dir(restore, 'sendonly')), /direction/);
+    assertRollbackAnswer(dir(prev, 'recvonly'), prev, dir(restore, 'sendonly'));
     // A session-level direction applies to streams without their own.
     assert.throws(() => assertRollbackAnswer(prev.replace('a=sendrecv', '').replace('t=0 0', 't=0 0\r\na=inactive'), prev, restore), /direction/);
 });
@@ -2662,7 +2875,15 @@ test('a REFER return whose carrier ended on the re-INVITE result reports neither
     assert.ok(!notifies.some(body => body.includes('200 OK')));
     assert.equal(sentEvents(f, 'sip.answered').length, 0);
     assert.equal(f.registry.size, 0);
-    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    // The end path reports the call's end once; the owner that answered the return invite additionally hears that the
+    // return attempt was aborted, so it can release media prepared for it.
+    assert.deepEqual(
+        sentEvents(f, 'sip.terminated')
+            .map(e => (e as { data?: { reason?: string } }).data?.reason)
+            .filter(reason => reason === 'return-aborted'),
+        ['return-aborted']
+    );
+    assert.equal(sentEvents(f, 'sip.terminated').length, 2);
     assert.equal(f.center.byes, 1);
 });
 
@@ -2837,11 +3058,12 @@ test('rollback codec identity survives unmapped dynamic and static payload types
 
 test('a rollback answer must not change the SDES keys of the carrier stream', () => {
     const withKey = (key: string) => media('10.0.0.1', 30000, '0', [PCMU, `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${key}`]);
-    const restore = media('10.0.0.3', 40000, '0', [PCMU]);
+    const restore = media('10.0.0.3', 40000, '0', [PCMU, 'a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:RRRR']);
     assertRollbackAnswer(withKey('AAAA'), withKey('AAAA'), restore);
     assert.throws(() => assertRollbackAnswer(withKey('BBBB'), withKey('AAAA'), restore), /SDES/);
     assert.throws(() => assertRollbackAnswer(media('10.0.0.1', 30000, '0', [PCMU]), withKey('AAAA'), restore), /SDES/);
-    assertRollbackAnswer(withKey('BBBB'), media('10.0.0.1', 30000, '0', [PCMU]), restore);
+    // Plain RTP before: an answer that adds keys switches the security mode.
+    assert.throws(() => assertRollbackAnswer(withKey('BBBB'), media('10.0.0.1', 30000, '0', [PCMU]), restore), /plain stream/);
 });
 
 test('hostname connection addresses are detected, IP literals are not', () => {
@@ -3016,8 +3238,8 @@ test('a failed application-owned Replaces ends the call when the original peer r
 const withCrypto = (text: string, key: string) => text.replace('a=sendrecv', `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${key}\r\na=sendrecv`);
 
 /** A replacement INVITE that is cancelled, so the application restores media: first answer binds 10.0.0.8, the restore 10.0.0.9. */
-async function failedReplaceWithRestore(f: Fixture, carrierAnswer: () => Promise<string>) {
-    const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
+async function failedReplaceWithRestore(f: Fixture, carrierAnswer: () => Promise<string>, restoreAnswer = sdp('10.0.0.9', 49000)) {
+    const answers = [sdp('10.0.0.8', 48000), restoreAnswer];
     f.hub.request = (async () => ({ action: 'answer', sdp: answers.shift()! })) as never;
     f.caller.reinviteHook = carrierAnswer;
     const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
@@ -3044,7 +3266,8 @@ test('a replace restore whose carrier answer changed the SDES key ends the call,
 
     const same = await fixture();
     same.caller.remoteSdp = same.call.remoteSdp = withCrypto(sdp('10.0.0.1'), 'AAAA');
-    await failedReplaceWithRestore(same, async () => withCrypto(sdp('10.0.0.1'), 'AAAA'));
+    // The restore offer is the untouched leg's own description: it offers crypto too.
+    await failedReplaceWithRestore(same, async () => withCrypto(sdp('10.0.0.1'), 'AAAA'), withCrypto(sdp('10.0.0.9', 49000), 'RRRR'));
     assert.ok(same.registry.get('caller'));
     assert.equal(same.caller.byes, 0);
 });
@@ -3305,4 +3528,1114 @@ test('an offerless relay ACK deadline cleans up the peer even while the requeste
     gate.resolve();
     await settle(10);
     assert.deepEqual(stalled.statuses, [200], 'no second final response is sent to the requester');
+});
+
+test('an offerless relay peer ACK does not wait for a stalled requester 200 once the requester ACK arrived', async () => {
+    const f = await handedOff();
+    const gate = Promise.withResolvers<void>();
+    const stalled = new Response();
+    const respond = stalled.respond.bind(stalled);
+    stalled.respond = async (status, options) => {
+        if (status === 200) await gate.promise;
+        return respond(status, options);
+    };
+    f.caller.emit('request', request('INVITE', '', 43), stalled);
+    await turn();
+    f.caller.deliverAck(43, sdp('10.0.0.1'));
+    await settle(10);
+    assert.equal(f.center.acks.length, 2, 'the requester ACK proves the 200 was delivered');
+    assert.match(f.center.acks[1], /c=IN IP4 10\.0\.0\.1/);
+    assert.equal(f.registry.size, 1);
+    gate.resolve();
+    await settle(10);
+});
+
+const AMR_WB = 'a=rtpmap:116 AMR-WB/16000';
+const AMR_WB_OA = 'a=rtpmap:107 AMR-WB/16000';
+
+test('rollback codec rule: duplicate encodings in the previous carrier offer do not end an identical rollback answer', () => {
+    const O = media('10.0.0.3', 40000, '116 101', [AMR_WB, 'a=fmtp:116 octet-align=0', TELEPHONE_EVENT]);
+    const P = media('10.0.0.1', 30000, '116 107 101', [AMR_WB, 'a=fmtp:116 octet-align=0', AMR_WB_OA, 'a=fmtp:107 octet-align=1', TELEPHONE_EVENT]);
+    const A = media('10.0.0.1', 30000, '116 101', [AMR_WB, 'a=fmtp:116 octet-align=0', TELEPHONE_EVENT]);
+    assertRollbackAnswer(A, P, O);
+    // Two bandwidth-efficient entries that differ only in mode-set.
+    const P2 = media('10.0.0.1', 30000, '116 117 101', [
+        AMR_WB,
+        'a=fmtp:116 octet-align=0;mode-set=0,1',
+        'a=rtpmap:117 AMR-WB/16000',
+        'a=fmtp:117 octet-align=0;mode-set=2',
+        TELEPHONE_EVENT
+    ]);
+    assertRollbackAnswer(A, P2, O);
+    // A real change is still caught.
+    const wrong = media('10.0.0.1', 30000, '107 101', [AMR_WB_OA, 'a=fmtp:107 octet-align=1', TELEPHONE_EVENT]);
+    assert.throws(() => assertRollbackAnswer(wrong, P, O), /voice codecs/);
+});
+
+test('rollback direction: the previously negotiated hold direction is accepted, a new hold is not', () => {
+    const restore = sdp('10.0.0.3');
+    const held = sdp('10.0.0.1').replace('a=sendrecv', 'a=inactive');
+    const active = sdp('10.0.0.1');
+    assertRollbackAnswer(held, held, restore);
+    assertRollbackAnswer(active, active, restore);
+    assert.throws(() => assertRollbackAnswer(held, active, restore), /direction/);
+    // Held before: an answer that resumes media matches the restore offer but leaves the legs disagreeing.
+    assert.throws(() => assertRollbackAnswer(active, held, restore), /direction/);
+});
+
+test('a failed REFER return keeps a call that was already on hold', async () => {
+    const f = await handedOff();
+    const held = sdp('10.0.0.1').replace('a=sendrecv', 'a=inactive');
+    f.call.remoteSdp = held;
+    let first = true;
+    f.caller.reinviteHook = async () => {
+        if (first) {
+            first = false;
+            return sdp('10.0.0.1', 0);
+        }
+        return held;
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a restore re-INVITE refused locally (memory status 0, Redis 491) while sipbridge ACKs is retried and keeps the call (transfer and REFER return)', async () => {
+    // Memory backend: NOT_ACCEPTED with no SIP status; the Redis path reports a local 491.
+    const refusal = (n: number) =>
+        n % 2
+            ? new NativeOperationError('previous INVITE ACK not positively written', false, false, 0)
+            : new NativeOperationError('SIP 491: previous INVITE ACK output still pending', false, false, 491);
+    const f = await fixture();
+    f.center.ackFailure = new Error('ACK send rejected');
+    let calls = 0;
+    f.caller.reinviteHook = async () => {
+        if (++calls === 2) throw refusal(1);
+        return sdp('10.0.0.1');
+    };
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.equal(f.caller.reinvites.length, 3, 'the refused restore was retried');
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+
+    const g = await handedOff();
+    let returns = 0;
+    g.caller.reinviteHook = async () => {
+        returns++;
+        if (returns === 1) return sdp('10.0.0.1', 0);
+        if (returns === 2) throw refusal(2);
+        return sdp('10.0.0.1');
+    };
+    g.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(returns, 3);
+    assert.equal(g.registry.size, 1);
+    assert.equal(g.caller.byes, 0);
+});
+
+test('a restore refused by local capacity is retried; an uncertain or non-491 peer final is not', async () => {
+    const run = async (failure: NativeOperationError) => {
+        const f = await fixture();
+        f.center.ackFailure = new Error('ACK send rejected');
+        let calls = 0;
+        f.caller.reinviteHook = async () => {
+            if (++calls === 1) return sdp('10.0.0.1');
+            if (calls === 2) throw failure;
+            return sdp('10.0.0.1');
+        };
+        await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+        await settle();
+        return f;
+    };
+    const capacity = await run(new NativeOperationError('Native context command capacity', false, false));
+    assert.equal(capacity.caller.reinvites.length, 3);
+    assert.equal(capacity.registry.size, 1);
+    const unavailable = await run(new NativeOperationError('Native session unavailable', false, true));
+    assert.equal(unavailable.caller.reinvites.length, 3);
+    assert.equal(unavailable.registry.size, 1);
+    const uncertain = await run(new NativeOperationError('unknown', true));
+    assert.equal(uncertain.caller.reinvites.length, 2);
+    const peer486 = await run(new NativeOperationError('SIP 486', false, false, 486, false, true));
+    assert.equal(peer486.caller.reinvites.length, 2);
+    assert.equal(peer486.registry.size, 0);
+});
+
+test('a peer 491 to the restore waits the RFC 3261 14.1 glare delay: 2.1-4s when the gateway owns the Call-ID, else 0-2s', async () => {
+    const asked: boolean[] = [];
+    const f = await fixture({
+        glareDelayMs: originated => {
+            asked.push(originated);
+            return 1;
+        }
+    });
+    f.center.ackFailure = new Error('ACK send rejected');
+    let calls = 0;
+    f.caller.reinviteHook = async () => {
+        if (++calls === 2) throw new NativeOperationError('SIP 491', false, false, 491, false, true);
+        return sdp('10.0.0.1');
+    };
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.deepEqual(asked, [false], 'the carrier leg is inbound: the peer owns the Call-ID');
+    assert.equal(f.caller.reinvites.length, 3);
+    assert.equal(f.registry.size, 1);
+    const g = await handedOff({
+        glareDelayMs: originated => {
+            asked.push(originated);
+            return 1;
+        }
+    });
+    g.center.isOutbound = false;
+    g.caller.isOutbound = true;
+    let returns = 0;
+    g.caller.reinviteHook = async () => {
+        returns++;
+        if (returns === 1) return sdp('10.0.0.1', 0);
+        if (returns === 2) throw new NativeOperationError('SIP 491', false, false, 491, false, true);
+        return sdp('10.0.0.1');
+    };
+    g.center.emit('request', refer(), new Response());
+    await settle();
+    assert.deepEqual(asked, [false, true]);
+    assert.equal(g.registry.size, 1);
+    assert.equal(g.caller.byes, 0);
+});
+
+test('a restore re-INVITE that stays refused 491 ends the call after the bounded retries', async () => {
+    const f = await fixture();
+    f.center.ackFailure = new Error('ACK send rejected');
+    let calls = 0;
+    f.caller.reinviteHook = async () => {
+        if (++calls === 1) return sdp('10.0.0.1');
+        throw new NativeOperationError('previous INVITE ACK not positively written', false, false, 0);
+    };
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle(10);
+    assert.equal(f.caller.reinvites.length, 1 + 1 + 3, 'initial restore plus three retries');
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+});
+
+test('BYE headers that the native layer would reject fail the request without ending the call', async () => {
+    const f = await fixture();
+    await assert.rejects(f.gateway.bye('caller', 'test', { 'X-Long': 'a'.repeat(17_000) }), /Invalid SIP header/);
+    await assert.rejects(f.gateway.bye('caller', 'test', { 'Bad Name': 'x' }), /Invalid SIP header/);
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+    await f.gateway.bye('caller', 'test', { 'X-Ok': 'fine' });
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+});
+
+test('BYE header preflight counts serialized bytes (": " and CRLF) and the header count before the call is touched', async () => {
+    const f = await handedOff();
+    // 62 headers: raw name+value is 16368 bytes (under the cap), serialized it is 16616 (over).
+    const many = Object.fromEntries(Array.from({ length: 62 }, (_, i) => [`X-${i}`, 'a'.repeat(260)]));
+    await assert.rejects(f.gateway.bye('caller', 'test', many), InvalidHttpActionError);
+    const tiny = Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`X-${i}`, 'a']));
+    await assert.rejects(f.gateway.bye('caller', 'test', tiny), /too many/);
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes + f.center.byes, 0);
+});
+
+test('an HTTP return invite waits for the in-flight transferred POST to the same owner', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const order: string[] = [];
+    const gate = Promise.withResolvers<void>();
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = (body as { event?: string }).event!;
+        order.push(`start:${event}`);
+        if (event === 'transferred') await gate.promise;
+        order.push(`end:${event}`);
+        if (event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        return {};
+    };
+    void (f.gateway as any).sendFollowUpEvent(f.call, {
+        event: 'transferred',
+        callId: f.call.callId,
+        sipCallId: f.call.sipCallId,
+        transfer: {},
+        receivedAt: ''
+    });
+    await settle(20);
+    f.center.emit('request', refer(), new Response());
+    await settle(40);
+    assert.deepEqual(order, ['start:transferred'], 'the return invite is held behind the transferred POST');
+    gate.resolve();
+    await settle(60);
+    assert.ok(order.indexOf('end:transferred') < order.indexOf('start:invite'), order.join(','));
+});
+
+test('BYE headers sipbridge reserves, or that exceed its size cap, are rejected before the call is touched', async () => {
+    const f = await handedOff();
+    const reserved = [
+        'Call-ID',
+        'call-id',
+        'i',
+        'Max-Forwards',
+        'Via',
+        'v',
+        'From',
+        'f',
+        'To',
+        't',
+        'CSeq',
+        'Route',
+        'Record-Route',
+        'Contact',
+        'm',
+        'Content-Length',
+        'l'
+    ];
+    for (const name of reserved) {
+        await assert.rejects(f.gateway.bye('caller', 'test', { [name]: 'x' }), InvalidHttpActionError, name);
+    }
+    const big = Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`X-Big-${i}`, 'a'.repeat(8000)]));
+    await assert.rejects(f.gateway.bye('caller', 'test', big), /too large/);
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes + f.center.byes, 0);
+    await f.gateway.bye('caller', 'test', { 'X-Ok': 'fine' });
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 1);
+});
+
+test('a BYE with caller headers that is definitely refused is retried with the same headers', async () => {
+    const f = await fixture();
+    const seen: (Record<string, string> | undefined)[] = [];
+    let first = true;
+    f.caller.bye = async (headers?: Record<string, string>) => {
+        seen.push(headers);
+        if (first) {
+            first = false;
+            throw new NativeOperationError('headers refused', false);
+        }
+        f.caller.byes++;
+    };
+    await f.gateway.bye('caller', 'test', { 'X-Ok': 'fine' });
+    assert.deepEqual(seen, [{ 'X-Ok': 'fine' }, { 'X-Ok': 'fine' }]);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.registry.size, 0);
+});
+
+test('a failed handoff BYEs the destination while the carrier restore is still retrying (glare backoff does not hold the dead dialog)', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    let invites = 0;
+    f.caller.reinviteHook = async () => {
+        // The first re-INVITE switches the carrier but its answer rejects audio, failing the transfer; the restore waits.
+        if (++invites === 1) return sdp('10.0.0.1', 0);
+        await gate.promise;
+        return sdp('10.0.0.1');
+    };
+    const transfer = f.gateway.transfer(f.params, 'app').catch(() => undefined);
+    await settle(30);
+    assert.equal(f.caller.reinvites.length, 2, 'the restore is in flight');
+    assert.equal(f.center.byes, 1, 'the destination was BYEd before the restore completed');
+    gate.resolve();
+    await transfer;
+    await settle();
+    assert.equal(f.center.byes, 1);
+    assert.equal(f.registry.size, 1, 'the restored carrier stays with the application');
+});
+
+test('a Replaces return whose route moved during the peer authorization goes to the current owner only', async () => {
+    const f = await handedOff();
+    f.call.peerHost = '10.0.0.2';
+    const invitedConnections: string[] = [];
+    const originalRequest = f.hub.request.bind(f.hub);
+    f.hub.request = async (id: string, method: string, params: unknown) => {
+        if (method === 'sip.invite') invitedConnections.push(id);
+        return originalRequest(id, method, params);
+    };
+    // The first lookup selects owner A; the peer authorization then awaits and the route moves to owner B.
+    let lookups = 0;
+    f.hub.findRoute = () => ({ connectionId: ++lookups === 1 ? 'owner-a' : 'owner-b', route: { url: 'control://x' } });
+    f.hub.isConnected = () => true;
+    await f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        new Response(new Dialog('replacement', 'new-local', 'new-remote')) as never
+    );
+    assert.deepEqual(invitedConnections, ['owner-b']);
+    assert.equal(f.registry.get('replacement')?.controlConnectionId, 'owner-b');
+});
+
+test('a Replaces return whose answering owner lost the route before the commit is refused and the pair stays handed off', async () => {
+    const f = await handedOff();
+    f.call.peerHost = '10.0.0.2';
+    const originalRequest = f.hub.request.bind(f.hub);
+    f.hub.request = async (id: string, method: string, params: unknown) => {
+        const result = await originalRequest(id, method, params);
+        f.hub.findRoute = () => undefined; // the owner cleared its route while answering
+        return result;
+    };
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    assert.equal(response.status, 603);
+    assert.equal(f.registry.get('replacement'), undefined);
+    assert.equal(f.call.ownership, 'handed-off');
+});
+
+test('a REFER return whose route moved during the 202 goes to the current owner only', async () => {
+    const f = await handedOff();
+    const invitedConnections: string[] = [];
+    const originalRequest = f.hub.request.bind(f.hub);
+    f.hub.request = async (id: string, method: string, params: unknown) => {
+        if (method === 'sip.invite') invitedConnections.push(id);
+        return originalRequest(id, method, params);
+    };
+    let lookups = 0;
+    f.hub.findRoute = () => ({ connectionId: ++lookups === 1 ? 'owner-a' : 'owner-b', route: { url: 'control://x' } });
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.deepEqual(invitedConnections, ['owner-b']);
+});
+
+test('a REFER return fails when the route disappeared during the 202', async () => {
+    const f = await handedOff();
+    let lookups = 0;
+    const invited: string[] = [];
+    const originalRequest = f.hub.request.bind(f.hub);
+    f.hub.request = async (id: string, method: string, params: unknown) => {
+        if (method === 'sip.invite') invited.push(id);
+        return originalRequest(id, method, params);
+    };
+    f.hub.findRoute = () => (++lookups === 1 ? { connectionId: 'owner-a', route: { url: 'control://x' } } : undefined);
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.deepEqual(invited, []);
+    assert.equal(f.call.ownership, 'handed-off');
+});
+
+test('a REFER return selected on an HTTP route fails when a control owner takes the route during the pending answer', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    const posted: { event?: string }[] = [];
+    gateway.httpClient.postJson = async (_url, body) => {
+        posted.push(body as { event?: string });
+        if ((body as { event?: string }).event === 'invite') {
+            // A WebSocket owner registers a matching route while the webhook is answering: it now takes precedence.
+            f.hub.findRoute = () => ({ connectionId: 'ws-owner', route: { url: 'control://ws-owner' } });
+            return { action: 'answer', sdp: sdp('10.0.0.3') };
+        }
+        return {};
+    };
+    f.events.length = 0;
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.ok(posted.some(body => body.event === 'invite'));
+    assert.equal(f.caller.reinvites.length, 1, 'only the transfer re-INVITE: the displaced HTTP owner never reaches the carrier');
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+});
+
+test('a delayed retry of an earlier failed transfer returns its recorded result without dialing again', async () => {
+    const f = await fixture();
+    f.caller.reinviteFailure = new Error('488');
+    const a = { ...f.params, transferId: 'transfer-a' };
+    const b = { ...f.params, transferId: 'transfer-b' };
+    await assert.rejects(f.gateway.transfer(a, 'app'));
+    await settle();
+    await assert.rejects(f.gateway.transfer(b, 'app'));
+    await settle();
+    assert.equal(f.dials(), 2);
+    const retried = await f.gateway.transfer(a, 'app');
+    assert.equal(f.dials(), 2, 'no dial for a retried transferId');
+    assert.equal(retried.transferId, 'transfer-a');
+    assert.equal(retried.state, 'failed');
+    // A later transfer that completes supersedes the recorded failure.
+    f.caller.reinviteFailure = undefined;
+    const c = await f.gateway.transfer({ ...f.params, transferId: 'transfer-c' }, 'app');
+    assert.equal(c.state, 'completed');
+    const dials = f.dials();
+    await assert.rejects(f.gateway.transfer(a, 'app'), SipOperationConflictError);
+    assert.equal(f.dials(), dials);
+});
+
+test('a failed transfer ID whose result was evicted can never dial again, and the admitted-ID table is bounded', async () => {
+    const f = await fixture();
+    f.failRecording();
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /recorder unavailable/);
+    for (let i = 0; i < 17; i++) {
+        await assert.rejects(f.gateway.transfer({ ...f.params, transferId: `later-${i}` }, 'app'), /recorder unavailable/);
+    }
+    const dials = f.dials();
+    assert.equal(dials, 18);
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), (err: unknown) => err instanceof SipOperationConflictError);
+    assert.equal(f.dials(), dials, 'the evicted ID never dials');
+    // A recorded (recent) result is still returned as before.
+    assert.equal((await f.gateway.transfer({ ...f.params, transferId: 'later-5' }, 'app')).state, 'failed');
+    assert.equal(f.dials(), dials);
+    // 18 IDs are admitted; fill the table to 256, then any new ID is refused without dialing.
+    for (let i = 18; i < 256; i++) await assert.rejects(f.gateway.transfer({ ...f.params, transferId: `fill-${i}` }, 'app'), /recorder unavailable/);
+    const full = f.dials();
+    await assert.rejects(
+        f.gateway.transfer({ ...f.params, transferId: 'one-too-many' }, 'app'),
+        (err: unknown) => err instanceof SipOperationConflictError
+    );
+    assert.equal(f.dials(), full);
+});
+
+test('a retried failed transfer conflicts once any later transfer completed, even after a return and a newer failure', async () => {
+    const f = await fixture();
+    f.failRecording();
+    await assert.rejects(f.gateway.transfer({ ...f.params, transferId: 'A' }, 'app'), /recorder unavailable/);
+    f.healRecording();
+    const b = await f.gateway.transfer({ ...f.params, transferId: 'B' }, 'app');
+    assert.equal(b.state, 'completed');
+    // Sequence 1: B is the current completed transfer.
+    await assert.rejects(f.gateway.transfer({ ...f.params, transferId: 'A' }, 'app'), (err: unknown) => err instanceof SipOperationConflictError);
+    // Return to the application, then a newer transfer C fails: B moves into the finished list, no longer current.
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.call.ownership, 'application');
+    f.failRecording();
+    await assert.rejects(f.gateway.transfer({ ...f.params, transferId: 'C' }, 'app'), /recorder unavailable/);
+    assert.equal(f.call.transfer?.state, 'failed');
+    const dials = f.dials();
+    // Sequence 2: A's failure was superseded by the completed B, although the current transfer (C) failed.
+    await assert.rejects(f.gateway.transfer({ ...f.params, transferId: 'A' }, 'app'), (err: unknown) => err instanceof SipOperationConflictError);
+    // B itself (no later completion) still returns its recorded result; so does C.
+    assert.equal((await f.gateway.transfer({ ...f.params, transferId: 'B' }, 'app')).state, 'completed');
+    assert.equal((await f.gateway.transfer({ ...f.params, transferId: 'C' }, 'app')).state, 'failed');
+    assert.equal(f.dials(), dials);
+});
+
+test('a refused final NOTIFY is retried while the referring dialog is usable; a peer failure is not', async () => {
+    const f = await handedOff();
+    let finals = 0;
+    f.center.request = async (method: string, options: { body?: string } = {}) => {
+        f.center.requests.push({ method, ...options });
+        if (options.body?.includes('200 OK') && finals++ < 2) throw new NativeOperationError('native command slots full', false);
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(finals, 3, 'refused twice, accepted on the third attempt');
+    assert.equal(f.call.ownership, 'application');
+
+    const g = await handedOff();
+    let peerFinals = 0;
+    g.center.request = async (method: string, options: { body?: string } = {}) => {
+        g.center.requests.push({ method, ...options });
+        if (options.body?.includes('200 OK')) {
+            peerFinals++;
+            throw new NativeOperationError('SIP non-success response: 481', false, false, 481, false);
+        }
+    };
+    g.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(peerFinals, 1, 'a peer final response ends the subscription without a retry');
+});
+
+test('each return attempt carries its own returnAttemptId on its answered and terminated events', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    // Attempt A: the owner answers, the carrier refuses the re-INVITE.
+    f.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488, false, true);
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    const inviteA = f.requests.findLast(r => r.method === 'sip.invite')!.params;
+    assert.ok(inviteA.returnAttemptId);
+    f.caller.reinviteFailure = undefined;
+    // Attempt B succeeds.
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    const inviteB = f.requests.findLast(r => r.method === 'sip.invite')!.params;
+    assert.ok(inviteB.returnAttemptId);
+    assert.notEqual(inviteA.returnAttemptId, inviteB.returnAttemptId);
+    const terminated = sentEvents(f, 'sip.terminated') as { data: { reason: string; returnAttemptId?: string } }[];
+    assert.equal(terminated.length, 1);
+    assert.equal(terminated[0].data.returnAttemptId, inviteA.returnAttemptId);
+    const answered = sentEvents(f, 'sip.answered') as { data: { returnAttemptId?: string } }[];
+    assert.equal(answered.length, 1);
+    assert.equal(answered[0].data.returnAttemptId, inviteB.returnAttemptId);
+});
+
+const lastAttemptId = (f: Fixture) => f.requests.findLast(r => r.method === 'sip.invite')!.params.returnAttemptId;
+const terminatedReasons = (f: Fixture) => (sentEvents(f, 'sip.terminated') as { data: { reason: string } }[]).map(event => event.data.reason);
+
+test('R1: a carrier that hangs up while its final NOTIFY is pending is followed by a correlated return-aborted', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    const gate = Promise.withResolvers<void>();
+    f.caller.request = async (method: string, options: { body?: string } = {}) => {
+        f.caller.requests.push({ method, ...options });
+        if (options.body?.includes('200 OK')) await gate.promise;
+    };
+    f.caller.emit('request', refer(), new Response());
+    await settle(10);
+    f.caller.emit('ended', 'bye');
+    gate.resolve();
+    await settle(30);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+    const names = eventNames(f);
+    assert.ok(names.includes('sip.bye'));
+    const terminated = sentEvents(f, 'sip.terminated') as { data: { reason: string; returnAttemptId?: string } }[];
+    assert.deepEqual(
+        terminated.map(event => event.data.reason),
+        ['return-aborted']
+    );
+    assert.equal(terminated[0].data.returnAttemptId, lastAttemptId(f));
+    assert.ok(names.indexOf('sip.bye') < names.indexOf('sip.terminated'), 'the call end precedes the attempt outcome');
+});
+
+test('R2: sip.answered is not held behind the destination referrer final NOTIFY retries; the old-peer BYE follows them', async () => {
+    const f = await handedOff({ retryDelays: [1, 2, 3] });
+    f.events.length = 0;
+    const gate = Promise.withResolvers<void>();
+    f.center.request = async (method: string, options: { body?: string } = {}) => {
+        f.center.requests.push({ method, ...options });
+        if (options.body?.includes('200 OK')) {
+            await gate.promise;
+            throw new NativeOperationError('NOT_ACCEPTED', false, false, 0, false, false);
+        }
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(30);
+    assert.equal(sentEvents(f, 'sip.answered').length, 1, 'answered precedes the NOTIFY retries');
+    assert.equal(f.center.byes, 0, 'the old-peer BYE waits for the NOTIFY');
+    gate.resolve();
+    await settle(60);
+    assert.equal(f.center.byes, 1);
+    assert.ok(f.center.requests.filter(r => r.body?.includes('200 OK')).length > 1, 'the NOTIFY was retried');
+    assert.equal(terminatedReasons(f).length, 0);
+});
+
+test('R3: a carrier 481 on the return re-INVITE reports the call end before return-aborted', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.caller.reinviteFailure = gone();
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(f.registry.size, 0);
+    assert.deepEqual(terminatedReasons(f), ['dialog-gone', 'return-aborted']);
+});
+
+test('R3: an application BYE during the pending return re-INVITE reports the call end before return-aborted', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    const gate = Promise.withResolvers<void>();
+    f.caller.reinviteHook = async () => {
+        await gate.promise;
+        return sdp('10.0.0.1');
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(10);
+    const bye = f.gateway.bye('caller', 'app-bye');
+    gate.resolve();
+    await bye;
+    await settle(60);
+    assert.deepEqual(terminatedReasons(f), ['app-bye', 'return-aborted']);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+});
+
+test('R4: a different return owner hears return-aborted when the call ended and return-failed when it continues', async () => {
+    const ended = await handedOff();
+    ended.events.length = 0;
+    const toOther = [] as { connection: string; event: { event?: string; data?: { reason?: string } } }[];
+    const route = { connectionId: 'other', route: { url: 'control://other' } };
+    ended.hub.findRoute = () => route;
+    ended.hub.sendEvent = ((id: string, event: never) => {
+        toOther.push({ connection: id, event });
+        ended.events.push(event);
+        return true;
+    }) as never;
+    ended.caller.reinviteFailure = gone();
+    ended.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(ended.registry.size, 0);
+    assert.deepEqual(terminatedReasons(ended), ['dialog-gone', 'return-aborted']);
+    assert.equal(toOther.find(entry => entry.event.data?.reason === 'return-aborted')?.connection, 'other');
+
+    const continuing = await handedOff();
+    continuing.events.length = 0;
+    continuing.hub.findRoute = () => route;
+    continuing.caller.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488);
+    continuing.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(continuing.registry.size, 1);
+    assert.deepEqual(terminatedReasons(continuing), ['return-failed']);
+});
+
+test('Codex 2: a destination body that is not SDP is no late offer; the transfer fails before recordings or the carrier', async () => {
+    const f = await fixture();
+    (f.center as unknown as { answerIsSdp: boolean }).answerIsSdp = false;
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /no late offer/);
+    await settle(10);
+    assert.ok(!f.log.includes('stop-recording'));
+    assert.equal(f.caller.reinvites.length, 0);
+    assert.equal(f.center.acks.length, 0, 'sipbridge already ACKed it; no ACK answer is sent');
+    assert.equal(f.center.byes, 1);
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'application');
+});
+
+test('Codex 3: transferId is limited to 128 bytes of [A-Za-z0-9._:-] on every transport', async () => {
+    const f = await fixture();
+    for (const transferId of ['x'.repeat(129), 'bad id', 'é', '../x', 'a\nb']) {
+        await assert.rejects(f.gateway.transfer({ ...f.params, transferId }, 'app'), /transferId must be/);
+    }
+    assert.equal(f.dials(), 0);
+    const ok = await f.gateway.transfer({ ...f.params, transferId: 'x'.repeat(128) }, 'app');
+    assert.equal(ok.state, 'completed');
+});
+
+test('Codex 1: an offerless inbound call whose ACK arrives while the destination rings rolls back to the ACK SDP', async () => {
+    const f = await fixture();
+    f.call.remoteSdp = '';
+    f.caller.remoteSdp = '';
+    f.delayDial(async () => {
+        f.caller.remoteSdp = sdp('10.0.0.1');
+    });
+    f.center.ackFailure = new Error('ACK send rejected');
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.equal(f.caller.reinvites.length, 2, 'handoff re-INVITE, then the restore');
+    assert.equal(f.caller.byes, 0, 'a valid rollback against the captured baseline keeps the call');
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'application');
+});
+
+test('Codex 1: an offerless inbound call still without its negotiated SDP at switch time fails the transfer; the carrier is untouched', async () => {
+    const f = await fixture();
+    f.call.remoteSdp = '';
+    f.caller.remoteSdp = '';
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /not yet established/);
+    await settle();
+    assert.equal(f.caller.reinvites.length, 0);
+    assert.equal(f.caller.byes, 0);
+    assert.ok(!f.log.includes('stop-recording'), 'the empty baseline is checked before recordings are stopped');
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:bye'],
+        'destination ACK-then-BYE'
+    );
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'application');
+});
+
+test('Codex 2: a non-SDP 2xx body to our offerless re-INVITE is no late offer: no ACK, relay fails, call ends', async () => {
+    const f = await handedOff();
+    f.center.offerlessIsSdp = false;
+    const acksBefore = f.center.acks.length;
+    const response = new Response();
+    f.caller.emit('request', request('INVITE', '', 43), response);
+    await settle(100);
+    assert.equal(f.center.reinvites.at(-1), '');
+    assert.equal(f.center.acks.length, acksBefore, 'sipbridge already ACKed the body; no ACK answer is attempted');
+    assert.equal(response.status, 488);
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.center.byes, 1);
+});
+
+test('Codex 3: for an HTTP owner the call-level terminated POST settles before the attempt return-aborted POST', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const started: string[] = [];
+    const finished: string[] = [];
+    const gate = Promise.withResolvers<void>();
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = body as { event?: string; reason?: string };
+        if (event.event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        const label = `${event.event}:${event.reason}`;
+        started.push(label);
+        if (event.reason === 'dialog-gone') await gate.promise;
+        finished.push(label);
+        return {};
+    };
+    f.caller.reinviteFailure = gone();
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.deepEqual(started, ['terminated:dialog-gone'], 'return-aborted waits for the delayed call-level delivery');
+    gate.resolve();
+    await settle(30);
+    assert.deepEqual(finished, ['terminated:dialog-gone', 'terminated:return-aborted']);
+    assert.deepEqual(started, finished);
+});
+
+test('R1: a destination referrer whose carrier dialog is gone gets its final NOTIFY before any BYE; the owner events keep their order', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.caller.log = f.log;
+    f.caller.reinviteFailure = gone();
+    f.center.emit('request', refer(), new Response());
+    await settle(80);
+    assert.equal(f.registry.size, 0);
+    assert.deepEqual(f.log, ['center:notify-100', 'center:notify-503', 'caller:bye', 'center:bye'], 'the final NOTIFY is queued before the BYE');
+    assert.equal(f.center.byes, 1);
+    assert.deepEqual(terminatedReasons(f), ['dialog-gone', 'return-aborted']);
+});
+
+test('Codex 1 (r21): a carrier 481 takes the registry token before the final NOTIFY settles: a Replaces meanwhile is not claimed', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.caller.log = f.log;
+    f.caller.reinviteFailure = gone();
+    const gate = Promise.withResolvers<void>();
+    const original = f.center.request.bind(f.center);
+    f.center.request = async (method: string, options: { body?: string; headers?: Record<string, string> } = {}) => {
+        if (options.body?.includes('503')) await gate.promise;
+        return original(method, options);
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(30);
+    assert.equal(f.registry.size, 0, 'removed as soon as the 481 is classified, while the NOTIFY is pending');
+    assert.ok(!f.log.some(entry => entry.endsWith(':bye')), 'no BYE before the final NOTIFY');
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    await f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    assert.ok(response.statuses.length === 1 && [481, 603].includes(response.statuses[0]), `not claimed: ${response.statuses}`);
+    assert.equal(response.answered, undefined);
+    gate.resolve();
+    await settle(50);
+    assert.deepEqual(
+        f.log.filter(e => e !== 'center:notify-100' && !e.startsWith('response')),
+        ['center:notify-503', 'caller:bye', 'center:bye']
+    );
+    assert.deepEqual(terminatedReasons(f), ['dialog-gone', 'return-aborted']);
+});
+
+test('Codex 2 (r21): a cancelled Replaces on an offerless call refreshes the baseline from the original dialog and restores media', async () => {
+    const f = await fixture();
+    f.call.remoteSdp = '';
+    f.caller.remoteSdp = '';
+    const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
+    f.hub.request = (async () => {
+        // The original caller's ACK supplies its SDP while the application prepares the replacement media.
+        f.caller.remoteSdp = sdp('10.0.0.1');
+        return { action: 'answer', sdp: answers.shift()! };
+    }) as never;
+    f.caller.reinviteHook = async () => sdp('10.0.0.1');
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(20);
+    assert.equal(answers.length, 0, 'the application was asked to restore the original media');
+    assert.ok(f.registry.get('caller'), 'the call survives on restored media');
+    assert.equal(f.caller.byes, 0);
+    assert.match(f.registry.get('caller')!.localSdp ?? '', /c=IN IP4 10\.0\.0\.9/);
+});
+
+test('Codex 2 (r21): a cancelled Replaces whose baseline is still unknown ends the call instead of leaving replacement media', async () => {
+    const f = await fixture();
+    f.call.remoteSdp = '';
+    f.caller.remoteSdp = '';
+    f.hub.request = (async () => ({ action: 'answer', sdp: sdp('10.0.0.8', 48000) })) as never;
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(20);
+    assert.equal(f.registry.get('caller'), undefined);
+    assert.ok(f.caller.byes >= 1);
+});
+
+async function httpOwnerReferFixture() {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const started: string[] = [];
+    const finished: string[] = [];
+    const byeGate = Promise.withResolvers<void>();
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = body as { event?: string; reason?: string };
+        if (event.event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        const label = event.event === 'bye' ? 'bye' : `${event.event}:${event.reason}`;
+        started.push(label);
+        if (event.event === 'bye') await byeGate.promise;
+        finished.push(label);
+        return {};
+    };
+    return { f, started, finished, byeGate };
+}
+
+test('Codex 3 (r21): carrier BYE during the final NOTIFY: return-aborted waits for the delayed bye POST', async () => {
+    const { f, started, finished, byeGate } = await httpOwnerReferFixture();
+    const notifyGate = Promise.withResolvers<void>();
+    f.caller.request = async (method: string, options: { body?: string } = {}) => {
+        f.caller.requests.push({ method, ...options });
+        if (options.body?.includes('200 OK')) await notifyGate.promise;
+    };
+    f.caller.emit('request', refer(), new Response());
+    await settle(20);
+    f.caller.emit('ended', 'bye');
+    notifyGate.resolve();
+    await settle(30);
+    assert.deepEqual(started, ['bye'], 'return-aborted is held back by the pending bye delivery');
+    byeGate.resolve();
+    await settle(20);
+    assert.deepEqual(finished, ['bye', 'terminated:return-aborted']);
+});
+
+test('Codex 3 (r21): carrier BYE during the pending return re-INVITE: return-aborted waits for the delayed bye POST', async () => {
+    const { f, started, finished, byeGate } = await httpOwnerReferFixture();
+    const reinviteGate = Promise.withResolvers<void>();
+    f.caller.reinviteHook = async () => {
+        await reinviteGate.promise;
+        return sdp('10.0.0.1');
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(20);
+    f.caller.isEnded = true;
+    f.caller.emit('ended', 'bye');
+    reinviteGate.resolve();
+    await settle(30);
+    assert.deepEqual(started, ['bye']);
+    byeGate.resolve();
+    await settle(20);
+    assert.deepEqual(finished, ['bye', 'terminated:return-aborted']);
+});
+
+test('Codex 1 (r22): a BYE header with an unpaired surrogate is rejected before the registry token is taken', async () => {
+    const f = await fixture();
+    await assert.rejects(f.gateway.bye('caller', 'test', { 'X-Bad': '\ud800' }), InvalidHttpActionError);
+    await assert.rejects(f.gateway.bye('caller', 'test', { 'X-Bad': 'ok\udc00x' }), InvalidHttpActionError);
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+    await f.gateway.bye('caller', 'test', { 'X-Ok': 'fine 😀' });
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+});
+
+test('Codex 2 (r22): a non-SDP re-INVITE or UPDATE body is refused with 415 before any cross-leg command', async () => {
+    for (const method of ['INVITE', 'UPDATE']) {
+        const f = await handedOff();
+        const before = f.center.reinvites.length;
+        const response = new Response();
+        f.caller.emit('request', request(method, sdp('10.0.0.1'), 44, { 'content-type': 'text/plain' }), response);
+        await turn();
+        assert.equal(response.status, 415, method);
+        assert.equal(response.options?.headers?.Accept, 'application/sdp');
+        assert.equal(f.center.reinvites.length, before, 'no command on the other leg');
+        assert.equal(f.registry.size, 1);
+    }
+});
+
+test('Codex 3 (r22): a delayed HTTP answered POST is delivered before the call-level bye', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const started: string[] = [];
+    const finished: string[] = [];
+    const gate = Promise.withResolvers<void>();
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = (body as { event?: string }).event!;
+        if (event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        started.push(event);
+        if (event === 'answered') await gate.promise;
+        finished.push(event);
+        return {};
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(30);
+    assert.ok(started.includes('answered'));
+    f.caller.emit('ended', 'bye');
+    await settle(30);
+    assert.equal(f.registry.size, 0, 'SIP cleanup does not wait for the delivery');
+    assert.deepEqual(started, ['answered'], 'bye is held behind the answered POST');
+    gate.resolve();
+    await settle(30);
+    assert.deepEqual(finished, ['answered', 'bye']);
+});
+
+test('R1 (r23): an application-owned re-INVITE or UPDATE with a non-SDP body is refused with 415 before the owner is consulted', async () => {
+    for (const method of ['INVITE', 'UPDATE']) {
+        const f = await fixture();
+        const events: string[] = [];
+        const gateway = f.gateway as unknown as { sendFollowUpEvent: (...args: unknown[]) => Promise<unknown> };
+        gateway.sendFollowUpEvent = async (_call, event) => {
+            events.push((event as { event: string }).event);
+            return { action: 'accept', status: 200, sdp: sdp('10.0.0.9') };
+        };
+        const response = new Response();
+        f.caller.emit('request', request(method, sdp('10.0.0.1'), 44, { 'content-type': 'text/plain' }), response);
+        await turn();
+        assert.equal(response.status, 415, method);
+        assert.equal(response.options?.headers?.Accept, 'application/sdp');
+        assert.deepEqual(events, [], 'the application never saw the request');
+    }
+});
+
+test('R2 (r23): a delayed HTTP transferred POST is delivered before the call-level bye', async () => {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const started: string[] = [];
+    const finished: string[] = [];
+    const gate = Promise.withResolvers<void>();
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = (body as { event?: string }).event!;
+        started.push(event);
+        if (event === 'transferred') await gate.promise;
+        finished.push(event);
+        return {};
+    };
+    void (f.gateway as any).sendFollowUpEvent(f.call, {
+        event: 'transferred',
+        callId: f.call.callId,
+        sipCallId: f.call.sipCallId,
+        transfer: {},
+        receivedAt: ''
+    });
+    await settle(20);
+    f.caller.emit('ended', 'bye');
+    await settle(30);
+    assert.deepEqual(started, ['transferred'], 'bye is held behind the transferred POST');
+    gate.resolve();
+    await settle(30);
+    assert.deepEqual(finished, ['transferred', 'bye']);
+});
+
+test('Codex 1 (r23): a declined return keeps the pair lock until the referrer final NOTIFY settles; re-INVITEs get 491 meanwhile', async () => {
+    const f = await handedOff();
+    f.hub.request = async () => ({ action: 'reject', status: 486 }) as never;
+    const gate = Promise.withResolvers<void>();
+    const notifies: string[] = [];
+    f.center.request = async (method: string, options: { body?: string } = {}) => {
+        f.center.requests.push({ method, ...options });
+        notifies.push(options.body ?? '');
+        await gate.promise;
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(30);
+    const blocked = new Response();
+    f.caller.emit('request', request('INVITE', '', 51), blocked);
+    await turn();
+    assert.equal(blocked.status, 491, 'the pair lock is held while the progress/final NOTIFY is pending');
+    assert.equal(notifies.length, 1, 'only the progress NOTIFY is on the wire so far');
+    gate.resolve();
+    await settle(60);
+    assert.equal(notifies.length, 2, 'the final NOTIFY followed');
+    assert.equal(f.registry.size, 1);
+    const reinvites = f.center.reinvites.length;
+    const after = new Response();
+    f.caller.emit('request', request('INVITE', sdp('10.0.0.1'), 52), after);
+    await settle(30);
+    assert.notEqual(after.status, 491, 'the lock is released once the final NOTIFY settled');
+    assert.ok(f.center.reinvites.length >= reinvites);
+});
+
+async function staleHttpOwnerFixture() {
+    const f = await handedOff();
+    const gateway = f.gateway as unknown as { config: { ROUTES: unknown[] }; httpClient: { postJson: (...args: unknown[]) => Promise<unknown> } };
+    gateway.config.ROUTES = [{ match: 'userPrefix', value: 'inbound', url: 'http://app.example/hook' }];
+    const wsRoute = f.hub.findRoute;
+    f.hub.findRoute = () => undefined;
+    f.call.controlConnectionId = undefined;
+    f.call.receiverUrl = 'http://app.example/hook';
+    const gate = Promise.withResolvers<void>();
+    const httpPosts: string[] = [];
+    const wsRequests: string[] = [];
+    gateway.httpClient.postJson = async (_url, body) => {
+        const event = (body as { event?: string }).event!;
+        httpPosts.push(event);
+        if (event === 'transferred') await gate.promise;
+        if (event === 'invite') return { action: 'answer', sdp: sdp('10.0.0.3') };
+        return {};
+    };
+    f.hub.request = (async (_id: string, method: string) => {
+        wsRequests.push(method);
+        return { action: 'answer', sdp: sdp('10.0.0.3') };
+    }) as never;
+    void (f.gateway as any).sendFollowUpEvent(f.call, {
+        event: 'transferred',
+        callId: f.call.callId,
+        sipCallId: f.call.sipCallId,
+        transfer: {},
+        receivedAt: ''
+    });
+    await settle(20);
+    return { f, gate, httpPosts, wsRequests, registerWs: () => (f.hub.findRoute = wsRoute) };
+}
+
+for (const path of ['refer', 'replaces'] as const) {
+    const start = (f: Fixture) => {
+        if (path === 'refer') f.center.emit('request', refer(), new Response());
+        else
+            void f.gateway.handleInvite(
+                invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+                new Response(new Dialog('replacement', 'new-local', 'new-remote')) as never
+            );
+    };
+
+    test(`r26 (${path}): a WS owner registering during the transferred settle gets the return invite, the stale HTTP owner none`, async () => {
+        const { f, gate, httpPosts, wsRequests, registerWs } = await staleHttpOwnerFixture();
+        start(f);
+        await settle(30);
+        assert.deepEqual(httpPosts, ['transferred'], 'the invite is held behind the transferred POST');
+        registerWs();
+        gate.resolve();
+        await settle(60);
+        assert.deepEqual(httpPosts, ['transferred'], 'the stale HTTP owner receives no invite');
+        assert.deepEqual(wsRequests, ['sip.invite'], 'the WS owner receives the return invite');
+    });
+
+    test(`r26 (${path}): a carrier BYE during the transferred settle sends no return invite`, async () => {
+        const { f, gate, httpPosts, wsRequests } = await staleHttpOwnerFixture();
+        start(f);
+        await settle(30);
+        f.caller.isEnded = true;
+        f.caller.emit('ended', 'bye');
+        gate.resolve();
+        await settle(60);
+        assert.equal(httpPosts.includes('invite'), false);
+        assert.deepEqual(wsRequests, []);
+    });
+}
+
+test('r26: a BYE with caller headers refused through the whole schedule is retried once without them (headerless schedule)', async () => {
+    const f = await fixture();
+    const seen: Array<Record<string, string> | undefined> = [];
+    f.caller.bye = async (headers?: Record<string, string>) => {
+        seen.push(headers);
+        if (headers) throw new NativeOperationError('invalid SIP send fingerprint input', false, true);
+    };
+    await f.gateway.bye('caller', 'app-hangup', { 'X-Reason': 'a' });
+    assert.equal(seen.filter(h => h).length, 4, 'headers: one attempt plus three retries');
+    assert.equal(seen.filter(h => !h).length, 1, 'then one headerless BYE, which succeeds');
+    assert.equal(f.registry.size, 0);
+});
+
+test('r26: an uncertain BYE refusal never drops the caller headers', async () => {
+    const f = await fixture();
+    const seen: Array<Record<string, string> | undefined> = [];
+    f.caller.bye = async (headers?: Record<string, string>) => {
+        seen.push(headers);
+        throw new NativeOperationError('unknown', true);
+    };
+    await assert.rejects(f.gateway.bye('caller', 'app-hangup', { 'X-Reason': 'a' }));
+    assert.equal(seen.filter(h => !h).length, 0);
 });

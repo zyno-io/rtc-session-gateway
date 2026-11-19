@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { FileRtcEndpointCatalog, type SignalingBackend } from './endpoint-catalog';
 import type { GatewayConfig } from './config';
 import { SipbridgeControlClient, SipbridgeControlNotSentError } from './sipbridge/client';
+import { isWellFormedSipbridgeString } from './sipbridge/json-validation';
 import {
     SIPBRIDGE_CAPABILITY,
     SIPBRIDGE_STATE_CAPABILITY,
@@ -19,6 +20,7 @@ import {
     ContextRetirementProof_Reason,
     DialogEvent,
     DialogEvent_Kind,
+    OperationResult,
     OperationResult_Certainty,
     OwnerIngest_Admission,
     type ContextRef,
@@ -136,6 +138,8 @@ interface Context {
     ended: boolean;
     retiredAt?: number;
     pendingCommands?: number;
+    /** The single in-flight CANCEL sequence for an outbound attempt; concurrent cancel requests await it. */
+    cancelInFlight?: Promise<void>;
     /** First-request context that has not become a dialog; bounded if its outcome is uncertain. */
     first?: boolean;
     expiresAt?: number;
@@ -144,6 +148,29 @@ interface Context {
     endTimer?: NodeJS.Timeout;
     /** Source of the first request of an inbound context; sipbridge reports no delivery flow in snapshots or for outbound contexts. */
     peerSource?: SipSource;
+    /** True when the gateway originated the context (UAC): it owns the Call-ID for RFC 3261 14.1 glare. */
+    outbound?: boolean;
+    /**
+     * Whether the final response that answered an outbound context carried an SDP body (exactly one Content-Type of
+     * application/sdp). Undefined until the answered event arrives. sipbridge ACKs any other body itself.
+     */
+    answerIsSdp?: boolean;
+}
+/** sipbridge's own rule for an SDP body: one Content-Type header whose media type is application/sdp (parameters allowed). */
+export function messageCarriesSdp(message: { body: Uint8Array; headers: { name: string; value: string }[] }) {
+    const types = message.headers.filter(header => ['content-type', 'c'].includes(header.name.toLowerCase()));
+    return message.body.length > 0 && types.length === 1 && goMediaType(types[0].value) === 'application/sdp';
+}
+/** Go's unicode.IsSpace set (what strings.TrimSpace trims); JS trim() differs (U+0085, U+FEFF). */
+const GO_SPACE = '\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000';
+const GO_TRIM = new RegExp(`^[${GO_SPACE}]+|[${GO_SPACE}]+$`, 'gu');
+/** Mirrors sipbridge's strings.EqualFold(strings.TrimSpace(strings.Split(v, ";")[0]), ...): Unicode simple folding included (U+017F folds to s). */
+function goMediaType(value: string) {
+    return value
+        .split(';')[0]
+        .replace(GO_TRIM, '')
+        .replace(/\u017f/g, 's')
+        .toLowerCase();
 }
 function sourceOf(request: RequestPresented): SipSource | undefined {
     const flow = request.flow;
@@ -180,6 +207,10 @@ export class NativeDialog extends EventEmitter {
     get isFenced() {
         return this.state.uncertain;
     }
+    /** True when this dialog was opened by the gateway (UAC side of the Call-ID). */
+    get isOutbound() {
+        return this.state.outbound === true;
+    }
     get sipCallId() {
         return this.state.snapshot.callId;
     }
@@ -204,6 +235,14 @@ export class NativeDialog extends EventEmitter {
         return Buffer.from(this.state.snapshot.remoteSdp).toString('utf8');
     }
     /**
+     * Whether the answering final response carried an SDP body. A mislabeled body (for example text/plain) is not an
+     * offer: sipbridge ACKs it automatically and accepts no ACK answer. Unknown (event not seen yet) reads as false: an
+     * unknown never counts as an SDP offer. Outbound setup waits for the answered event, so it is known once delivered.
+     */
+    get answerIsSdp() {
+        return this.state.answerIsSdp ?? false;
+    }
+    /**
      * Sends a re-INVITE. With an empty body it is offerless: the result is the peer's 2xx offer and the caller
      * must complete the exchange with ackAnswer().
      */
@@ -213,6 +252,23 @@ export class NativeDialog extends EventEmitter {
             dialogRequest: { method: 'INVITE', body: Buffer.from(sdp), headers: nativeHeaders(headers) }
         });
         return Buffer.from(snapshot.remoteSdp).toString('utf8');
+    }
+    /**
+     * Offerless re-INVITE with the exact final response classified: `sdp` is the peer's late offer only when `offered` is
+     * true (the 2xx carried an application/sdp body, so an ACK answer is owed). Any other body was already ACKed empty by
+     * sipbridge and is no offer (the snapshot's remote SDP would then be the stale previous one).
+     */
+    async reinviteOffer(headers?: Record<string, string>): Promise<{ sdp: string; offered: boolean }> {
+        let response: OperationResult['response'];
+        const snapshot = await this.owner.command(
+            this.state,
+            { $case: 'dialogRequest', dialogRequest: { method: 'INVITE', body: Buffer.alloc(0), headers: nativeHeaders(headers) } },
+            result => {
+                response = result.response;
+            }
+        );
+        const offered = !!response && messageCarriesSdp(response);
+        return { sdp: offered ? Buffer.from(snapshot.remoteSdp).toString('utf8') : '', offered };
     }
     /** Sends the ACK answer for a late-offer 2xx (an initial late-offer UAC or an offerless re-INVITE we sent). */
     async ackAnswer(sdp: string, headers?: Record<string, string>) {
@@ -484,7 +540,8 @@ export class SipbridgeSignaling extends EventEmitter {
                 return;
             }
             if (result.certainty === OperationResult_Certainty.UNKNOWN) this.fence(state);
-            if (!state.uncertain && result.snapshot.answered && state.deferred) {
+            // An answer whose body classification is not yet known waits for the answered event (same lock as Answered).
+            if (!state.uncertain && result.snapshot.answered && state.answerIsSdp !== undefined && state.deferred) {
                 state.dialog ??= new NativeDialog(state, this);
                 state.deferred.resolve(state.dialog);
             }
@@ -511,10 +568,15 @@ export class SipbridgeSignaling extends EventEmitter {
     }
     /** Contexts that count against admission; ended tombstones never do. */
     private liveContexts() {
-        let live = 0;
+        let live = this.reservedContexts.size;
         for (const context of this.contexts.values()) if (!context.ended) live++;
         return live;
     }
+    /**
+     * Slots held by outbound opens whose OpenUac result has not arrived, keyed by bootstrap id (sipbridge's snapshot
+     * context.id). Released when tracked or failed; an early event for the context consumes its own reservation.
+     */
+    private reservedContexts = new Set<string>();
     /** Keeps at most MAX_TOMBSTONES ended contexts, evicting the oldest retired first. */
     private trimTombstones() {
         if (this.contexts.size <= MAX_TOMBSTONES) return;
@@ -602,6 +664,8 @@ export class SipbridgeSignaling extends EventEmitter {
         let state = this.contexts.get(key);
         if (state && state.peer !== peer) throw new Error('Native context peer mismatch');
         if (!state) {
+            // The open's own reservation is converted into the tracked context, never counted against it.
+            if (this.reservedContexts.delete(ref.id as string)) capacity = 'force';
             const ended = terminal || !!snapshot.ended;
             if (!ended && this.liveContexts() >= MAX_CONTEXTS && capacity === 'enforce') throw new Error('Native context capacity');
             state = {
@@ -700,6 +764,7 @@ export class SipbridgeSignaling extends EventEmitter {
             // open); it is kept as an ended tombstone, never refused for capacity.
             const state = this.remember(peer, client, event.snapshot, terminal ? 'force' : 'enforce', terminal);
             const { created } = this.receipt(key, fingerprint);
+            if (created && event.kind === DialogEvent_Kind.ANSWERED) state.answerIsSdp = event.message ? messageCarriesSdp(event.message) : false;
             // The terminal flag is set in the same synchronous turn as the snapshot update, before the receipt write is
             // awaited, so isEnded never lags the snapshot.
             if (created && terminal) {
@@ -934,9 +999,12 @@ export class SipbridgeSignaling extends EventEmitter {
         state.tail = result.catch(() => undefined);
         return result;
     }
-    async command(state: Context, action: NonNullable<Command['action']>): Promise<ContextSnapshot> {
+    async command(state: Context, action: NonNullable<Command['action']>, onResult?: (result: OperationResult) => void): Promise<ContextSnapshot> {
         const work = async () => {
             if (state.uncertain || state.ended) throw new NativeOperationError('Native call is ended or uncertain', state.uncertain);
+            // Evaluated when the queued command runs, not when it was requested: once the answer is observed CANCEL no
+            // longer applies (sipbridge would mark the answered dialog retiring and then refuse its BYE while an ACK is owed).
+            if (action.$case === 'cancel' && state.snapshot.answered) return state.snapshot;
             const client = state.peer.client;
             if (!client) throw new NativeOperationError('Native session unavailable', false, true);
             const sequence = state.sequence + 1n;
@@ -957,6 +1025,7 @@ export class SipbridgeSignaling extends EventEmitter {
                 });
                 if (frame.payload?.$case !== 'result') throw new NativeOperationError('Unexpected native result', true);
                 const result = frame.payload.result;
+                onResult?.(result);
                 if (result.snapshot) {
                     this.remember(state.peer, client, result.snapshot);
                     // remember() only initializes `ended` for new contexts: an ended snapshot on a command result ends the
@@ -1016,6 +1085,11 @@ export class SipbridgeSignaling extends EventEmitter {
             const credentialId = params.auth ? randomUUID() : undefined;
             if (credentialId) this.credentials.set(credentialId, { peer, contextId: bootstrapId, ...params.auth! });
             let dispatched = false;
+            // Reserve the slot synchronously after the capacity check so concurrent opens cannot all pass it.
+            this.reservedContexts.add(bootstrapId);
+            const release = () => {
+                this.reservedContexts.delete(bootstrapId);
+            };
             try {
                 const transport = /^sips:/i.test(params.requestUri)
                     ? 'tls'
@@ -1061,7 +1135,9 @@ export class SipbridgeSignaling extends EventEmitter {
                 if (result.certainty === OperationResult_Certainty.NOT_ACCEPTED)
                     throw new NativeOperationError(result.error || 'Outbound native command refused');
                 if (!result.snapshot) throw new NativeOperationError('Outbound native context unavailable', true);
+                release();
                 state = this.remember(peer, client, result.snapshot!, 'force');
+                state.outbound = true;
                 state.onProvisional = status => attempt.onProvisional?.(status);
                 if (credentialId) state.credentials = { id: credentialId };
                 if (![OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(result.certainty)) {
@@ -1087,7 +1163,9 @@ export class SipbridgeSignaling extends EventEmitter {
                     }
                 }
                 if (state.ended) throw new NativeOperationError('Outbound call ended');
-                if (state.snapshot.answered) {
+                // An answer first seen from a snapshot waits for the answered event, which classifies its body; the setup
+                // deadline below bounds that wait.
+                if (state.snapshot.answered && state.answerIsSdp !== undefined) {
                     state.dialog ??= new NativeDialog(state, this);
                     return state.dialog;
                 }
@@ -1105,6 +1183,8 @@ export class SipbridgeSignaling extends EventEmitter {
                 if (!(error instanceof NativeOperationError))
                     throw new NativeOperationError(dispatched ? 'Native operation outcome unknown' : 'Invalid outbound SIP parameters', dispatched);
                 throw error;
+            } finally {
+                release();
             }
         })();
         void completed.catch(() => undefined);
@@ -1125,8 +1205,19 @@ export class SipbridgeSignaling extends EventEmitter {
      * Sends CANCEL for a setup that is still pending, retrying definite refusals (never uncertain outcomes) on a bounded
      * schedule while the INVITE is unanswered. The final definite refusal is rethrown unfenced.
      */
-    private async sendCancel(state: Context) {
+    private sendCancel(state: Context): Promise<void> {
+        // One CANCEL sequence per attempt: concurrent requests (owner cancel, pending sweep, teardown) share it.
+        if (state.cancelInFlight) return state.cancelInFlight;
+        const run = this.runCancel(state).finally(() => {
+            if (state.cancelInFlight === run) state.cancelInFlight = undefined;
+        });
+        state.cancelInFlight = run;
+        return run;
+    }
+    private async runCancel(state: Context) {
         for (let attempt = 0; ; attempt++) {
+            // An answered setup is no longer cancellable (the caller's ACK-aware cleanup owns the dialog).
+            if (state.snapshot.answered) return;
             try {
                 await this.command(state, { $case: 'cancel', cancel: {} });
                 return;
@@ -1153,9 +1244,49 @@ export class SipbridgeSignaling extends EventEmitter {
         this.events.clear();
     }
 }
-function nativeHeaders(headers?: Record<string, string>) {
+export function nativeHeaders(headers?: Record<string, string>) {
     return Object.entries(headers ?? {}).map(([name, value]) => {
         if (!/^[A-Za-z0-9-]{1,127}$/.test(name) || /[\r\n\0]/.test(value) || value.length > 8192) throw new Error('Invalid SIP header');
         return { name, value };
     });
+}
+
+/** Names sipbridge refuses on dialog requests: they carry native identity, routing or framing (RFC 3261 compact forms included). */
+const NATIVE_RESERVED_HEADERS = new Set([
+    'via',
+    'v',
+    'from',
+    'f',
+    'to',
+    't',
+    'call-id',
+    'i',
+    'cseq',
+    'route',
+    'record-route',
+    'max-forwards',
+    'contact',
+    'm',
+    'content-length',
+    'l'
+]);
+// Serialized budget (name, ": ", value, CRLF per header), leaving room under sipbridge's 64 KiB wire limit for routing/framing headers.
+const MAX_DIALOG_HEADER_BYTES = 16 * 1024;
+const MAX_DIALOG_HEADER_COUNT = 64;
+
+/**
+ * Validates caller headers for a dialog request (BYE) exactly as sipbridge applies them: the shape checks of
+ * nativeHeaders, the reserved identity/routing/framing names, and the total header size. Throws before anything is sent.
+ */
+export function dialogRequestHeaders(headers?: Record<string, string>) {
+    const list = nativeHeaders(headers);
+    let bytes = 0;
+    if (list.length > MAX_DIALOG_HEADER_COUNT) throw new Error('Invalid SIP header: too many headers');
+    for (const { name, value } of list) {
+        if (!isWellFormedSipbridgeString(name) || !isWellFormedSipbridgeString(value)) throw new Error('Invalid SIP header: malformed unicode');
+        if (NATIVE_RESERVED_HEADERS.has(name.toLowerCase())) throw new Error(`Invalid SIP header: ${name} is reserved`);
+        bytes += Buffer.byteLength(name) + 2 + Buffer.byteLength(value) + 2;
+    }
+    if (bytes > MAX_DIALOG_HEADER_BYTES) throw new Error('Invalid SIP header: headers too large');
+    return list;
 }

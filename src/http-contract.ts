@@ -25,6 +25,8 @@ export interface FollowUpHttpEvent {
     sdp?: string;
     status?: number;
     reason?: string;
+    /** Set on a return attempt's `answered` and `terminated` events; matches the invite's `returnAttemptId`. */
+    returnAttemptId?: string;
     transfer?: SipTransferStatus;
     receivedAt: string;
 }
@@ -111,3 +113,10 @@ function parseRequiredStatus(input: unknown, min: number, max: number, name: str
     }
     return input;
 }
+
+/** Transfer IDs are retained for the life of a call: a small byte limit and a conservative character set bound that memory. */
+export const TRANSFER_ID_MAX_BYTES = 128;
+export function isValidTransferId(value: string) {
+    return /^[A-Za-z0-9._:-]+$/.test(value) && Buffer.byteLength(value, 'utf8') <= TRANSFER_ID_MAX_BYTES;
+}
+export const TRANSFER_ID_ERROR = `transferId must be 1-${TRANSFER_ID_MAX_BYTES} bytes of [A-Za-z0-9._:-]`;

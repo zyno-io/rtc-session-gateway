@@ -669,3 +669,258 @@ test('a covering range that expires midway through clearing stops the clearing a
     assert.deepEqual(backend.calls, ['remove 192.0.2.1', 'remove 192.0.2.2', 'add 192.0.2.1 590', 'add 192.0.2.2 590']);
     assert.ok(!backend.calls.includes('add 192.0.2.0/24 0'));
 });
+
+test('a covering range that expires during a slow unrelated operation is not reported applied; the rerun installs the host', async () => {
+    let now = start;
+    let appliedAtHostAdd: number | undefined;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    const add = backend.add.bind(backend);
+    backend.add = async (target, ttl) => {
+        await add(target, ttl);
+        if (target === '198.51.100.1') now += 6000; // slow unrelated operation outlasts the cover
+        if (target === '192.0.2.7') appliedAtHostAdd = reconciler.state.appliedRevision;
+    };
+    reconciler.accept(
+        snapshot(1, [
+            { target: '192.0.2.0/24', expiresAt: new Date(start + 5000).toISOString() },
+            { target: '192.0.2.7', expiresAt: new Date(start + 30000).toISOString() },
+            { target: '198.51.100.1', expiresAt: new Date(start + 30000).toISOString() }
+        ])
+    );
+    await reconciler.reconcile();
+    assert.ok(
+        backend.calls.some(call => call.startsWith('add 192.0.2.7 ')),
+        'the suppressed host is installed by the rerun'
+    );
+    assert.notEqual(appliedAtHostAdd, 1, 'the revision is not applied before the host is installed');
+    assert.equal(reconciler.state.appliedRevision, 1);
+});
+
+test('a cover that expires during a slow operation that then fails still gets its coverage rerun, and a persistent error does not spin', async () => {
+    let now = start;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    const cidr = { target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() };
+    const host = { target: '192.0.2.1', expiresAt: new Date(start + 60000).toISOString() };
+    reconciler.accept(snapshot(1, [cidr, host]));
+    await reconciler.reconcile();
+    assert.equal(
+        backend.calls.some(call => call.startsWith('add 192.0.2.1 ')),
+        false,
+        'the host is covered by the CIDR'
+    );
+    const originalAdd = backend.add.bind(backend);
+    let unrelatedAttempts = 0;
+    backend.add = async (target: string, ttl: number) => {
+        if (target !== '198.51.100.9') return originalAdd(target, ttl);
+        unrelatedAttempts++;
+        now = start + 11000; // the slow unrelated operation outlasts the cover
+        throw new Error('unrelated nftables failure');
+    };
+    reconciler.accept(snapshot(2, [cidr, host, { target: '198.51.100.9', expiresAt: new Date(start + 60000).toISOString() }]));
+    await assert.rejects(reconciler.reconcile(), /unrelated nftables failure/);
+    assert.ok(
+        backend.calls.some(call => call.startsWith('add 192.0.2.1 ')),
+        'the rerun installed the uncovered host'
+    );
+    assert.ok(reconciler.state.errors >= 1);
+    assert.match(reconciler.state.lastError ?? '', /unrelated nftables failure/);
+    assert.ok(unrelatedAttempts <= 2, 'at most one rerun');
+});
+
+test('two covers expiring during consecutive failing passes both get a rerun, and a persistent error with no new expiry throws', async () => {
+    let now = start;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    const iso = (offset: number) => new Date(start + offset).toISOString();
+    const blocks = [
+        { target: '192.0.2.0/24', expiresAt: iso(10000) },
+        { target: '192.0.2.1', expiresAt: iso(90000) },
+        { target: '198.51.100.0/24', expiresAt: iso(20000) },
+        { target: '198.51.100.1', expiresAt: iso(90000) }
+    ];
+    reconciler.accept(snapshot(1, blocks));
+    await reconciler.reconcile();
+    const originalAdd = backend.add.bind(backend);
+    const jumps = [11000, 21000];
+    let attempts = 0;
+    backend.add = async (target: string, ttl: number) => {
+        if (target !== '203.0.113.9') return originalAdd(target, ttl);
+        attempts++;
+        const jump = jumps.shift();
+        if (jump !== undefined) now = start + jump; // each failing pass outlasts one more cover
+        throw new Error('unrelated nftables failure');
+    };
+    reconciler.accept(snapshot(2, [...blocks, { target: '203.0.113.9', expiresAt: iso(90000) }]));
+    await assert.rejects(reconciler.reconcile(), /unrelated nftables failure/);
+    for (const host of ['192.0.2.1', '198.51.100.1']) {
+        assert.ok(
+            backend.calls.some(call => call.startsWith(`add ${host} `)),
+            `${host} installed after its cover expired`
+        );
+    }
+    assert.equal(attempts, 3, 'one rerun per newly expired cover, then the persistent error throws without spinning');
+});
+
+test('replacing an installed covering CIDR with a narrower cover whose add fails installs the suppressed host individually', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 60000).toISOString();
+    const host = { target: '192.0.2.1', expiresAt };
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.0/24', expiresAt }, host]));
+    await reconciler.reconcile();
+    assert.equal(
+        backend.calls.some(call => call.startsWith('add 192.0.2.1 ')),
+        false,
+        'the host is covered by the /24'
+    );
+    const originalAdd = backend.add.bind(backend);
+    let coverAttempts = 0;
+    backend.add = async (target: string, ttl: number) => {
+        if (target === '192.0.2.0/25') {
+            coverAttempts++;
+            throw new Error('cover add failed');
+        }
+        return originalAdd(target, ttl);
+    };
+    reconciler.accept(snapshot(2, [{ target: '192.0.2.0/25', expiresAt }, host]));
+    await assert.rejects(reconciler.reconcile(), /cover add failed/);
+    assert.ok(
+        backend.calls.some(call => call.startsWith('add 192.0.2.1 ')),
+        'the host ban is installed individually'
+    );
+    assert.equal(coverAttempts, 2, 'one bounded fallback pass; the persistent failure does not spin');
+});
+
+test('a transient failure of the replacing cover is repaired by the single fallback pass', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const expiresAt = new Date(start + 60000).toISOString();
+    const host = { target: '192.0.2.1', expiresAt };
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.0/24', expiresAt }, host]));
+    await reconciler.reconcile();
+    const originalAdd = backend.add.bind(backend);
+    let failed = false;
+    backend.add = async (target: string, ttl: number) => {
+        if (target === '192.0.2.0/25' && !failed) {
+            failed = true;
+            throw new Error('cover add failed once');
+        }
+        return originalAdd(target, ttl);
+    };
+    reconciler.accept(snapshot(2, [{ target: '192.0.2.0/25', expiresAt }, host]));
+    await reconciler.reconcile();
+    assert.equal(reconciler.state.appliedRevision, 2);
+    assert.ok(
+        backend.calls.some(call => call.startsWith('add 192.0.2.0/25 ')),
+        'the cover is installed by the fallback pass'
+    );
+});
+
+test('a failed refresh deletion of a cover whose installed expiry passes leaves its suppressed host to the fallback pass', async () => {
+    let now = start;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    const host = { target: '192.0.2.1', expiresAt: new Date(start + 60000).toISOString() };
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() }, host]));
+    await reconciler.reconcile();
+    assert.equal(
+        backend.calls.some(call => call.startsWith('add 192.0.2.1 ')),
+        false,
+        'the host is covered by the /24'
+    );
+    // The refresh needs the old /24 deleted first; the deletion fails after the old kernel timeout elapsed.
+    const originalRemove = backend.remove.bind(backend);
+    let failing = true;
+    backend.remove = async (target: string) => {
+        if (failing && target === '192.0.2.0/24') {
+            now += 11000;
+            throw new Error('delete rejected');
+        }
+        return originalRemove(target);
+    };
+    reconciler.accept(snapshot(2, [{ target: '192.0.2.0/24', expiresAt: new Date(start + 60000).toISOString() }, host]));
+    await assert.rejects(reconciler.reconcile(), /delete rejected/);
+    assert.ok(
+        backend.calls.some(call => call.startsWith('add 192.0.2.1 ')),
+        'the requested host is installed once the old cover has expired'
+    );
+    failing = false;
+});
+
+test('a failed refresh deletion of a cover that is still installed leaves its suppressed host covered', async () => {
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const host = { target: '192.0.2.1', expiresAt: new Date(start + 60000).toISOString() };
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.0/24', expiresAt: new Date(start + 30000).toISOString() }, host]));
+    await reconciler.reconcile();
+    backend.remove = async () => {
+        throw new Error('delete rejected');
+    };
+    reconciler.accept(snapshot(2, [{ target: '192.0.2.0/24', expiresAt: new Date(start + 60000).toISOString() }, host]));
+    await assert.rejects(reconciler.reconcile(), /delete rejected/);
+    assert.equal(
+        backend.calls.some(call => call.startsWith('add 192.0.2.1 ')),
+        false,
+        'the installed cover still protects the host'
+    );
+});
+
+test('Codex 4: a failed cover install does not count an expired mirrored host as coverage; the fallback pass reinstalls', async () => {
+    let now = start;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    const host = '192.0.2.1';
+    reconciler.accept(snapshot(1, [{ target: host, expiresAt: new Date(start + 10000).toISOString() }]));
+    await reconciler.reconcile();
+    // The extended host ban gains a covering /24; clearing the host for it fails after the host's old kernel timeout passed.
+    const originalRemove = backend.remove.bind(backend);
+    let failedOnce = false;
+    backend.remove = async (target: string) => {
+        if (!failedOnce && target === host) {
+            failedOnce = true;
+            now += 11000;
+            throw new Error('remove rejected');
+        }
+        return originalRemove(target);
+    };
+    const expiresAt = new Date(start + 60000).toISOString();
+    reconciler.accept(
+        snapshot(2, [
+            { target: '192.0.2.0/24', expiresAt },
+            { target: host, expiresAt }
+        ])
+    );
+    await reconciler.reconcile();
+    assert.equal(reconciler.state.appliedRevision, 2, 'the expired mirrored host is no coverage: the bounded rerun applies the revision');
+    assert.ok(
+        backend.calls.some(call => call.startsWith('add 192.0.2.0/24 ') || call === 'add 192.0.2.1 49'),
+        'a ban covering the host is installed again'
+    );
+});
+
+test('a covering CIDR restored at a newer expiry after its refresh add failed counts as installed coverage', async () => {
+    const backend = new OverlapBackend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const cidr = (seconds: number) => ({ target: '192.0.2.0/24', expiresAt: new Date(start + seconds * 1000).toISOString() });
+    const host = { target: '192.0.2.1', expiresAt: new Date(start + 60000).toISOString() };
+    reconciler.accept(snapshot(1, [cidr(10)]));
+    await reconciler.reconcile();
+    const originalAdd = backend.add.bind(backend);
+    backend.add = async (target, ttl) => {
+        if (target === '192.0.2.0/24' && ttl === 20) {
+            // A newer snapshot keeps the CIDR (new expiry) and a host inside it while the refresh add is failing.
+            reconciler.accept(snapshot(3, [cidr(30), host]));
+            throw new Error('refresh rejected');
+        }
+        return originalAdd(target, ttl);
+    };
+    reconciler.accept(snapshot(2, [cidr(20), host]));
+    await reconciler.reconcile();
+    await reconciler.reconcile();
+    assert.deepEqual([...backend.installed.keys()], ['192.0.2.0/24']);
+    assert.equal(reconciler.state.appliedRevision, 3);
+    assert.ok(!backend.calls.includes('add 192.0.2.1 60'), 'the covered host is never added');
+    assert.equal(backend.calls.at(-1), 'add 192.0.2.0/24 30');
+});

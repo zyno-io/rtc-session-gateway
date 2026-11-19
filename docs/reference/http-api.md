@@ -31,7 +31,8 @@ routes. `/routing/lookup` and `/drachtio/route` are no longer served.
 | `POST` | `/calls/:callId/bye` | Send SIP BYE. |
 
 The transfer body uses the [`sip.transfer` parameters](./control-protocol.md#external-sip-handoff),
-with `sessionId` supplied by the path. HTTP can transfer only HTTP-owned SIP/media
+with `sessionId` supplied by the path. `transferId` is limited to 128 bytes of `[A-Za-z0-9._:-]`; others get
+`400`. HTTP can transfer only HTTP-owned SIP/media
 sessions; WebSocket owners must use their owning connection. Call/session snapshots
 include `logicalCallId`, `ownership` (`application`, `transferring`, `handed-off`,
 `returning`) and the latest `transfer` status, with no live dialog objects or

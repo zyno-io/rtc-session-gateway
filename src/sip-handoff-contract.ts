@@ -38,6 +38,8 @@ export interface SipReturnMetadata {
     logicalCallId: string;
     returning?: boolean;
     previousSessionId?: string;
+    /** Unique per return attempt; echoed on that attempt's `answered` and `terminated` events. */
+    returnAttemptId?: string;
 }
 
 export function isSipTransferStatus(value: unknown): value is SipTransferStatus {

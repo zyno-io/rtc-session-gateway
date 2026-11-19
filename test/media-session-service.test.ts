@@ -1397,3 +1397,85 @@ test('handoff bound to the validated source endpoint refuses a session whose end
     assert.equal(service.assertHandoffMedia('media-session-1', 'owner', sdp(40000), 'rtp-3'), 'rtp-3');
     assert.equal((await service.prepareHandoff('media-session-1', 'owner', {}, { endpointId: 'rtp-3', sdp: sdp(40000) })).length, 0);
 });
+
+test('recording.stopped with a canonical path outside the prefix finalizes with the validated start path and never throws', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(
+        new FakeMediaServerManager(client) as any,
+        '/var/lib/rtpbridge/recordings',
+        undefined,
+        10_000,
+        undefined,
+        undefined,
+        'gw-'
+    );
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', {});
+    const startPath = client.recordingFilePath;
+    assert.match(startPath, /\/gw-/);
+    client.stopRecording = async () => {
+        throw new Error('stop must not be called for an already-stopped recording');
+    };
+    assert.doesNotThrow(() =>
+        client.emit('recording.stopped', { recordingId: 'rec-1', filePath: '/mnt/canonical/store/other-name.pcap', durationMs: 42, packets: 7 })
+    );
+    const results = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.equal(results.length, 1);
+    assert.equal(results[0].filePath, startPath);
+    assert.equal(results[0].durationMs, 42);
+});
+
+test('recording.stopped for an untracked recording with an invalid path is logged and ignored without throwing', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(
+        new FakeMediaServerManager(client) as any,
+        '/var/lib/rtpbridge/recordings',
+        undefined,
+        10_000,
+        undefined,
+        undefined,
+        'gw-'
+    );
+    await service.createSession({ ownerConnectionId: 'owner' });
+    assert.doesNotThrow(() =>
+        client.emit('recording.stopped', { recordingId: 'ghost', filePath: '/mnt/canonical/store/other-name.pcap', durationMs: 1, packets: 1 })
+    );
+    assert.doesNotThrow(() => client.emit('recording.stopped', null));
+    assert.equal((service as any).handoffRecordings.get('media-session-1')?.length ?? 0, 0);
+});
+
+test('explicit stop reports the start-validated path even when rtpbridge returns a canonical one', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any, '/var/lib/rtpbridge/recordings');
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.startRecording('media-session-1', { filePath: '/var/lib/rtpbridge/recordings/call_42.pcap' });
+    client.stopRecording = async () => ({ filePath: '/mnt/real-disk/elsewhere/call_42.pcap', durationMs: 5, packets: 1 });
+    const stopped = await service.stopRecording('rec-1');
+    assert.equal(stopped.filePath, '/var/lib/rtpbridge/recordings/call_42.pcap');
+    const results = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.equal(results[0].filePath, '/var/lib/rtpbridge/recordings/call_42.pcap');
+});
+
+test('handoff skips an untracked recording whose reported path is invalid instead of failing', async () => {
+    const client = new FakeRtpbridgeClient();
+    const service = new MediaSessionService(
+        new FakeMediaServerManager(client) as any,
+        '/var/lib/rtpbridge/recordings',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'gw-'
+    );
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    client.startRecording = async () => {
+        throw new RtpbridgeTimeoutError('start timed out');
+    };
+    await assert.rejects(service.startRecording('media-session-1', {}), RtpbridgeTimeoutError);
+    client.sessionRecordings = [{ recordingId: 'rec-x', filePath: '/var/lib/rtpbridge/recordings/other-tenant.pcap', state: 'active' }];
+    const results = await service.prepareHandoff('media-session-1', 'owner', {});
+    assert.equal(results.length, 0);
+});

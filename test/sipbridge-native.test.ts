@@ -845,6 +845,8 @@ test('uncertain first requests expire, not-sent failures are definite, and capac
         client.request = async () => {
             throw new SipbridgeControlNotSentError('control operation capacity');
         };
+        // A CANCEL on an answered context is skipped at dispatch: present the context as a pending setup.
+        live.snapshot = { ...live.snapshot, answered: false };
         await assert.rejects(signaling.command(live, { $case: 'cancel', cancel: {} }), (error: unknown) => {
             assert.ok(error instanceof NativeOperationError);
             assert.equal(error.uncertain, false);

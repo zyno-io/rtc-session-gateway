@@ -244,15 +244,26 @@ test('firewall route misses are not scored without connected owners or shortly a
     let t = setup('[]');
     assert.equal(t.admit(), 404);
     assert.equal(t.firewall.counters.observations, 0);
+    // An outbound-only connection (no routes) is not an owner: still unscored.
+    const outbound = t.hub.registerConnection(socket());
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 0);
     // Owner connected and settled: scored.
     const id = t.hub.registerConnection(socket());
+    t.hub.setRoutes(id, [{ match: 'exact', value: 'support' }]);
     assert.equal(t.admit(), 404);
     assert.equal(t.firewall.counters.observations, 1);
-    // Owner disconnects: unscored within the grace window.
+    // Owner disconnects while the outbound-only connection stays: unscored (no owner, then within grace).
     t.hub.unregisterConnection(id);
-    t.hub.registerConnection(socket());
+    assert.equal(t.hub.size, 1);
     assert.equal(t.admit(), 404);
     assert.equal(t.firewall.counters.observations, 1);
+    // A returning owner is unscored within the grace window.
+    const again = t.hub.registerConnection(socket());
+    t.hub.setRoutes(again, [{ match: 'exact', value: 'support' }]);
+    assert.equal(t.admit(), 404);
+    assert.equal(t.firewall.counters.observations, 1);
+    t.hub.unregisterConnection(outbound);
     // Unknown host is always scored.
     t = setup('[]');
     assert.equal(t.admit('sip:x@evil.example'), 404);

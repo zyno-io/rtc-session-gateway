@@ -10,6 +10,10 @@ export interface ActiveCall {
     logicalCallId?: string;
     ownership?: SipCallOwnership;
     transfer?: SipTransferStatus;
+    /** Bounded record of earlier finished transfers (oldest first), so a delayed retry of an old transferId never dials again. */
+    finishedTransfers?: SipTransferStatus[];
+    /** Every transfer ID admitted on this call (bounded); a retried ID whose result was evicted is refused, never dialed. */
+    admittedTransferIds?: Set<string>;
     /** Destination dialog of a handed-off call; the primary `dialog` stays the original leg. */
     peerDialog?: NativeDialog;
     /** Observed source IP of `dialog` (inbound legs) and, when only the configured destination is known, its host. */
@@ -146,6 +150,8 @@ export function snapshotCall(call: ActiveCall): ActiveCallSnapshot {
         peerAddress: _peerAddress,
         peerHost: _peerHost,
         peerAddresses: _peerAddresses,
+        finishedTransfers: _finishedTransfers,
+        admittedTransferIds: _admittedTransferIds,
         ...snapshot
     } = call;
     return snapshot;

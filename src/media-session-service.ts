@@ -156,8 +156,16 @@ export class MediaSessionService implements GatewayMediaController {
             };
             this.sessions.set(sessionId, record);
             client.onClose(() => this.dropSession(sessionId!));
-            client.on('rtpbridge.event', event => this.publishRtpbridgeEvent(record, event));
-            client.on('recording.stopped', event => this.onBackendRecordingStopped(record, event));
+            client.on(
+                'rtpbridge.event',
+                this.guarded('rtpbridge.event', (event: unknown) => this.publishRtpbridgeEvent(record, event))
+            );
+            client.on(
+                'recording.stopped',
+                this.guarded('recording.stopped', (event: Parameters<MediaSessionService['onBackendRecordingStopped']>[1]) =>
+                    this.onBackendRecordingStopped(record, event)
+                )
+            );
             return snapshotSession(record);
         } catch (err) {
             if (sessionId) await client.destroySession(sessionId).catch(() => undefined);
@@ -603,14 +611,31 @@ export class MediaSessionService implements GatewayMediaController {
         const recordingId = event?.recordingId;
         if (!recordingId) return;
         const metadata = this.recordings.get(recordingId);
-        if (!metadata || metadata.sessionId !== session.sessionId) return;
+        if (metadata && metadata.sessionId !== session.sessionId) return;
+        // rtpbridge may report a canonical (symlink-resolved) path that fails prefix validation; for a tracked
+        // recording the path validated at start is authoritative. An untracked one is recorded only if its path validates.
+        const filePath = metadata ? metadata.filePath : (event.filePath ?? '');
+        if (!metadata) {
+            try {
+                this.recordingMetadata(session, filePath);
+            } catch (err) {
+                this.logger.warn({ err, recordingId, filePath }, 'Ignoring recording.stopped for an untracked recording with an invalid path');
+                return;
+            }
+        }
         this.recordings.delete(recordingId);
-        this.appendFinalizedRecording(
-            session,
-            recordingId,
-            { filePath: event.filePath ?? '', durationMs: event.durationMs ?? 0, packets: event.packets ?? 0 },
-            metadata.filePath
-        );
+        this.appendFinalizedRecording(session, recordingId, { filePath, durationMs: event.durationMs ?? 0, packets: event.packets ?? 0 }, filePath);
+    }
+
+    /** Wraps an rtpbridge event handler: it runs on the client's emitter, so a throw would reach uncaughtException. */
+    private guarded<A extends unknown[]>(name: string, fn: (...args: A) => void): (...args: A) => void {
+        return (...args: A) => {
+            try {
+                fn(...args);
+            } catch (err) {
+                this.logger.error({ err, event: name }, 'rtpbridge event listener failed');
+            }
+        };
     }
 
     /** Stops recordings rtpbridge reports active that the gateway never learned of (a timed-out recording.start). Fails closed. */
@@ -626,7 +651,15 @@ export class MediaSessionService implements GatewayMediaController {
         holds();
         for (const info of active) {
             const result = await session.client.stopRecording(info.recordingId);
-            this.appendFinalizedRecording(session, info.recordingId, result, info.filePath);
+            try {
+                this.appendFinalizedRecording(session, info.recordingId, { ...result, filePath: info.filePath }, info.filePath);
+            } catch (err) {
+                // Stopped, but its path is outside what the gateway may report: skip the entry rather than fail the handoff.
+                this.logger.warn(
+                    { recordingId: info.recordingId, error: err instanceof Error ? err.message : String(err) },
+                    'Skipping unreportable recording'
+                );
+            }
             holds();
         }
         if (this.recordingUncertain.get(session.sessionId) === covered) this.recordingUncertain.delete(session.sessionId);
@@ -657,7 +690,8 @@ export class MediaSessionService implements GatewayMediaController {
         const session = this.requireSession(metadata.sessionId);
         const result = await session.client.stopRecording(recordingId);
         this.recordings.delete(recordingId);
-        return this.appendFinalizedRecording(session, recordingId, result, metadata.filePath);
+        // The start-validated path is authoritative: rtpbridge's reply may carry a canonical/symlink-resolved one.
+        return this.appendFinalizedRecording(session, recordingId, { ...result, filePath: metadata.filePath }, metadata.filePath);
     }
 
     private appendFinalizedRecording(session: MediaSessionRecord, recordingId: string, result: RecordingResult, fallbackPath: string) {
@@ -880,12 +914,12 @@ export class MediaSessionService implements GatewayMediaController {
                 timer = setTimeout(() => finish('timeout'), delayMs);
             };
 
-            const onTimeoutReset = (event: { endpointId?: string }) => {
+            const onTimeoutReset = this.guarded('gather.timeoutReset', (event: { endpointId?: string }) => {
                 if (digits || !hooks.resetTimeoutOn?.matches(event)) return;
                 armTimer(hooks.resetTimeoutOn.timeoutMs);
-            };
+            });
 
-            const onDtmf = (event: { endpointId?: string; digit?: string }) => {
+            const onDtmf = this.guarded('dtmf', (event: { endpointId?: string; digit?: string }) => {
                 if (event.endpointId !== params.endpointId || !event.digit) return;
                 const digit = event.digit.toUpperCase();
                 if (terminator.includes(digit)) {
@@ -903,7 +937,7 @@ export class MediaSessionService implements GatewayMediaController {
                     return;
                 }
                 armTimer(interDigitTimeoutMs);
-            };
+            });
 
             cancel = () => finish('cancelled');
             session.client.on('dtmf', onDtmf);
@@ -929,15 +963,15 @@ export class MediaSessionService implements GatewayMediaController {
                 resolve(reason);
             };
             const maxTimer = setTimeout(() => done('max-duration'), maxDurationMs);
-            const onSilence = (event?: { endpointId?: string }) => {
+            const onSilence = this.guarded('vad.silence', (event?: { endpointId?: string }) => {
                 if (event?.endpointId && event.endpointId !== params.endpointId) return;
                 done('silence');
-            };
-            const onDtmf = (event: { endpointId?: string; digit?: string }) => {
+            });
+            const onDtmf = this.guarded('dtmf', (event: { endpointId?: string; digit?: string }) => {
                 if (event.endpointId === params.endpointId && event.digit && terminator.includes(event.digit.toUpperCase())) {
                     done('dtmf');
                 }
-            };
+            });
             const cleanup = () => {
                 clearTimeout(maxTimer);
                 session.client.removeListener('vad.silence', onSilence);
@@ -963,7 +997,7 @@ export class MediaSessionService implements GatewayMediaController {
                     cleanup();
                     reject(new Error(`Media playback timed out after ${timeoutMs}ms`));
                 }, timeoutMs);
-                const onFinished = (event: { endpointId?: string; reason?: string; error?: string }) => {
+                const onFinished = this.guarded('endpoint.file.finished', (event: { endpointId?: string; reason?: string; error?: string }) => {
                     if (event.endpointId !== playback.endpointId) return;
                     cleanup();
                     if (event.reason === 'error' || event.error) {
@@ -971,7 +1005,7 @@ export class MediaSessionService implements GatewayMediaController {
                     } else {
                         resolve(true);
                     }
-                };
+                });
                 const onAbort = () => {
                     cleanup();
                     resolve(false);

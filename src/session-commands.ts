@@ -3,7 +3,7 @@ import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
 import { NativeOperationError } from './sipbridge-signaling';
 import { CallNotFoundError, SipOperationConflictError, type SipAuthCredentials } from './sip-gateway';
 import type { GatewayController } from './http-server';
-import { InvalidHttpActionError, parseOptionalHeaders } from './http-contract';
+import { InvalidHttpActionError, isValidTransferId, parseOptionalHeaders, TRANSFER_ID_ERROR } from './http-contract';
 import type { GatewayMediaController } from './media-controller';
 import { MediaBackendNotFoundError, MediaBackendUnavailableError } from './media-server-manager';
 import {
@@ -180,12 +180,14 @@ export class SessionCommandHandler {
     private async transfer(params: unknown, context: CommandContext) {
         if (!this.gateway.transfer) throw new CommandNotImplementedError('sip.transfer is not implemented');
         const body = requireObject(params);
+        const transferId = requiredString(body.transferId, 'transferId');
+        if (!isValidTransferId(transferId)) throw new CommandValidationError(TRANSFER_ID_ERROR);
         return this.gateway.transfer(
             {
                 sessionId: requiredString(body.sessionId, 'sessionId'),
                 mediaSessionId: requiredString(body.mediaSessionId, 'mediaSessionId'),
                 requestUri: requiredString(body.requestUri, 'requestUri'),
-                transferId: requiredString(body.transferId, 'transferId'),
+                transferId,
                 headers: parseOptionalHeaders(body.headers),
                 callingNumber: optionalString(body.callingNumber, 'callingNumber'),
                 callingName: optionalString(body.callingName, 'callingName'),

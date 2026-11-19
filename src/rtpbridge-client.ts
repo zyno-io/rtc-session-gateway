@@ -98,7 +98,15 @@ export class RtpbridgeClient extends EventEmitter {
     constructor(private options: RtpbridgeClientOptions) {
         super();
         this.ws = new WebSocket(options.url, options.websocketOptions);
-        this.ws.on('message', data => this.handleMessage(data.toString()));
+        this.ws.on('message', data => {
+            let raw: string;
+            try {
+                raw = data.toString();
+            } catch {
+                return;
+            }
+            this.handleMessage(raw);
+        });
         this.ws.on('error', err => {
             this.rejectAllPending(err);
             this.fireCloseHandlers();
@@ -302,6 +310,28 @@ export class RtpbridgeClient extends EventEmitter {
     }
 
     private handleMessage(raw: string) {
+        // Peer-controlled frame: nothing here may throw into the ws callback (uncaughtException exits the process).
+        const ctx: { pending?: PendingRequest } = {};
+        try {
+            this.processMessage(raw, ctx);
+        } catch (err) {
+            let reason: unknown = 'unprintable error';
+            try {
+                reason = scrubControlError(err);
+            } catch {
+                // keep fixed reason
+            }
+            try {
+                this.logger.warn({ error: reason, messageLength: raw.length }, 'Failed to process rtpbridge message');
+            } catch {
+                // logging must not throw either
+            }
+            // Settling twice is a no-op, so this is safe even if the RPC already resolved.
+            ctx.pending?.reject(new RtpbridgeRequestError('rtpbridge protocol error: invalid reply frame', 'protocol_error'));
+        }
+    }
+
+    private processMessage(raw: string, ctx: { pending?: PendingRequest }) {
         let parsed: any;
         try {
             parsed = JSON.parse(raw);
@@ -310,11 +340,27 @@ export class RtpbridgeClient extends EventEmitter {
             return;
         }
 
-        if (parsed.event) {
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            this.logger.warn({ messageLength: raw.length }, 'Ignoring non-object rtpbridge message');
+            return;
+        }
+
+        if (parsed.event !== undefined && parsed.event !== null && parsed.event !== false && parsed.event !== '') {
+            if (typeof parsed.event !== 'string') {
+                this.logger.warn({ messageLength: raw.length }, 'Ignoring rtpbridge event with a non-string name');
+                return;
+            }
             const data = toCamelCase(parsed.data);
             this.logger.debug({ payloadBytes: Buffer.byteLength(raw), body: scrubRtpbridgeEvent(parsed.event, data) }, 'Received rtpbridge event');
-            this.emit(parsed.event, data);
-            this.emit('rtpbridge.event', { event: parsed.event, data });
+            try {
+                // 'error' is reserved by EventEmitter (throws with no listener): peer input never emits it.
+                if (parsed.event === 'error')
+                    this.logger.warn({ body: scrubRtpbridgeEvent(parsed.event, data) }, 'rtpbridge reported an error event');
+                else this.emit(parsed.event, data);
+                this.emit('rtpbridge.event', { event: parsed.event, data });
+            } catch (err) {
+                this.logger.warn({ error: scrubControlError(err), event: parsed.event }, 'rtpbridge event listener threw');
+            }
             return;
         }
 
@@ -325,6 +371,7 @@ export class RtpbridgeClient extends EventEmitter {
         }
         this.pending.delete(parsed.id);
         clearTimeout(pending.timer);
+        ctx.pending = pending;
         this.logger.debug(
             {
                 payloadBytes: Buffer.byteLength(raw),
@@ -334,8 +381,19 @@ export class RtpbridgeClient extends EventEmitter {
         );
 
         if (parsed.error) {
-            const message = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message ?? JSON.stringify(parsed.error));
-            const code = typeof parsed.error === 'object' && typeof parsed.error?.code === 'string' ? parsed.error.code : undefined;
+            let message: string;
+            let code: string | undefined;
+            try {
+                const e = parsed.error;
+                if (typeof e === 'string') message = e;
+                else if (typeof e === 'object' && typeof e.message === 'string') message = e.message;
+                else if (typeof e === 'object' && e.message === undefined) message = JSON.stringify(e);
+                else message = 'rtpbridge returned an error with a non-string message';
+                code = typeof e === 'object' && typeof e?.code === 'string' ? e.code : undefined;
+            } catch {
+                message = 'rtpbridge returned an unreadable error';
+                code = undefined;
+            }
             pending.reject(new RtpbridgeRequestError(message, code));
             return;
         }
@@ -376,12 +434,15 @@ function toSnakeCase(obj: Record<string, unknown>) {
     return out;
 }
 
-function toCamelCase(input: any): any {
+const MAX_FRAME_DEPTH = 64;
+
+function toCamelCase(input: any, depth = 0): any {
     if (input == null || typeof input !== 'object') return input;
-    if (Array.isArray(input)) return input.map(toCamelCase);
+    if (depth > MAX_FRAME_DEPTH) throw new Error('rtpbridge frame nested too deeply');
+    if (Array.isArray(input)) return input.map(item => toCamelCase(item, depth + 1));
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(input)) {
-        out[key.replace(/_([a-z])/g, (_match, char) => char.toUpperCase())] = toCamelCase(value);
+        out[key.replace(/_([a-z])/g, (_match, char) => char.toUpperCase())] = toCamelCase(value, depth + 1);
     }
     return out;
 }

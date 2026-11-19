@@ -121,6 +121,8 @@ export class FirewallReconciler {
 
     private async run(): Promise<void> {
         try {
+            // Covers (target@expiry) whose expiry already triggered a failure-path rerun: each is spent once, so a rerun needs a NEW expiry.
+            const coverageRerunDone = new Set<string>();
             while (this.pending) {
                 this.pending = false;
                 if (!this.current) return;
@@ -154,18 +156,36 @@ export class FirewallReconciler {
                 // installed entry is only restored when the current snapshot still independently requests it.
                 const requested = new Map<string, number>();
                 let covering: ReturnType<typeof addressRange> | undefined;
+                let coveringExpiry = 0;
+                let coveringKey = '';
+                // Every range that stood in for a narrower requested target during this pass (identity and expiry).
+                const suppressedBy: { key: string; expiry: number; target: string }[] = [];
+                // Covers (target@expiry) whose add failed this pass: what they stood in for was never installed individually.
+                const failedCovers: string[] = [];
+                // Covers whose refresh deletion failed: the installed entry keeps its old (mirror) expiry, not the requested one.
+                const refreshFailures: { target: string; key: string; installedExpiry: number }[] = [];
                 for (const block of candidates) {
                     const range = block.range;
                     const expiresAt = Date.parse(block.expiresAt);
                     if (expiresAt <= this.now() || allow.some(entry => overlaps(range, entry))) continue;
                     requested.set(block.target, Math.max(expiresAt, requested.get(block.target) ?? 0));
-                    if (covering?.family === range.family && covering.first <= range.first && covering.last >= range.last) continue;
+                    if (covering?.family === range.family && covering.first <= range.first && covering.last >= range.last) {
+                        suppressedBy.push({ key: coveringKey, expiry: coveringExpiry, target: block.target });
+                        continue;
+                    }
                     desired.set(block.target, expiresAt);
-                    if (!this.addFailed.has(block.target)) covering = range;
+                    // A failed add whose entry is mirrored at an unexpired TTL (restored, or installed by a later pass) is installed coverage.
+                    if ((this.mirror.get(block.target) ?? 0) > this.now()) this.addFailed.delete(block.target);
+                    if (!this.addFailed.has(block.target)) {
+                        covering = range;
+                        coveringExpiry = expiresAt;
+                        coveringKey = `${block.target}@${expiresAt}`;
+                    }
                 }
                 for (const target of this.addFailed) if (!desired.has(target)) this.addFailed.delete(target);
                 // Each kernel operation is isolated: one rejected target must not abort or wipe the rest.
                 let recompute = false;
+                const recomputeKeys: string[] = [];
                 const failures: { target: string; op: 'add' | 'remove'; error: unknown }[] = [];
                 const attempt = async (op: 'add' | 'remove', target: string, fn: () => Promise<void>) => {
                     try {
@@ -201,17 +221,25 @@ export class FirewallReconciler {
                     if (await attempt('remove', target, () => this.backend.remove(target))) this.mirror.delete(target);
                 }
                 const installedThisPass: AddressRange[] = [];
+                const installedExpiries: { key: string; expiry: number }[] = [];
                 for (const [target, expiresAt] of desired) {
                     if (this.mirror.get(target) === expiresAt) continue;
                     if (stale()) break;
                     const range = rangeFor(target);
-                    if (installedThisPass.some(outer => covers(outer, range))) continue;
+                    const installedCover = installedThisPass.findIndex(outer => covers(outer, range));
+                    if (installedCover >= 0) {
+                        suppressedBy.push({ ...installedExpiries[installedCover], target });
+                        continue;
+                    }
                     // Native interval sets reject overlapping elements: clear covered entries first, restore on failure.
                     const covered: [string, number][] = [];
                     // A TTL refresh replaces the installed element; if the re-add fails the old one is restored.
                     const installedExpiry = this.mirror.get(target);
                     if (installedExpiry !== undefined) {
-                        if (!(await attempt('remove', target, () => this.backend.remove(target)))) continue;
+                        if (!(await attempt('remove', target, () => this.backend.remove(target)))) {
+                            refreshFailures.push({ target, key: `${target}@${expiresAt}`, installedExpiry });
+                            continue;
+                        }
                         this.mirror.delete(target);
                         covered.push([target, installedExpiry]);
                     }
@@ -238,6 +266,7 @@ export class FirewallReconciler {
                         // Nothing to add; an unexpired old entry keeps its protection. Narrower targets were left out of
                         // `desired` because of this covering range, so recompute now that it is known to be expired.
                         recompute = true;
+                        recomputeKeys.push(`${target}@${expiresAt}`);
                         await restore();
                         continue;
                     }
@@ -270,6 +299,7 @@ export class FirewallReconciler {
                     const remainingAtAdd = installExpiry - this.now();
                     if (!clearFailed && remainingAtAdd <= 0) {
                         recompute = true;
+                        recomputeKeys.push(`${target}@${installExpiry}`);
                         await restore();
                         continue;
                     }
@@ -278,10 +308,25 @@ export class FirewallReconciler {
                         this.mirror.set(target, installExpiry);
                         this.addFailed.delete(target);
                         installedThisPass.push(range);
+                        installedExpiries.push({ key: `${target}@${installExpiry}`, expiry: installExpiry });
                     } else {
                         this.addFailed.add(target);
+                        failedCovers.push(`${target}@${expiresAt}`);
                         await restore();
+                        // The restore may have re-added this very cover (at the newer expiry): it is installed, not failed.
+                        if ((this.mirror.get(target) ?? 0) > this.now()) {
+                            this.addFailed.delete(target);
+                            failedCovers.pop();
+                        }
                     }
+                }
+                // A cover that could not be refreshed protects its narrower requested targets (suppressed against the NEW expiry)
+                // only until its installed expiry. Once that has passed, the cover no longer counts: it is treated as a failed
+                // cover so the bounded fallback installs what it stood in for.
+                for (const { target, key, installedExpiry } of refreshFailures) {
+                    if (installedExpiry > this.now()) continue;
+                    this.addFailed.add(target);
+                    failedCovers.push(key);
                 }
                 if (failures.length) {
                     // One bounded summary per pass; per-operation logging could emit thousands of lines every few seconds.
@@ -305,7 +350,24 @@ export class FirewallReconciler {
                                   .slice(0, 5)
                                   .join(', ')}`
                     );
-                    if (!this.sameRevision(snapshot) || this.pending) {
+                    // A covering range that expired during this pass (a slow operation that then failed) leaves the narrower
+                    // targets it stood in for uninstalled: rerun once against the current clock so they are installed. The
+                    // error stays recorded; a persistent error on that single rerun is thrown, so this cannot spin.
+                    const newlyExpired = [
+                        ...recomputeKeys,
+                        ...suppressedBy.filter(({ expiry }) => expiry <= this.now()).map(({ key }) => key),
+                        // A cover whose add failed hid narrower requested targets that are not covered by an unexpired mirrored entry (an expired
+                        // one no longer protects; the kernel timeout already removed it): the next
+                        // pass no longer treats it as covering (addFailed), so they are installed then. Spent once per cover.
+                        ...failedCovers.filter(key =>
+                            suppressedBy.some(entry => entry.key === key && !((this.mirror.get(entry.target) ?? 0) > this.now()))
+                        )
+                    ].filter(key => !coverageRerunDone.has(key));
+                    // A rerun is spent per newly expired cover, and only when coverage is the sole reason to continue; a rerun
+                    // without a newly expired cover throws, so a persistent error cannot spin.
+                    const coverageRerun = newlyExpired.length > 0 && this.sameRevision(snapshot) && !this.pending;
+                    if (coverageRerun) for (const key of newlyExpired) coverageRerunDone.add(key);
+                    if (!this.sameRevision(snapshot) || this.pending || coverageRerun) {
                         // A newer revision (or trigger) arrived during this pass: count this failure, then apply the
                         // newer state now instead of leaving it queued until the next timer tick.
                         this.status.errors++;
@@ -320,7 +382,9 @@ export class FirewallReconciler {
                     this.pending = true;
                     continue;
                 }
-                if (recompute) {
+                // A covering range that expired mid-pass (a slow unrelated kernel operation) no longer protects the narrower
+                // targets it stood in for; rerun against the current clock before reporting the revision applied.
+                if (recompute || suppressedBy.some(({ expiry }) => expiry <= this.now())) {
                     // A skipped expired covering range hid narrower targets from this pass; run again before reporting applied.
                     this.pending = true;
                     continue;
