@@ -200,6 +200,18 @@ test('duplicate route registration is rejected deterministically', async () => {
     }
 });
 
+test('holdsRoute requires the winning connection with an OPEN socket', () => {
+    const hub = new ControlHub(1_000);
+    const fake = (readyState: number) => Object.assign(new EventEmitter(), { readyState }) as unknown as WebSocket;
+    const owner = fake(WebSocket.OPEN);
+    const ownerId = hub.registerConnection(owner);
+    hub.setRoutes(ownerId, [{ match: 'userPrefix', value: 'alice' }]);
+    const destination = { destinationUri: 'sip:alice@example.com', destinationUser: 'alice' };
+    assert.equal(hub.holdsRoute(ownerId, destination), true);
+    (owner as unknown as { readyState: number }).readyState = WebSocket.CLOSING;
+    assert.equal(hub.holdsRoute(ownerId, destination), false, 'a closing socket cannot terminate a committed call');
+});
+
 test('websocket session commands preserve not-found error parity', async () => {
     const { server } = await startControlServer();
     const ws = new WebSocket(`ws://127.0.0.1:${(server.address() as any).port}/control`);
@@ -430,18 +442,6 @@ class FakeMediaController implements GatewayMediaController {
         return { deleted: true as const };
     }
 }
-
-test('holdsRoute requires the winning connection with an OPEN socket', () => {
-    const hub = new ControlHub(1_000);
-    const fake = (readyState: number) => Object.assign(new EventEmitter(), { readyState }) as unknown as WebSocket;
-    const owner = fake(WebSocket.OPEN);
-    const ownerId = hub.registerConnection(owner);
-    hub.setRoutes(ownerId, [{ match: 'userPrefix', value: 'alice' }]);
-    const destination = { destinationUri: 'sip:alice@example.com', destinationUser: 'alice' };
-    assert.equal(hub.holdsRoute(ownerId, destination), true);
-    (owner as unknown as { readyState: number }).readyState = WebSocket.CLOSING;
-    assert.equal(hub.holdsRoute(ownerId, destination), false, 'a closing socket cannot terminate a committed call');
-});
 
 test('an upgrade to the wrong path is answered 404 and closed, and a reset does not raise an uncaught exception', async () => {
     const server = http.createServer((_req, res) => res.end('ok'));
