@@ -767,6 +767,51 @@ test('recording-stop failure aborts media preparation without forgetting the act
     await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), /dedicated call/);
 });
 
+test('handoff is refused when the session carries a second RTP endpoint, and allowed with one RTP plus non-RTP endpoints', async () => {
+    const client = new FakeRtpbridgeClient();
+    const sdp = (port: number) =>
+        ['v=0', 'o=- 1 1 IN IP4 10.0.0.3', 's=test', 'c=IN IP4 10.0.0.3', 't=0 0', `m=audio ${port} RTP/AVP 0`, ''].join('\r\n');
+    let n = 0;
+    client.createRtpOffer = async () => {
+        n++;
+        return { endpointId: `rtp-${n}`, sdpOffer: sdp(40000 + n * 2) };
+    };
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    await service.play('media-session-1', { source: 'file.wav' });
+    assert.doesNotThrow(() => service.assertHandoffMedia('media-session-1', 'owner', sdp(40002)));
+    await service.createRtpOffer('media-session-1');
+    assert.throws(() => service.assertHandoffMedia('media-session-1', 'owner', sdp(40002)), /single RTP endpoint/);
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}), /single RTP endpoint/);
+    assert.deepEqual(client.removedEndpoints, []);
+    assert.deepEqual(client.destroyedSessions, []);
+    assert.ok(service.get('media-session-1'));
+});
+
+test('late RTP endpoint reply after owner disconnect does not cache SDP or index the endpoint', async () => {
+    for (const method of ['createRtpOffer', 'createRtpFromOffer'] as const) {
+        const client = new FakeRtpbridgeClient();
+        const gate = Promise.withResolvers<void>();
+        client.createRtpOffer = async () => {
+            await gate.promise;
+            return { endpointId: 'rtp-late', sdpOffer: 'offer' };
+        };
+        client.createRtpFromOffer = async () => {
+            await gate.promise;
+            return { endpointId: 'rtp-late', sdpAnswer: 'answer' };
+        };
+        const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+        await service.createSession({ ownerConnectionId: 'owner' });
+        const pending = service[method]('media-session-1', { sdp: 'x' });
+        await service.destroySessionsForOwner('owner');
+        gate.resolve();
+        await pending;
+        assert.equal((service as any).rtpLocalSdp.size, 0);
+        assert.equal((service as any).endpointToSession.size, 0);
+    }
+});
+
 test('handoff validates the source RTP address and retains previously finalized recording segments', async () => {
     const client = new FakeRtpbridgeClient();
     const local = ['v=0', 'o=- 1 1 IN IP4 10.0.0.3', 's=test', 'c=IN IP4 10.0.0.3', 't=0 0', 'm=audio 40000 RTP/AVP 0', ''].join('\r\n');

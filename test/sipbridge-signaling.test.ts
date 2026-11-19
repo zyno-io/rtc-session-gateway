@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { SipbridgeSignaling } from '../src/sipbridge-signaling';
+import { NativeOperationError, SipbridgeSignaling } from '../src/sipbridge-signaling';
 import { ContextSnapshot, DialogEvent_Kind } from '../src/sipbridge/generated/sipbridge-control';
 
 const authority = { service: 's', generation: 'g', primaryId: 'p', schemaVersion: 1 };
@@ -106,4 +106,45 @@ test('tombstones retired under 120s ago are never evicted, even over the cap; ol
     } finally {
         h.signaling.stopped = true;
     }
+});
+
+test('a definitely refused CANCEL is retried without fencing; an uncertain one is not retried', async () => {
+    const signaling = new SipbridgeSignaling({} as any) as any;
+    signaling.stopped = false;
+    signaling.cancelRetryDelaysMs = [1, 1, 1];
+    const state: any = { snapshot: {}, ended: false, uncertain: false };
+    let calls = 0;
+    signaling.command = async () => {
+        if (++calls < 3) throw new NativeOperationError('capacity', false);
+    };
+    await signaling.sendCancel(state);
+    assert.equal(calls, 3);
+    assert.equal(state.uncertain, false);
+
+    calls = 0;
+    signaling.command = async () => {
+        calls++;
+        throw new NativeOperationError('capacity', false);
+    };
+    await assert.rejects(signaling.sendCancel(state), (error: NativeOperationError) => !error.uncertain);
+    assert.equal(calls, 4, 'bounded by the schedule');
+    assert.equal(state.uncertain, false);
+
+    calls = 0;
+    signaling.command = async () => {
+        calls++;
+        throw new NativeOperationError('unknown', true);
+    };
+    await assert.rejects(signaling.sendCancel(state), (error: NativeOperationError) => error.uncertain);
+    assert.equal(calls, 1);
+
+    // Setup answered meanwhile: stop retrying.
+    calls = 0;
+    signaling.command = async () => {
+        calls++;
+        state.snapshot.answered = true;
+        throw new NativeOperationError('capacity', false);
+    };
+    await assert.rejects(signaling.sendCancel(state));
+    assert.equal(calls, 1);
 });

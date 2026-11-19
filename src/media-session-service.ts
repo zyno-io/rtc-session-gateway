@@ -257,16 +257,14 @@ export class MediaSessionService implements GatewayMediaController {
     async createRtpOffer(sessionId: string, params: RtpOfferOptions = {}) {
         const session = this.requireSession(sessionId);
         const result = await session.client.createRtpOffer(sessionId, params);
-        this.addEndpoint(session, result.endpointId, 'rtp', params.direction);
-        this.rtpLocalSdp.set(result.endpointId, result.sdpOffer);
+        if (this.addEndpoint(session, result.endpointId, 'rtp', params.direction)) this.rtpLocalSdp.set(result.endpointId, result.sdpOffer);
         return result;
     }
 
     async createRtpFromOffer(sessionId: string, params: { sdp: string; direction?: string }) {
         const session = this.requireSession(sessionId);
         const result = await session.client.createRtpFromOffer(sessionId, params);
-        this.addEndpoint(session, result.endpointId, 'rtp', params.direction);
-        this.rtpLocalSdp.set(result.endpointId, result.sdpAnswer);
+        if (this.addEndpoint(session, result.endpointId, 'rtp', params.direction)) this.rtpLocalSdp.set(result.endpointId, result.sdpAnswer);
         return result;
     }
 
@@ -279,7 +277,7 @@ export class MediaSessionService implements GatewayMediaController {
     async rtpReinvite(endpointId: string, params: { sdp: string }) {
         const session = this.requireSessionForEndpoint(endpointId);
         const result = await session.client.rtpReinvite(endpointId, params.sdp);
-        this.rtpLocalSdp.set(endpointId, result.sdpAnswer);
+        if (this.sessions.get(session.sessionId) === session && session.endpoints.has(endpointId)) this.rtpLocalSdp.set(endpointId, result.sdpAnswer);
         return result;
     }
 
@@ -488,9 +486,10 @@ export class MediaSessionService implements GatewayMediaController {
         if ([...session.endpoints.values()].some(endpoint => endpoint.type === 'webrtc')) {
             throw new MediaActionConflictError('Handoff requires a dedicated call media session');
         }
-        if (![...session.endpoints.values()].some(endpoint => endpoint.type === 'rtp')) {
-            throw new MediaActionConflictError('Handoff requires established RTP call media');
-        }
+        const rtpEndpoints = [...session.endpoints.values()].filter(endpoint => endpoint.type === 'rtp');
+        if (rtpEndpoints.length === 0) throw new MediaActionConflictError('Handoff requires established RTP call media');
+        // Handoff tears down the whole media session: a second RTP endpoint is another live call's audio.
+        if (rtpEndpoints.length > 1) throw new MediaActionConflictError('Handoff requires a media session with a single RTP endpoint');
         if (sourceSdp) {
             const sourceKey = mediaAddressKey(sourceSdp);
             if (
@@ -749,11 +748,14 @@ export class MediaSessionService implements GatewayMediaController {
         type: MediaEndpointType,
         direction?: string,
         bridge?: { pairedSessionId?: string; pairedEndpointId?: string }
-    ) {
+    ): boolean {
+        // A late backend reply for a dropped session must not repopulate indexes that nothing will clean up.
+        if (this.sessions.get(session.sessionId) !== session) return false;
         const now = new Date().toISOString();
         session.endpoints.set(endpointId, { endpointId, type, direction, ...bridge, createdAt: now });
         this.endpointToSession.set(endpointId, session.sessionId);
         this.touch(session);
+        return true;
     }
 
     private touch(session: MediaSessionRecord) {

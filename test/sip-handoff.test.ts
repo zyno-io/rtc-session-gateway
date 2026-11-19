@@ -683,7 +683,9 @@ test('Replaces rejects unmatched tags and unauthorized source addresses, scoring
     for (const [header, address, status] of [
         ['center;to-tag=wrong;from-tag=center-tag', '10.0.0.2', 481],
         ['center;to-tag=center-gateway-tag;from-tag=center-tag', '10.0.0.8', 403],
-        ['not a replaces header', '10.0.0.8', 400]
+        ['not a replaces header', '10.0.0.8', 400],
+        ['', '10.0.0.8', 400],
+        ['   ', '10.0.0.8', 400]
     ] as const) {
         const response = new Response();
         await f.gateway.handleInvite(invite({ replaces: header }, 'replacement', address) as never, response as never);
@@ -1640,4 +1642,169 @@ test('shutdown wakes a sleeping BYE retry and schedules nothing afterwards', asy
     // A refused ACK during shutdown does not schedule a deferred BYE either.
     (f.gateway as any).deferBye(new Dialog(), undefined, Date.now());
     assert.equal((f.gateway as any).deferredByes.size, 0);
+});
+
+const eventNames = (f: Fixture) => f.events.map(event => (event as { event?: string }).event);
+
+test('a stale offerless relay failing after its call ended never tears down a new call with the same id', async () => {
+    const f = await handedOff();
+    const gate = Promise.withResolvers<void>();
+    f.center.offerlessGate = gate.promise;
+    f.caller.emit('request', request('INVITE', '', 43), new Response());
+    await turn();
+    f.caller.emit('ended', 'bye');
+    await turn();
+    assert.equal(f.registry.get('caller'), undefined);
+    const successor = new Dialog('caller', 'new-local', 'new-remote');
+    await f.gateway.handleInvite(invite() as never, new Response(successor) as never);
+    await turn();
+    const next = f.registry.get('caller');
+    assert.ok(next && next !== f.call, 'a new call reuses the id');
+    gate.resolve();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.registry.get('caller'), next);
+    assert.equal(successor.byes, 0);
+});
+
+test('an uncertain 202 to the return REFER ends the call: usable leg BYEd, fenced leg never commanded, one terminated', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    const response = new Response();
+    response.respond = async () => {
+        f.center.isFenced = true;
+        throw new NativeOperationError('Native outcome unknown', true);
+    };
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), response);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+});
+
+test('an uncertain final NOTIFY on the retained carrier ends the call without sip.answered', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.caller.request = async (method: string, options: { body?: string } = {}) => {
+        f.caller.requests.push({ method, ...options });
+        if (options.body?.includes('200 OK')) {
+            f.caller.isFenced = true;
+            throw new NativeOperationError('Native outcome unknown', true);
+        }
+    };
+    f.caller.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 0, 'the fenced carrier is never commanded');
+    assert.equal(f.center.byes, 1);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a retained leg hanging up during the final NOTIFY never yields sip.answered after sip.bye', async () => {
+    const f = await handedOff();
+    const gate = Promise.withResolvers<void>();
+    f.center.request = async (method: string, options: { body?: string } = {}) => {
+        f.center.requests.push({ method, ...options });
+        if (options.body?.includes('200 OK')) await gate.promise;
+    };
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>' }), new Response());
+    await new Promise(resolve => setTimeout(resolve, 10));
+    f.caller.emit('ended', 'bye');
+    gate.resolve();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const names = eventNames(f);
+    assert.ok(names.includes('sip.bye'));
+    assert.ok(!names.includes('sip.answered') || names.indexOf('sip.answered') < names.indexOf('sip.bye'));
+});
+
+test('a Replaces return publishes sip.answered before the old-leg cleanup wait, so a later bye follows it', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    f.caller.bye = async () => {
+        await gate.promise;
+        f.caller.byes++;
+    };
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        new Response(replacement) as never
+    );
+    await new Promise(resolve => setTimeout(resolve, 10));
+    replacement.emit('ended', 'bye');
+    gate.resolve();
+    await pending;
+    await turn();
+    const names = eventNames(f);
+    assert.ok(names.indexOf('sip.answered') >= 0 && names.indexOf('sip.answered') < names.indexOf('sip.bye'));
+});
+
+test('a Replaces return whose named destination left while the application was consulted is refused with 481', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    f.hub.request = async () => {
+        await gate.promise;
+        return { action: 'answer', sdp: sdp('10.0.0.3') } as never;
+    };
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await turn();
+    f.center.emit('ended', 'bye');
+    gate.resolve();
+    await pending;
+    await turn();
+    assert.deepEqual(response.statuses, [481]);
+    assert.equal(response.answered, undefined);
+});
+
+test('a Replaces return whose named destination left during the answer tears down the replacement', async () => {
+    const f = await handedOff();
+    f.call.peerAddress = undefined;
+    f.call.peerAddresses = ['10.0.0.2'];
+    const gate = Promise.withResolvers<void>();
+    const replacement = new Dialog('replacement', 'new-local', 'new-remote');
+    const response = new Response(replacement);
+    response.answerGate = gate.promise;
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'center;to-tag=center-gateway-tag;from-tag=center-tag' }, 'replacement', '10.0.0.2') as never,
+        response as never
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    f.center.emit('ended', 'bye');
+    gate.resolve();
+    await pending;
+    await turn();
+    assert.equal(f.registry.get('replacement'), undefined);
+    assert.equal(replacement.byes, 1);
+});
+
+test('a cancelled late-offer outbound that the destination still answers is ACKed with a rejection before its BYE', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.delayDial(() => gate.promise);
+    const outbound = f.gateway.createOutbound({
+        requestUri: 'sip:center@center.example',
+        sdp: '',
+        controlConnectionId: 'app',
+        outboundAttemptId: 'attempt-1'
+    } as never);
+    const rejected = assert.rejects(outbound, /cancelled/);
+    await turn();
+    await turn();
+    await f.gateway.cancelOutbound('attempt-1', 'app');
+    gate.resolve();
+    await rejected;
+    assert.deepEqual(
+        f.log.filter(entry => entry.startsWith('center')),
+        ['center:ack', 'center:bye']
+    );
+    assert.match(f.center.acks[0], /m=audio 0 /);
 });

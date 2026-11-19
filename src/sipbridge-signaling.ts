@@ -1025,14 +1025,18 @@ export class SipbridgeSignaling extends EventEmitter {
                 if (![OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(result.certainty))
                     throw new NativeOperationError('Outbound native outcome unknown', true);
                 if (result.error) throw new NativeOperationError(result.error);
-                if (cancelled)
+                if (cancelled) {
                     try {
-                        await this.command(state, { $case: 'cancel', cancel: {} });
+                        await this.sendCancel(state);
                     } catch (error) {
-                        // The INVITE is already on the wire; a failed CANCEL never makes the outcome safely retryable.
-                        this.fence(state);
-                        throw new NativeOperationError(error instanceof Error ? error.message : 'Outbound cancel failed', true);
+                        // Only an UNKNOWN CANCEL outcome (already fenced by command) ends the attempt; a definitely refused
+                        // one leaves setup pending so a destination that answers meanwhile is still handed to the caller.
+                        if (!(error instanceof NativeOperationError) || error.uncertain) {
+                            this.fence(state);
+                            throw new NativeOperationError(error instanceof Error ? error.message : 'Outbound cancel failed', true);
+                        }
                     }
+                }
                 if (state.ended) throw new NativeOperationError('Outbound call ended');
                 if (state.snapshot.answered) {
                     state.dialog ??= new NativeDialog(state, this);
@@ -1059,10 +1063,29 @@ export class SipbridgeSignaling extends EventEmitter {
             completed,
             cancel: async () => {
                 cancelled = true;
-                if (state && !state.ended) await this.command(state, { $case: 'cancel', cancel: {} });
+                if (state && !state.ended) await this.sendCancel(state);
             }
         };
         return attempt;
+    }
+    /** Backoff between CANCEL attempts that sipbridge definitely refused (for example for capacity). */
+    cancelRetryDelaysMs = [250, 1000, 2000, 5000];
+    /**
+     * Sends CANCEL for a setup that is still pending, retrying definite refusals (never uncertain outcomes) on a bounded
+     * schedule while the INVITE is unanswered. The final definite refusal is rethrown unfenced.
+     */
+    private async sendCancel(state: Context) {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                await this.command(state, { $case: 'cancel', cancel: {} });
+                return;
+            } catch (error) {
+                const definite = error instanceof NativeOperationError && !error.uncertain;
+                if (!definite || attempt >= this.cancelRetryDelaysMs.length || this.stopped) throw error;
+                await new Promise<void>(resolve => setTimeout(resolve, this.cancelRetryDelaysMs[attempt]).unref());
+                if (state.ended || state.snapshot.answered || state.uncertain || this.stopped) throw error;
+            }
+        }
     }
     async stop() {
         this.stopped = true;
