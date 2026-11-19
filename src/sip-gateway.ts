@@ -30,7 +30,15 @@ import { GatewayDrainingError, GatewayLifecycle } from './gateway-lifecycle';
 import type { SipFirewall } from './sip-firewall';
 import type { GatewayMediaController } from './media-controller';
 import type { SipTransferParams, SipTransferStatus } from './sip-handoff-contract';
-import { assertDirectMediaAnswer, parseReferTarget, parseReplaces, rejectSdpOffer, relaySdp } from './sip-sdp';
+import {
+    assertDirectMediaAnswer,
+    assertRollbackAnswer,
+    parseReferTarget,
+    parseReplaces,
+    rejectSdpOffer,
+    relaySdp,
+    sharesMediaEndpoint
+} from './sip-sdp';
 import { sourceIp } from './firewall-address';
 import { acceptsSipHost, getSipUser, matchRoute, stripSipUri } from './routing';
 
@@ -78,6 +86,8 @@ interface PendingOutboundSipCall {
     cancelRequested: boolean;
     cancelError?: NativeOperationError;
     attempt?: OutboundAttempt;
+    /** The destination's answer was observed: native CANCEL no longer applies, the ACK-aware cleanup owns the dialog. */
+    answered?: boolean;
     completed: Promise<void>;
     finish: () => void;
 }
@@ -228,8 +238,9 @@ export class SipGateway {
                 this.firewall?.observe(req.source?.ip, destinationUser, reason, req.requestId, replacement);
             let identity;
             try {
-                // RFC 3891 3: at most one Replaces header field, with a single value; a repeated or comma-joined one is malformed.
-                if (replacesInstances(req) > 1 || replaces.includes(',')) throw new Error('Multiple Replaces');
+                // RFC 3891 3: at most one Replaces header field. sipbridge keeps each header line separate, and a comma is
+                // legal inside a quoted parameter value, so only a repeated header line is rejected here.
+                if (replacesInstances(req) > 1) throw new Error('Multiple Replaces');
                 identity = parseReplaces(replaces);
             } catch {
                 observe('invalid-replaces');
@@ -349,6 +360,8 @@ export class SipGateway {
             // The owner left while the answer was written: the replacement is BYEd (catch below) and the original pair,
             // still `returning`, is restored to handed-off by the finally block without touching its legs.
             if (!ownerLive()) throw new InvalidCallStateError('Return owner disconnected');
+            // A fenced carrier (the leg being kept) cannot be returned; a fenced destination is retired anyway.
+            if (replacing && replacing.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             const now = new Date().toISOString();
             const call = this.registry.activate({
                 logicalCallId: inviteRequest.logicalCallId,
@@ -403,7 +416,11 @@ export class SipGateway {
             }
         } finally {
             if (replacing && this.registry.get(replacing.callId) === replacing && replacing.ownership === 'returning') {
-                if (replacing.peerDialog) replacing.ownership = 'handed-off';
+                if (replacing.peerDialog) {
+                    replacing.ownership = 'handed-off';
+                    // Fences during the return were deferred to this flow: a pair with an uncertain leg cannot be kept.
+                    if (this.pairHasFencedLeg(replacing)) void this.byeCall(replacing, 'return-peer-uncertain').catch(() => undefined);
+                }
                 // The external party hung up while the application was consulted: nobody is left on that leg.
                 else void this.bye(replacing.callId, 'return-failed-no-peer').catch(() => undefined);
             }
@@ -631,6 +648,10 @@ export class SipGateway {
     }
 
     /** Ends `call` only if it is still the registered instance; a stale async path never tears down a newer call. */
+    private pairHasFencedLeg(call: ActiveCall) {
+        return call.dialog.isFenced || !!call.peerDialog?.isFenced;
+    }
+
     private async byeCall(call: ActiveCall, reason: string) {
         if (this.registry.get(call.callId) !== call) return;
         await this.bye(call.callId, reason);
@@ -698,6 +719,7 @@ export class SipGateway {
         // I5: an uncertain context is never commanded; native timers own its cleanup.
         if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
         const sourceEndpointId = media.assertHandoffMedia(params.mediaSessionId, controlConnectionId, call.localSdp) || undefined;
+        this.assertExclusiveMedia(call);
         const handoffSource = { endpointId: sourceEndpointId, sdp: call.localSdp };
         // Registered before ownership is claimed so an ID collision cannot strand the call in `transferring`.
         // Unique per attempt: the internal id is never derived from a callId another call may reuse.
@@ -710,6 +732,21 @@ export class SipGateway {
             return await operation;
         } finally {
             this.transfers.delete(call);
+        }
+    }
+
+    /** The handoff destroys the media session behind the call's local SDP: no other registered call may be using it. */
+    private assertExclusiveMedia(call: ActiveCall) {
+        if (!call.localSdp) return;
+        for (const other of this.registry.list()) {
+            if (other.callId === call.callId || !other.localSdp) continue;
+            let shared = false;
+            try {
+                shared = sharesMediaEndpoint(call.localSdp, other.localSdp);
+            } catch {
+                shared = false;
+            }
+            if (shared) throw new InvalidCallStateError('Handoff media endpoint is shared with another SIP call');
         }
     }
 
@@ -744,6 +781,7 @@ export class SipGateway {
         // Owner-scoped media guard: a stale attempt must never release a later attempt's recording suspension.
         const handoffToken = {};
         const previousSdp = call.localSdp;
+        const previousRemoteSdp = call.remoteSdp;
         // I6: the single ACK for the destination's late-offer 2xx, taken synchronously by whichever path gets there first.
         let destinationAnsweredAt = Date.now();
         const ackDestination = async (sdp: string) => {
@@ -780,6 +818,7 @@ export class SipGateway {
             attempt.onProvisional = provisional => this.logger.debug({ callId: call.callId, provisional }, 'Handoff destination provisional');
             if (pending.cancelRequested) await attempt.cancel();
             destination = await attempt.completed;
+            pending.answered = true;
             // Recorded before any check can fail: an answered destination is owed an ACK whatever happens next (I6).
             destinationOffer = destination.remoteSdp;
             destinationAnsweredAt = Date.now();
@@ -789,6 +828,8 @@ export class SipGateway {
             if (!destinationOffer) throw new InvalidCallStateError('Destination provided no late offer');
             relayedOffer = relaySdp(destinationOffer, call.localSdp);
             const negotiate = async () => {
+                // Re-checked at the last moment before media is touched: another call may have claimed the endpoint meanwhile.
+                this.assertExclusiveMedia(call);
                 // I3: recording is stopped and confirmed before any destination SDP reaches the carrier.
                 status.recordings = await media.prepareHandoff!(params.mediaSessionId, call.controlConnectionId, handoffToken, handoffSource);
                 this.assertLiveCall(call);
@@ -829,6 +870,8 @@ export class SipGateway {
             ]);
             // Commit synchronously (I1), re-checking liveness after the race resolved.
             this.assertLiveCall(call);
+            // The carrier may have fenced while the destination ACK was in flight; the catch takes the carrier-lost path.
+            if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             if (destination.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
             call.peerDialog = destination;
             call.peerAddress = destination.peerSource?.ip;
@@ -908,8 +951,9 @@ export class SipGateway {
                     const restore = relaySdp(previousSdp!, relayedOffer);
                     this.sentSdp.set(call.dialog, restore);
                     const answer = await call.dialog.reinvite(restore);
-                    // A 200 that rejects audio did not restore the carrier's media: the call cannot be left connected.
-                    assertDirectMediaAnswer(restore, answer);
+                    // The app's RTP endpoint still sends to the carrier's previous media address: a rejected audio stream
+                    // or a moved address cannot be repaired here, so the call ends. Extra formats are legal (RFC 3264 6.1).
+                    assertRollbackAnswer(answer, previousRemoteSdp!);
                     this.updateCallSdp(call, { localSdp: restore, remoteSdp: answer });
                 } catch {
                     await this.byeCall(call, 'transfer-restore-failed').catch(() => undefined);
@@ -973,6 +1017,7 @@ export class SipGateway {
             }
             const dialog = await pending.attempt.completed;
             answered = dialog;
+            pending.answered = true;
             const answeredAt = Date.now();
 
             if (pending.cancelRequested || dialog.isEnded || this.lifecycle?.isStopping) {
@@ -1049,7 +1094,7 @@ export class SipGateway {
         }
 
         pending.cancelRequested = true;
-        if (pending.attempt) {
+        if (pending.attempt && !pending.answered) {
             await pending.attempt.cancel().catch(err => {
                 this.logger.warn(
                     {
@@ -1143,6 +1188,8 @@ export class SipGateway {
         const pending = this.transferRequests.get(call);
         if (!pending) return;
         pending.cancelRequested = true;
+        // After the answer, CANCEL would mark the selected dialog retiring and block the ACK-aware BYE cleanup.
+        if (pending.answered) return;
         void pending.attempt?.cancel().catch(() => undefined);
     }
 
@@ -1214,10 +1261,14 @@ export class SipGateway {
         // commanded again (I5), so relaying through it would fail forever. Deferred so an in-flight handler that already
         // handles the fence runs its own path first; byeCall's registry token makes whichever comes second a no-op (I7).
         // Single-leg application calls are excluded: their owner sees SIGNALING_UNKNOWN errors instead.
+        // Returns and transfers own fence handling: a fenced destination being retired must not end a return that can
+        // still succeed, and a fenced carrier takes their explicit paths. Those flows end the call on restoring handed-off.
+        const flowOwnsFence = () => call.ownership === 'returning' || call.ownership === 'transferring';
         const endOnFence = () => {
+            if (flowOwnsFence()) return;
             setImmediate(() => {
                 // I4: a detached leg no longer speaks for the call.
-                if (!call.peerDialog || !this.isLiveLeg(call, dialog)) return;
+                if (flowOwnsFence() || !call.peerDialog || !this.isLiveLeg(call, dialog)) return;
                 this.logger.warn({ callId: call.callId, failure: 'paired-leg-uncertain' }, 'Leg of a paired call fenced; ending call');
                 void this.byeCall(call, 'leg-uncertain').catch(() => undefined);
             });
@@ -1453,11 +1504,13 @@ export class SipGateway {
             return;
         }
         // RFC 6665 4.2.2: a failure response to a NOTIFY ends the implicit REFER subscription, so no later NOTIFY is sent.
+        // RFC 4488: suppression is only in effect when the 202 echoes `Refer-Sub: false`; otherwise NOTIFYs must be sent.
+        const suppressNotify = readHeader(req, 'refer-sub')?.split(';')[0].trim().toLowerCase() === 'false';
         let subscriptionGone = false;
         let progress: Promise<void> | undefined;
         const notify = async (status: number, final: boolean) => {
             if (final) await progress?.catch(() => undefined);
-            if (subscriptionGone || readHeader(req, 'refer-sub')?.toLowerCase() === 'false' || dialog.isFenced || dialog.isEnded) return;
+            if (subscriptionGone || suppressNotify || dialog.isFenced || dialog.isEnded) return;
             const sequence = req.cseq || undefined;
             await dialog
                 .request('NOTIFY', {
@@ -1482,7 +1535,7 @@ export class SipGateway {
             this.modifyingPairs.add(call);
         }
         try {
-            await res.respond(202);
+            await res.respond(202, suppressNotify ? { headers: { 'Refer-Sub': 'false' } } : undefined);
         } catch (err) {
             if (returning) {
                 // An UNKNOWN 202 fences the referring leg (I5): the pair cannot be kept, so the call ends. bye() takes the
@@ -1498,8 +1551,11 @@ export class SipGateway {
                 }
                 this.modifyingPairs.delete(call);
                 if (this.registry.get(call.callId) === call) {
-                    if (call.peerDialog && !call.peerDialog.isEnded) call.ownership = 'handed-off';
-                    else {
+                    if (call.peerDialog && !call.peerDialog.isEnded) {
+                        call.ownership = 'handed-off';
+                        // Fences are not acted on while returning: a pair with an uncertain leg cannot be kept.
+                        if (this.pairHasFencedLeg(call)) await this.byeCall(call, 'return-peer-uncertain').catch(() => undefined);
+                    } else {
                         // The destination hung up while the 202 was pending (it was detached as a blind transfer): nobody is
                         // left on the external leg, so the carrier is ended (once) instead of stranded on direct media.
                         this.logger.warn(
@@ -1530,6 +1586,7 @@ export class SipGateway {
     ) {
         let preparedCall: ActiveCall | undefined;
         const previousSdp = call.localSdp;
+        const previousRemoteSdp = call.remoteSdp;
         let switched = false;
         let localSdp = '';
         try {
@@ -1574,6 +1631,9 @@ export class SipGateway {
             this.assertLiveCall(call);
             if (controlRoute && !this.controlHub?.isConnected(controlRoute.connectionId))
                 throw new InvalidCallStateError('Return owner disconnected');
+            // A fenced carrier (the leg being kept) blocks the commit and takes the fenced-carrier path below. A fenced
+            // destination is being retired anyway: it only cannot be BYEd (byeLeg skips it).
+            if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             // Commit synchronously; the old destination leg is detached before it is ended (I4).
             const oldPeer = call.peerDialog;
             call.peerDialog = undefined;
@@ -1645,8 +1705,9 @@ export class SipGateway {
                     const restored = relaySdp(previousSdp, localSdp);
                     this.sentSdp.set(call.dialog, restored);
                     const answer = await call.dialog.reinvite(restored);
-                    // A 200 that rejects audio did not restore the carrier's media: the call cannot be left connected.
-                    assertDirectMediaAnswer(restored, answer);
+                    // The destination still sends to the carrier's previous media address: a rejected audio stream or a
+                    // moved address leaves one-way audio, so the call ends. Extra formats are legal (RFC 3264 6.1).
+                    assertRollbackAnswer(answer, previousRemoteSdp!);
                     this.updateCallSdp(call, { localSdp: restored, remoteSdp: answer });
                 } catch {
                     await this.byeCall(call, 'return-restore-failed').catch(() => undefined);
@@ -1657,14 +1718,6 @@ export class SipGateway {
                 // The external party already hung up: the conversation cannot be left working.
                 else await this.byeCall(call, 'return-failed-no-peer').catch(() => undefined);
             }
-            if (preparedCall)
-                void this.sendFollowUpEvent(preparedCall, {
-                    event: 'terminated',
-                    callId: call.callId,
-                    sipCallId: call.sipCallId,
-                    reason: 'return-failed',
-                    receivedAt: new Date().toISOString()
-                });
             // The final NOTIFY precedes any dialog-gone BYE below (it waits only for the progress NOTIFY).
             await notify(503, true);
             // An UNKNOWN NOTIFY (or progress NOTIFY) fenced a leg of the restored pair: it can never be commanded again
@@ -1674,6 +1727,19 @@ export class SipGateway {
             }
             // A no-op when an earlier path already ended the call.
             if (!switched) this.endIfDialogGone(call, err);
+            // Exactly one terminated per owner: when the call ended and the consulted owner is the call's own owner, the
+            // end path already reported it; a different owner (it never held the call) is told its offer failed.
+            if (preparedCall) {
+                const sameOwner = preparedCall.controlConnectionId === call.controlConnectionId && preparedCall.receiverUrl === call.receiverUrl;
+                if (!(sameOwner && this.registry.get(call.callId) !== call))
+                    void this.sendFollowUpEvent(preparedCall, {
+                        event: 'terminated',
+                        callId: call.callId,
+                        sipCallId: call.sipCallId,
+                        reason: 'return-failed',
+                        receivedAt: new Date().toISOString()
+                    });
+            }
         }
     }
 

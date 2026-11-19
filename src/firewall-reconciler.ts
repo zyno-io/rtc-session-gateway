@@ -91,6 +91,18 @@ export class FirewallReconciler {
         if (!this.applying) void this.reconcile().catch(() => undefined);
     }
 
+    /** Eligible targets (unexpired, not allow-listed) a snapshot asks for, with the latest expiry per target. */
+    private requestedBy(snapshot: FirewallSnapshot): Map<string, number> {
+        const allow = [...snapshot.allowlist.map(addressRange), ...this.protectedRanges];
+        const requested = new Map<string, number>();
+        for (const block of snapshot.blocks) {
+            const expiresAt = Date.parse(block.expiresAt);
+            if (expiresAt <= this.now() || allow.some(entry => overlaps(addressRange(block.target), entry))) continue;
+            requested.set(block.target, Math.max(expiresAt, requested.get(block.target) ?? 0));
+        }
+        return requested;
+    }
+
     private async run(): Promise<void> {
         try {
             while (this.pending) {
@@ -179,16 +191,24 @@ export class FirewallReconciler {
                         this.mirror.delete(target);
                         covered.push([target, installedExpiry]);
                     }
+                    const restore = async () => {
+                        // A newer snapshot may have been accepted while this pass ran (it is queued for the next one):
+                        // never resurrect an entry it dropped, and use its TTL for the ones it keeps.
+                        const latest = this.current === snapshot ? undefined : this.requestedBy(this.current!);
+                        for (const [other, previous] of covered) {
+                            const otherExpiry = latest ? latest.get(other) : previous;
+                            if (otherExpiry === undefined) continue;
+                            const left = otherExpiry - this.now();
+                            if (left > 0 && (await attempt('add', other, () => this.backend.add(other, Math.ceil(left / 1000)))))
+                                this.mirror.set(other, otherExpiry);
+                        }
+                    };
                     const remaining = expiresAt - this.now();
                     if (remaining <= 0) {
                         // Nothing to add; an unexpired old entry keeps its protection. Narrower targets were left out of
                         // `desired` because of this covering range, so recompute now that it is known to be expired.
                         recompute = true;
-                        for (const [other, otherExpiry] of covered) {
-                            const left = otherExpiry - this.now();
-                            if (left > 0 && (await attempt('add', other, () => this.backend.add(other, Math.ceil(left / 1000)))))
-                                this.mirror.set(other, otherExpiry);
-                        }
+                        await restore();
                         continue;
                     }
                     let clearFailed = false;
@@ -201,13 +221,6 @@ export class FirewallReconciler {
                             this.mirror.delete(other);
                         } else clearFailed = true;
                     }
-                    const restore = async () => {
-                        for (const [other, otherExpiry] of covered) {
-                            const left = otherExpiry - this.now();
-                            if (left > 0 && (await attempt('add', other, () => this.backend.add(other, Math.ceil(left / 1000)))))
-                                this.mirror.set(other, otherExpiry);
-                        }
-                    };
                     // Removals above may have outlasted the deadline; never install an already-expired ban.
                     const remainingAtAdd = expiresAt - this.now();
                     if (!clearFailed && remainingAtAdd <= 0) {
@@ -247,6 +260,14 @@ export class FirewallReconciler {
                                   .slice(0, 5)
                                   .join(', ')}`
                     );
+                    if (this.current !== snapshot || this.pending) {
+                        // A newer revision (or trigger) arrived during this pass: count this failure, then apply the
+                        // newer state now instead of leaving it queued until the next timer tick.
+                        this.status.errors++;
+                        this.status.lastError = error.message.slice(0, 256);
+                        this.pending = true;
+                        continue;
+                    }
                     throw error;
                 }
                 if (recompute) {

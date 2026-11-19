@@ -7,7 +7,15 @@ import { GatewayLifecycle } from '../src/gateway-lifecycle';
 import { controlErrorForCommand } from '../src/session-commands';
 import { SipGateway, SipOperationConflictError } from '../src/sip-gateway';
 import { isSipTransferStatus } from '../src/sip-handoff-contract';
-import { assertDirectMediaAnswer, parseReferTarget, parseReplaces, rejectSdpOffer, relaySdp } from '../src/sip-sdp';
+import {
+    assertDirectMediaAnswer,
+    assertRollbackAnswer,
+    parseReferTarget,
+    parseReplaces,
+    rejectSdpOffer,
+    relaySdp,
+    sharesMediaEndpoint
+} from '../src/sip-sdp';
 import { loadFirewallConfig, SipFirewall } from '../src/sip-firewall';
 import { NativeOperationError, type SipbridgeSignaling } from '../src/sipbridge-signaling';
 
@@ -2192,4 +2200,251 @@ test('an app cancel that preceded the failed open result still gets the deadline
     await failed;
     await turn();
     assert.equal(f.cancelled(), 2);
+});
+
+const slowOwner = (f: Fixture) => {
+    f.hub.request = (async (_id: string, method: string, params: unknown) => {
+        f.requests.push({ method, params });
+        await settle(5);
+        return { action: 'answer', sdp: sdp('10.0.0.3', 41000) };
+    }) as never;
+};
+
+test('a destination fenced by an UNKNOWN progress NOTIFY during an accepted return does not end the return', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    slowOwner(f);
+    unknownNotify(f.center, '100 Trying');
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'application');
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.center.byes, 0, 'a fenced destination is never commanded');
+    assert.equal(sentEvents(f, 'sip.answered').length, 1);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 0);
+});
+
+test('a carrier fenced while the application is consulted ends the return once: one terminated, destination BYEd after the failure NOTIFY', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    slowOwner(f);
+    f.center.emit('request', refer(), new Response());
+    await turn();
+    f.caller.fence();
+    await settle(60);
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 0, 'a fenced carrier is never commanded');
+    assert.equal(f.center.byes, 1);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+    const notify = f.log.findIndex(entry => entry === 'center:notify-503');
+    assert.ok(notify >= 0 && notify < f.log.indexOf('center:bye'), 'final NOTIFY precedes the destination BYE');
+});
+
+test('a carrier fenced by the return re-INVITE itself is not committed', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.caller.reinviteHook = async () => {
+        f.caller.fence();
+        return sdp('10.0.0.1');
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle(60);
+    assert.equal(f.registry.size, 0);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a leg fenced during a failed return that restores handed-off ends the call once', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.hub.request = (async () => {
+        await settle(5);
+        return { action: 'reject', status: 486 };
+    }) as never;
+    f.center.request = async () => {};
+    f.center.emit('request', refer(), new Response());
+    await turn();
+    f.center.fence();
+    await settle(60);
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a carrier fenced while the destination ACK is in flight is not committed by the transfer', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    const ack = f.center.ackAnswer.bind(f.center);
+    f.center.ackAnswer = async (answer: string) => {
+        await gate.promise;
+        return ack(answer);
+    };
+    const transfer = f.gateway.transfer(f.params, 'app').catch(err => err);
+    await settle(5);
+    f.caller.fence();
+    gate.resolve();
+    const result = await transfer;
+    await settle(20);
+    assert.ok(result instanceof NativeOperationError && result.uncertain);
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.center.byes, 1);
+    assert.equal(sentEvents(f, 'sip.transferred').length, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a transfer rollback answer with extra payload types keeps the call', async () => {
+    const f = await fixture();
+    f.center.ackFailure = new Error('ACK send rejected');
+    let calls = 0;
+    f.caller.reinviteHook = async () => (++calls === 1 ? sdp('10.0.0.1') : sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101'));
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(f.call.ownership, 'application');
+});
+
+test('a transfer rollback answer on a new carrier port ends the call', async () => {
+    const f = await fixture();
+    f.center.ackFailure = new Error('ACK send rejected');
+    let calls = 0;
+    f.caller.reinviteHook = async () => (++calls === 1 ? sdp('10.0.0.1') : sdp('10.0.0.1', 40002));
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+});
+
+test('a return rollback answer with extra payload types keeps the pair', async () => {
+    const f = await handedOff();
+    let calls = 0;
+    // The first return re-INVITE is accepted by the carrier, but the owner disconnects before commit.
+    f.caller.reinviteHook = async () => {
+        calls++;
+        if (calls === 1) {
+            f.hub.isConnected = () => false;
+            return sdp('10.0.0.1');
+        }
+        return sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101');
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.caller.reinvites.length, 3, 'transfer, return attempt, rollback');
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a return rollback answer on a new carrier port ends the call', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    let calls = 0;
+    f.caller.reinviteHook = async () => {
+        if (++calls === 1) {
+            f.hub.isConnected = () => false;
+            return sdp('10.0.0.1');
+        }
+        return sdp('10.0.0.1', 40002);
+    };
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.caller.reinvites.length, 3);
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+});
+
+test('carrier hangup after the destination answer was observed sends no CANCEL; the destination is ACKed then BYEd', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.delayRecording(() => gate.promise);
+    const transfer = f.gateway.transfer(f.params, 'app').catch(err => err);
+    await settle(5);
+    f.caller.emit('ended', 'bye');
+    gate.resolve();
+    await transfer;
+    await settle(20);
+    assert.equal(f.cancelled(), 0);
+    assert.ok(f.log.indexOf('center:ack') >= 0 && f.log.indexOf('center:ack') < f.log.indexOf('center:bye'));
+    assert.equal(f.center.byes, 1);
+});
+
+test('an app disconnect after the destination answer was observed sends no CANCEL', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.delayRecording(() => gate.promise);
+    const transfer = f.gateway.transfer(f.params, 'app').catch(err => err);
+    await settle(5);
+    await f.gateway.terminateCallsForControlConnection('app');
+    gate.resolve();
+    await transfer;
+    await settle(20);
+    assert.equal(f.cancelled(), 0);
+    assert.equal(f.center.byes, 1);
+});
+
+test('a transfer is refused while another registered call uses the same media endpoint', async () => {
+    const f = await fixture();
+    const other = new Dialog('other', 'other-tag', 'other-remote');
+    await f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, new Response(other) as never);
+    await turn();
+    assert.equal(f.registry.size, 2, 'both calls were answered with the same local SDP');
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /shared with another SIP call/);
+    assert.equal(f.opened.length, 0);
+    assert.equal(f.call.ownership, 'application');
+});
+
+test('a transfer is refused when another call claims the endpoint after admission, before media is touched', async () => {
+    const f = await fixture();
+    const other = new Dialog('other', 'other-tag', 'other-remote');
+    const gate = Promise.withResolvers<void>();
+    f.delayDial(() => gate.promise);
+    const transfer = f.gateway.transfer(f.params, 'app').catch(err => err);
+    await settle(5);
+    await f.gateway.handleInvite(invite({}, 'other', '10.0.0.9') as never, new Response(other) as never);
+    await turn();
+    gate.resolve();
+    const result = await transfer;
+    assert.match(String(result), /shared with another SIP call/);
+    assert.equal(f.sources.length, 0, 'recording was never stopped');
+});
+
+test('Refer-Sub: false is echoed in the 202 and suppresses NOTIFY; without it NOTIFYs are sent', async () => {
+    const suppressed = await handedOff();
+    const response = new Response();
+    suppressed.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:inbound@gateway.example>', 'refer-sub': 'false' }), response);
+    await settle(60);
+    assert.equal(response.status, 202);
+    assert.equal(response.options?.headers?.['Refer-Sub'], 'false');
+    assert.equal(suppressed.center.requests.filter(r => r.method === 'NOTIFY').length, 0);
+
+    const normal = await handedOff();
+    const plain = new Response();
+    normal.center.emit('request', refer(), plain);
+    await settle(60);
+    assert.equal(plain.status, 202);
+    assert.equal(plain.options?.headers?.['Refer-Sub'], undefined);
+    assert.ok(normal.center.requests.filter(r => r.method === 'NOTIFY').length >= 1);
+});
+
+test('a Replaces whose quoted parameter contains a comma is not rejected as malformed', async () => {
+    const f = await handedOff();
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    await f.gateway.handleInvite(invite({ replaces: 'abc@h;to-tag=1;from-tag=2;x="a,b"' }, 'replacement', '10.0.0.2') as never, response as never);
+    assert.equal(response.status, 481, 'parsed, then no such dialog (not 400)');
+    assert.equal(parseReplaces('abc@h;to-tag=1;from-tag=2;x="a,b"').toTag, '1');
+});
+
+test('rollback and endpoint helpers', () => {
+    const prev = sdp('10.0.0.1');
+    assertRollbackAnswer(sdp('10.0.0.1').replace('RTP/AVP 0 101', 'RTP/AVP 0 8 101'), prev);
+    assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 0), prev), /rejected/);
+    assert.throws(() => assertRollbackAnswer(sdp('10.0.0.1', 40002), prev), /address/);
+    assert.equal(sharesMediaEndpoint(sdp('10.0.0.3'), sdp('10.0.0.3')), true);
+    assert.equal(sharesMediaEndpoint(sdp('10.0.0.3'), sdp('10.0.0.3', 40002)), false);
 });

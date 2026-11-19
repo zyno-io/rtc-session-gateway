@@ -59,6 +59,50 @@ export function assertDirectMediaAnswer(offer: string, answer: string) {
     mediaAddressKey(answer);
 }
 
+/**
+ * Validates a rollback answer. The restored side keeps sending media to the carrier address it already holds, so the
+ * answer must still accept audio and must not move any media address or port. Extra payload types are allowed
+ * (RFC 3264 6.1); anything that changes the carrier's media address cannot be repaired in place.
+ */
+export function assertRollbackAnswer(answer: string, previousRemoteSdp: string) {
+    const audioAccepted = answer
+        .trim()
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('m='))
+        .some(line => {
+            const [type, port] = line.slice(2).split(/\s+/);
+            return type === 'audio' && Number(port) > 0;
+        });
+    if (!audioAccepted) throw new Error('Rollback audio was rejected');
+    if (mediaAddressKey(answer) !== mediaAddressKey(previousRemoteSdp)) throw new Error('Rollback changed the carrier media address');
+}
+
+/** True when two session descriptions send media to a common address and port (an RTP endpoint shared by two calls). */
+export function sharesMediaEndpoint(a: string, b: string): boolean {
+    const endpoints = (sdp: string) => {
+        const found = new Set<string>();
+        let session = '';
+        let current: { port: string; connection: string } | undefined;
+        const flush = () => {
+            if (current && Number(current.port) > 0 && current.connection) found.add(`${current.connection}|${current.port}`);
+        };
+        for (const line of sdp.trim().split(/\r?\n/)) {
+            if (line.startsWith('m=')) {
+                flush();
+                current = { port: line.slice(2).split(/\s+/)[1] ?? '', connection: session };
+            } else if (line.startsWith('c=')) {
+                if (current) current.connection = line.slice(2).trim();
+                else session = line.slice(2).trim();
+            }
+        }
+        flush();
+        return found;
+    };
+    const left = endpoints(a);
+    for (const endpoint of endpoints(b)) if (left.has(endpoint)) return true;
+    return false;
+}
+
 export function mediaAddressKey(sdp: string): string {
     const lines = sdp.trim().split(/\r?\n/);
     let connection = '';

@@ -681,7 +681,7 @@ export class SipbridgeSignaling extends EventEmitter {
             const { created } = this.receipt(key, fingerprint);
             // The terminal flag is set in the same synchronous turn as the snapshot update, before the receipt write is
             // awaited, so isEnded never lags the snapshot.
-            if (created && terminal) {
+            if (created && terminal && !state.ended) {
                 state.ended = true;
                 state.retiredAt = Date.now();
                 this.trimTombstones();
@@ -928,7 +928,12 @@ export class SipbridgeSignaling extends EventEmitter {
                 });
                 if (frame.payload?.$case !== 'result') throw new NativeOperationError('Unexpected native result', true);
                 const result = frame.payload.result;
-                if (result.snapshot) this.remember(state.peer, client, result.snapshot);
+                if (result.snapshot) {
+                    this.remember(state.peer, client, result.snapshot);
+                    // remember() only initializes `ended` for new contexts: an ended snapshot on a command result retires the
+                    // context now. retire() is idempotent and the terminal event handler skips what is already ended.
+                    if (result.snapshot.ended) this.retire(state, 'terminated');
+                }
                 if (
                     ![OperationResult_Certainty.NOT_ACCEPTED, OperationResult_Certainty.ACCEPTED, OperationResult_Certainty.COMPLETED].includes(
                         result.certainty
@@ -1070,7 +1075,9 @@ export class SipbridgeSignaling extends EventEmitter {
             completed,
             cancel: async () => {
                 cancelled = true;
-                if (state && !state.ended) await this.sendCancel(state);
+                // Once the answer is observed CANCEL no longer applies: sipbridge would mark the selected dialog retiring and
+                // refuse the later BYE while the INVITE awaits its ACK. The caller's ACK-aware cleanup owns the dialog.
+                if (state && !state.ended && !state.snapshot.answered && !state.dialog) await this.sendCancel(state);
             }
         };
         return attempt;

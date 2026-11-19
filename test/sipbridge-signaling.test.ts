@@ -148,3 +148,24 @@ test('a definitely refused CANCEL is retried without fencing; an uncertain one i
     await assert.rejects(signaling.sendCancel(state));
     assert.equal(calls, 1);
 });
+
+test('a command result with an ended snapshot retires an existing context once; the later terminal event does not re-emit', async () => {
+    const h = harness();
+    try {
+        const state = h.signaling.remember(h.peer, h.client, h.snapshot('D'));
+        const emitted: string[] = [];
+        state.dialog = { emit: (name: string, reason: string) => emitted.push(`${name}:${reason}`) };
+        state.peer = h.peer;
+        h.client.request = async () => ({
+            payload: { $case: 'result', result: { certainty: 2, snapshot: { ...h.snapshot('D', true), revision: 2n, commandSequence: 2n } } }
+        });
+        await h.signaling.command(state, { $case: 'cancel', cancel: {} }).catch(() => undefined);
+        assert.equal(state.ended, true);
+        assert.deepEqual(emitted, ['ended:terminated']);
+        await h.receive(h.event('D', 'evD'));
+        assert.deepEqual(emitted, ['ended:terminated'], 'terminal handling is idempotent');
+        assert.equal(h.live(), 0);
+    } finally {
+        h.signaling.stopped = true;
+    }
+});
