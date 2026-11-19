@@ -388,3 +388,36 @@ test('a skipped expired covering range does not leave a new narrower ban uninsta
     );
     assert.equal(reconciler.state.appliedRevision, 2);
 });
+
+test('a covered host the new snapshot no longer requests is not restored when the covering CIDR add fails', async () => {
+    const backend = new OverlapBackend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    const host = { target: '192.0.2.1', expiresAt: new Date(start + 20000).toISOString() };
+    const cidr = { target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() };
+    reconciler.accept(snapshot(1, [host]));
+    await reconciler.reconcile();
+    backend.failAdds.set('192.0.2.0/24', 100);
+    reconciler.accept(snapshot(2, [cidr]));
+    for (let pass = 0; pass < 3; pass++) {
+        await assert.rejects(reconciler.reconcile(), /transient add failure/);
+        assert.deepEqual([...backend.installed.keys()], [], 'dropped host stays removed');
+    }
+    assert.equal(backend.calls.filter(call => call.startsWith('add 192.0.2.1 ')).length, 1);
+});
+
+test('a covered host the snapshot still requests is restored with the snapshot TTL when the covering CIDR add fails', async () => {
+    const backend = new OverlapBackend();
+    const reconciler = new FirewallReconciler(backend, () => start);
+    reconciler.accept(snapshot(1, [{ target: '192.0.2.1', expiresAt: new Date(start + 20000).toISOString() }]));
+    await reconciler.reconcile();
+    backend.failAdds.set('192.0.2.0/24', 100);
+    reconciler.accept(
+        snapshot(2, [
+            { target: '192.0.2.1', expiresAt: new Date(start + 30000).toISOString() },
+            { target: '192.0.2.0/24', expiresAt: new Date(start + 10000).toISOString() }
+        ])
+    );
+    await assert.rejects(reconciler.reconcile());
+    assert.deepEqual([...backend.installed.keys()], ['192.0.2.1']);
+    assert.equal(backend.calls.at(-1), 'add 192.0.2.1 30');
+});

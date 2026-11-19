@@ -185,7 +185,8 @@ test('native outbound parameters and cancellation remain bound to the initiating
     await assert.rejects(gateway.cancelOutbound('attempt', 'owner-b'), /another control connection/);
     await gateway.cancelOutbound('attempt', 'owner-a');
     await failed;
-    assert.equal(cancellations, 1);
+    // The app's cancel plus the failure-path CANCEL: a second CANCEL on a finished attempt is harmless and covers a refused first one.
+    assert.equal(cancellations, 2);
 });
 test('drain rejects new SIP admission while preserving retained dialog commands', async () => {
     const registry = new CallRegistry();

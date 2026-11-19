@@ -99,6 +99,8 @@ export interface IncomingSipRequest {
     /** Source observed by sipbridge for this request; absent when the flow is unknown. */
     source?: SipSource;
     get(name: string): string | undefined;
+    /** Every instance of a header field in wire order (the `headers` map keeps only the last). */
+    getAll(name: string): string[];
 }
 export interface SipSource {
     ip: string;
@@ -479,7 +481,7 @@ export class SipbridgeSignaling extends EventEmitter {
                 this.retire(state, 'terminated');
                 return;
             }
-            if (result.certainty === OperationResult_Certainty.UNKNOWN) state.uncertain = true;
+            if (result.certainty === OperationResult_Certainty.UNKNOWN) this.fence(state);
             if (!state.uncertain && result.snapshot.answered && state.deferred) {
                 state.dialog ??= new NativeDialog(state, this);
                 state.deferred.resolve(state.dialog);
@@ -503,7 +505,7 @@ export class SipbridgeSignaling extends EventEmitter {
             this.retire(state, 'terminated');
             return;
         }
-        state.uncertain = true;
+        this.fence(state);
     }
     /** Contexts that count against admission; ended tombstones never do. */
     private liveContexts() {
@@ -540,7 +542,9 @@ export class SipbridgeSignaling extends EventEmitter {
     }
     /** Fences a context after an uncertain outcome; a first request that never became a dialog expires. */
     private fence(state: Context) {
+        const first = !state.uncertain;
         state.uncertain = true;
+        if (first && !state.ended) state.dialog?.emit('fenced');
         if (state.first && !state.dialog && state.expiresAt === undefined) state.expiresAt = Date.now() + UNCERTAIN_FIRST_REQUEST_MS;
     }
     private expireUnanswered(state: Context) {
@@ -675,6 +679,16 @@ export class SipbridgeSignaling extends EventEmitter {
             // open); it is kept as an ended tombstone, never refused for capacity.
             const state = this.remember(peer, client, event.snapshot, terminal ? 'force' : 'enforce', terminal);
             const { created } = this.receipt(key, fingerprint);
+            // The terminal flag is set in the same synchronous turn as the snapshot update, before the receipt write is
+            // awaited, so isEnded never lags the snapshot.
+            if (created && terminal) {
+                state.ended = true;
+                state.retiredAt = Date.now();
+                this.trimTombstones();
+                state.deferred?.reject(new NativeOperationError(event.error || 'SIP call ended'));
+                state.dialog?.emit('ended', event.kind === DialogEvent_Kind.ENDED ? 'bye' : 'terminated');
+                if (state.credentials) this.credentials.delete(state.credentials.id);
+            }
             await client.reply(frame.correlationId, { $case: 'result', result: emptyResult() });
             if (!created) return;
             if (event.kind === DialogEvent_Kind.PROVISIONAL) state.onProvisional?.(event.message?.status ?? 0);
@@ -684,14 +698,6 @@ export class SipbridgeSignaling extends EventEmitter {
             if (event.kind === DialogEvent_Kind.ANSWERED) {
                 state.dialog ??= new NativeDialog(state, this);
                 state.deferred?.resolve(state.dialog);
-            }
-            if ([DialogEvent_Kind.ENDED, DialogEvent_Kind.FAILED, DialogEvent_Kind.CANCELLED].includes(event.kind)) {
-                state.ended = true;
-                state.retiredAt = Date.now();
-                this.trimTombstones();
-                state.deferred?.reject(new NativeOperationError(event.error || 'SIP call ended'));
-                state.dialog?.emit('ended', event.kind === DialogEvent_Kind.ENDED ? 'bye' : 'terminated');
-                if (state.credentials) this.credentials.delete(state.credentials.id);
             }
             return;
         }
@@ -836,7 +842,8 @@ export class SipbridgeSignaling extends EventEmitter {
             requestId: request.requestId,
             headers,
             source: sourceOf(request),
-            get: name => headers[name.toLowerCase()]
+            get: name => headers[name.toLowerCase()],
+            getAll: name => message.headers.filter(header => header.name.toLowerCase() === name.toLowerCase()).map(header => header.value)
         };
         const response: SipResponse = {
             finalResponseSent: false,

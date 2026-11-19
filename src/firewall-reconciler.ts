@@ -122,11 +122,15 @@ export class FirewallReconciler {
                                       ? 1
                                       : 0)
                     );
+                // Every eligible target the snapshot asks for, kept before overlapping ranges are collapsed, so a covered
+                // installed entry is only restored when the current snapshot still independently requests it.
+                const requested = new Map<string, number>();
                 let covering: ReturnType<typeof addressRange> | undefined;
                 for (const block of candidates) {
                     const range = block.range;
                     const expiresAt = Date.parse(block.expiresAt);
                     if (expiresAt <= this.now() || allow.some(entry => overlaps(range, entry))) continue;
+                    requested.set(block.target, Math.max(expiresAt, requested.get(block.target) ?? 0));
                     if (covering?.family === range.family && covering.first <= range.first && covering.last >= range.last) continue;
                     desired.set(block.target, expiresAt);
                     if (!this.addFailed.has(block.target)) covering = range;
@@ -188,10 +192,12 @@ export class FirewallReconciler {
                         continue;
                     }
                     let clearFailed = false;
-                    for (const [other, otherExpiry] of [...this.mirror]) {
+                    for (const [other] of [...this.mirror]) {
                         if (other === target || !covers(range, rangeFor(other))) continue;
                         if (await attempt('remove', other, () => this.backend.remove(other))) {
-                            covered.push([other, otherExpiry]);
+                            // Restore only what the current snapshot still requests, with the snapshot's TTL (not the mirror's).
+                            const wanted = requested.get(other);
+                            if (wanted !== undefined) covered.push([other, wanted]);
                             this.mirror.delete(other);
                         } else clearFailed = true;
                     }

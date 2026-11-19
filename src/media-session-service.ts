@@ -504,7 +504,8 @@ export class MediaSessionService implements GatewayMediaController {
         return { ...result, ...metadata };
     }
 
-    assertHandoffMedia(sessionId: string, ownerConnectionId?: string, sourceSdp?: string) {
+    /** Returns the id of the RTP endpoint carrying `sourceSdp` (when given); `sourceEndpointId` pins it to one specific endpoint. */
+    assertHandoffMedia(sessionId: string, ownerConnectionId?: string, sourceSdp?: string, sourceEndpointId?: string): string | undefined {
         const session = this.requireSession(sessionId);
         if (session.ownerConnectionId !== ownerConnectionId) throw new MediaActionConflictError('Media session belongs to another owner');
         if ([...session.endpoints.values()].some(endpoint => endpoint.type === 'webrtc')) {
@@ -514,20 +515,26 @@ export class MediaSessionService implements GatewayMediaController {
         if (rtpEndpoints.length === 0) throw new MediaActionConflictError('Handoff requires established RTP call media');
         // Handoff tears down the whole media session: a second RTP endpoint is another live call's audio.
         if (rtpEndpoints.length > 1) throw new MediaActionConflictError('Handoff requires a media session with a single RTP endpoint');
+        if (sourceEndpointId && rtpEndpoints[0].endpointId !== sourceEndpointId)
+            throw new MediaActionConflictError('Media endpoint of the source SIP dialog was replaced');
         if (sourceSdp) {
             const sourceKey = mediaAddressKey(sourceSdp);
-            if (
-                ![...session.endpoints.values()].some(endpoint => {
-                    const localSdp = this.rtpLocalSdp.get(endpoint.endpointId);
-                    return endpoint.type === 'rtp' && localSdp && mediaAddressKey(localSdp) === sourceKey;
-                })
-            )
-                throw new MediaActionConflictError('Media session does not carry the source SIP dialog');
+            const carrier = [...session.endpoints.values()].find(endpoint => {
+                const localSdp = this.rtpLocalSdp.get(endpoint.endpointId);
+                return endpoint.type === 'rtp' && localSdp && mediaAddressKey(localSdp) === sourceKey;
+            });
+            if (!carrier) throw new MediaActionConflictError('Media session does not carry the source SIP dialog');
+            return carrier.endpointId;
         }
+        return undefined;
     }
 
-    async prepareHandoff(sessionId: string, ownerConnectionId: string | undefined, token: object) {
-        this.assertHandoffMedia(sessionId, ownerConnectionId);
+    /**
+     * `source` binds the guard to the endpoint the caller validated: it is re-verified here and again with the guard held,
+     * so an endpoint replaced since the caller's check (another call's media) is never stopped or destroyed.
+     */
+    async prepareHandoff(sessionId: string, ownerConnectionId: string | undefined, token: object, source?: { endpointId?: string; sdp: string }) {
+        this.assertHandoffMedia(sessionId, ownerConnectionId, source?.sdp, source?.endpointId);
         // An endpoint being created now could land after validation and be destroyed with the session.
         if (this.endpointCreations.get(sessionId)) throw new MediaActionConflictError('Handoff refused while a media endpoint is being created');
         this.handoffSessions.set(sessionId, token);
@@ -557,7 +564,7 @@ export class MediaSessionService implements GatewayMediaController {
             }
             if (this.recordingUncertain.has(sessionId)) await this.stopUnknownRecordings(session);
             // Re-validated with the guard held (no endpoint can be added meanwhile): the rule still holds at the end.
-            this.assertHandoffMedia(sessionId, ownerConnectionId);
+            this.assertHandoffMedia(sessionId, ownerConnectionId, source?.sdp, source?.endpointId);
             return [...results];
         } catch (err) {
             this.releaseHandoff(sessionId, token);

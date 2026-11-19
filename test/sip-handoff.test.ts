@@ -50,6 +50,12 @@ class Dialog extends EventEmitter {
     byeFailure?: Error;
     byeFailureLimit = Infinity;
     fenceOnAckFailure = false;
+    /** Models an UNKNOWN native outcome: the context is fenced and, like NativeDialog, announces it once. */
+    fence() {
+        if (this.isFenced) return;
+        this.isFenced = true;
+        this.emit('fenced');
+    }
     private buffered = new Map<number, string>();
     private waiters = new Map<number, { resolve: (body: string) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
     constructor(
@@ -64,7 +70,7 @@ class Dialog extends EventEmitter {
         this.reinvites.push(offer);
         if (offer) this.localSdp = offer;
         if (this.reinviteFailure) {
-            if (this.fenceOnReinviteFailure) this.isFenced = true;
+            if (this.fenceOnReinviteFailure) this.fence();
             throw this.reinviteFailure;
         }
         // An offerless re-INVITE returns the peer's 2xx offer.
@@ -77,7 +83,7 @@ class Dialog extends EventEmitter {
     async ackAnswer(answer: string) {
         this.log?.push(`${this.name}:ack`);
         if (this.ackFailure && this.ackFailureLimit-- > 0) {
-            if (this.fenceOnAckFailure) this.isFenced = true;
+            if (this.fenceOnAckFailure) this.fence();
             throw this.ackFailure;
         }
         this.acks.push(answer);
@@ -210,6 +216,7 @@ async function fixture(
     let replacementFailure: Error | undefined;
     let destroyHook: (() => Promise<void>) | undefined;
     let cancelFailure: Error | undefined;
+    const sources: unknown[] = [];
     const finalized = {
         recordingId: 'recording',
         backendId: 'media-a',
@@ -258,8 +265,10 @@ async function fixture(
     const media = {
         assertHandoffMedia(_id: string, owner: string) {
             assert.equal(owner, 'app');
+            return 'endpoint-a';
         },
-        async prepareHandoff() {
+        async prepareHandoff(_id: string, _owner: string, _token: object, source: unknown) {
+            sources.push(source);
             log.push('stop-recording');
             if (prepareHook) await prepareHook();
             if (prepareFailure) throw prepareFailure;
@@ -312,6 +321,7 @@ async function fixture(
         hub,
         opened,
         provisionalSeen,
+        sources,
         cancelled: () => cancelled,
         dials: () => opened.length,
         failRecording: () => {
@@ -2021,4 +2031,165 @@ test('an outbound setup that fails at the native deadline is cancelled once more
     await turn();
     assert.equal(f.cancelled(), 1);
     assert.equal(f.center.byes, 0);
+});
+
+test('the handoff media guard is bound to the endpoint validated for the source call', async () => {
+    const f = await fixture();
+    await f.gateway.transfer(f.params, 'app');
+    assert.deepEqual(f.sources, [{ endpointId: 'endpoint-a', sdp: sdp('10.0.0.3') }]);
+});
+
+test('a destination bodyless UPDATE whose 200 is UNKNOWN ends the pair: carrier BYEd, destination never commanded, one terminated', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    const response = new Response();
+    response.respond = async () => {
+        f.center.fence();
+        throw new NativeOperationError('Native outcome unknown', true);
+    };
+    f.center.emit('request', request('UPDATE', ''), response);
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a 488 to the requester that is UNKNOWN after the peer rejects a relayed re-INVITE ends the pair once', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.center.reinviteFailure = new NativeOperationError('SIP non-success response: 488', false, false, 488, false, true);
+    const response = new Response();
+    response.respond = async () => {
+        f.caller.fence();
+        throw new NativeOperationError('Native outcome unknown', true);
+    };
+    f.caller.emit('request', request('INVITE', sdp('10.0.0.1'), 43), response);
+    await settle();
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.center.byes, 1);
+    assert.equal(f.caller.byes, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 1);
+});
+
+test('a fence on a detached leg has no effect on the call', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    // The carrier leg was replaced (detached): its fence must not end the call that now has another carrier.
+    f.call.dialog = new Dialog('other', 'o-local', 'o-remote') as never;
+    f.caller.fence();
+    await settle();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.center.byes, 0);
+    assert.equal(sentEvents(f, 'sip.terminated').length, 0);
+    // A destination detached by a return no longer speaks for the call either.
+    const g = await handedOff();
+    g.call.ownership = 'returning';
+    g.center.emit('ended', 'bye');
+    g.center.fence();
+    await settle();
+    assert.equal(g.registry.size, 1);
+    assert.equal(g.caller.byes, 0);
+});
+
+test('a single-leg application call is unaffected by a fenced leg (the owner sees SIGNALING_UNKNOWN instead)', async () => {
+    const f = await fixture();
+    f.caller.fence();
+    await settle();
+    assert.equal(f.registry.size, 1);
+    assert.equal(f.caller.byes, 0);
+});
+
+test('a rollback re-INVITE answered with rejected audio ends the call after a failed transfer', async () => {
+    const f = await fixture();
+    f.center.ackFailure = new Error('ACK send rejected');
+    let calls = 0;
+    f.caller.reinviteHook = async () => (++calls === 1 ? sdp('10.0.0.1') : sdp('10.0.0.1', 0));
+    await assert.rejects(f.gateway.transfer(f.params, 'app'), /ACK send rejected/);
+    await settle();
+    assert.equal(f.caller.reinvites.length, 2);
+    assert.equal(f.registry.size, 0, 'the carrier is not left connected without audio');
+    assert.equal(f.caller.byes, 1);
+});
+
+test('a rollback re-INVITE answered with rejected audio ends the call after a failed REFER return', async () => {
+    const f = await handedOff();
+    f.events.length = 0;
+    f.caller.reinviteHook = async () => sdp('10.0.0.1', 0);
+    f.center.emit('request', refer(), new Response());
+    await settle();
+    assert.equal(f.caller.reinvites.length, 3, 'return attempt then rollback');
+    assert.equal(f.registry.size, 0);
+    assert.equal(f.caller.byes, 1);
+    assert.equal(sentEvents(f, 'sip.answered').length, 0);
+});
+
+test('a Replaces whose authorizing destination was detached during the lookup is refused with 403 and scored', async () => {
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL: 'enforce' } as never));
+    const observed: string[] = [];
+    const original = firewall.observe.bind(firewall);
+    firewall.observe = ((...args: Parameters<SipFirewall['observe']>) => {
+        observed.push(args[2]);
+        return original(...args);
+    }) as SipFirewall['observe'];
+    const f = await handedOff({ firewall });
+    f.call.peerHost = 'localhost';
+    f.call.peerAddress = undefined;
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+    const pending = f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '127.0.0.1') as never,
+        response as never
+    );
+    await turn();
+    // A REFER return detaches the destination (blind transfer) while its address is being resolved.
+    f.call.ownership = 'returning';
+    f.center.emit('ended', 'bye');
+    await pending;
+    assert.equal(response.status, 403);
+    assert.equal(response.answered, undefined);
+    assert.deepEqual(observed, ['unauthorized-replaces']);
+    assert.equal(f.registry.get('caller'), f.call);
+});
+
+test('duplicate or comma-joined Replaces header fields are malformed: 400 and invalid-replaces before dialog lookup', async () => {
+    const firewall = new SipFirewall(loadFirewallConfig({ SIP_FIREWALL: 'enforce' } as never));
+    const observed: string[] = [];
+    const original = firewall.observe.bind(firewall);
+    firewall.observe = ((...args: Parameters<SipFirewall['observe']>) => {
+        observed.push(args[2]);
+        return original(...args);
+    }) as SipFirewall['observe'];
+    const f = await handedOff({ firewall });
+    f.call.peerAddresses = ['10.0.0.2'];
+    const valid = 'center;to-tag=center-gateway-tag;from-tag=center-tag';
+    const duplicate = { ...invite({ replaces: valid }, 'replacement', '10.0.0.2'), getAll: () => ['garbage', valid] };
+    const joined = invite({ replaces: `${valid}, ${valid}` }, 'replacement', '10.0.0.2');
+    for (const req of [duplicate, joined]) {
+        const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'));
+        await f.gateway.handleInvite(req as never, response as never);
+        assert.equal(response.status, 400);
+        assert.equal(response.answered, undefined);
+    }
+    assert.deepEqual(observed, ['invalid-replaces', 'invalid-replaces']);
+    assert.equal(f.registry.get('caller'), f.call);
+});
+
+test('an app cancel that preceded the failed open result still gets the deadline CANCEL', async () => {
+    const f = await fixture();
+    const gate = Promise.withResolvers<void>();
+    f.delayDial(() => gate.promise);
+    const outbound = f.gateway.createOutbound({
+        requestUri: 'sip:center@center.example',
+        sdp: '',
+        controlConnectionId: 'app',
+        outboundAttemptId: 'attempt-3'
+    } as never);
+    const failed = assert.rejects(outbound, /deadline/);
+    await turn();
+    await f.gateway.cancelOutbound('attempt-3', 'app');
+    assert.equal(f.cancelled(), 1);
+    gate.reject(new NativeOperationError('Outbound setup deadline', true));
+    await failed;
+    await turn();
+    assert.equal(f.cancelled(), 2);
 });

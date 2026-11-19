@@ -123,11 +123,13 @@ export interface CreateMediaSessionParams {
 }
 
 export interface GatewayMediaController {
-    assertHandoffMedia?(sessionId: string, ownerConnectionId?: string, sourceSdp?: string): void;
+    /** Returns the id of the RTP endpoint carrying `sourceSdp`, when one is given. */
+    assertHandoffMedia?(sessionId: string, ownerConnectionId?: string, sourceSdp?: string, sourceEndpointId?: string): string | undefined | void;
     prepareHandoff?(
         sessionId: string,
         ownerConnectionId: string | undefined,
-        token: object
+        token: object,
+        source?: { endpointId?: string; sdp: string }
     ): Promise<import('./sip-handoff-contract').FinalizedSipRecording[]>;
     releaseHandoff?(sessionId: string, token: object): void;
     list(): MediaSessionSnapshot[];

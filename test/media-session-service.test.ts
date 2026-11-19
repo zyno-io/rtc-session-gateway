@@ -1271,3 +1271,35 @@ test('a failed endpoint creation releases its in-flight count so a later handoff
     await service.prepareHandoff('media-session-1', 'owner', token);
     service.releaseHandoff('media-session-1', token);
 });
+
+test('handoff bound to the validated source endpoint refuses a session whose endpoint was replaced by another call', async () => {
+    const client = new FakeRtpbridgeClient();
+    const sdp = (port: number) =>
+        ['v=0', 'o=- 1 1 IN IP4 10.0.0.3', 's=test', 'c=IN IP4 10.0.0.3', 't=0 0', `m=audio ${port} RTP/AVP 0`, ''].join('\r\n');
+    // rtp-1: call A (40000); rtp-2: call B (40002); rtp-3: another call that happens to share call A's media address.
+    const ports: Record<string, number> = { 'rtp-1': 40000, 'rtp-2': 40002, 'rtp-3': 40000 };
+    let n = 0;
+    client.createRtpOffer = async () => {
+        n++;
+        return { endpointId: `rtp-${n}`, sdpOffer: sdp(ports[`rtp-${n}`]) };
+    };
+    const service = new MediaSessionService(new FakeMediaServerManager(client) as any);
+    await service.createSession({ ownerConnectionId: 'owner' });
+    await service.createRtpOffer('media-session-1');
+    const sourceEndpointId = service.assertHandoffMedia('media-session-1', 'owner', sdp(40000));
+    assert.equal(sourceEndpointId, 'rtp-1');
+    const source = { endpointId: sourceEndpointId, sdp: sdp(40000) };
+    // Call A's endpoint is removed while the destination rings and call B takes over the same session.
+    await service.stopMedia('rtp-1');
+    await service.createRtpOffer('media-session-1');
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}, source), MediaActionConflictError);
+    assert.deepEqual(client.removedEndpoints, ['rtp-1'], 'call B endpoint is untouched');
+    assert.deepEqual(client.destroyedSessions, []);
+    assert.equal((service as any).handoffSessions.size, 0, 'the refused attempt holds no guard');
+    // Same address under a different endpoint id is still not the validated endpoint.
+    await service.stopMedia('rtp-2');
+    await service.createRtpOffer('media-session-1');
+    await assert.rejects(service.prepareHandoff('media-session-1', 'owner', {}, source), /replaced/);
+    assert.equal(service.assertHandoffMedia('media-session-1', 'owner', sdp(40000), 'rtp-3'), 'rtp-3');
+    assert.equal((await service.prepareHandoff('media-session-1', 'owner', {}, { endpointId: 'rtp-3', sdp: sdp(40000) })).length, 0);
+});
