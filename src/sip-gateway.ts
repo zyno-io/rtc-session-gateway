@@ -633,7 +633,7 @@ export class SipGateway {
                     );
                     if (restored.action !== 'answer') throw new Error('Application could not restore replaced media');
                     const committed = call.localSdp;
-                    if (committed && !preservesMediaParameters(committed, restored.sdp)) {
+                    if (committed && !preservesMediaParameters(committed, restored.sdp, previousRemoteSdp)) {
                         // The application restored different local media: the original peer still sends to the old
                         // address, so it must be renegotiated onto the new one (or the call ends).
                         this.assertLiveCall(call);
@@ -833,7 +833,11 @@ export class SipGateway {
         };
     }
 
-    /** Registered calls whose localSdp can name a local endpoint: a pair with an external peer holds that peer's SDP instead. */
+    /**
+     * Registered calls whose localSdp can name a local endpoint: a pair with an external peer holds that peer's SDP instead.
+     * Paired calls are deliberately outside exclusivity (their SDP names external endpoints, so including them would cause
+     * cross-tenant false refusals); a remote SDP naming a local endpoint is an RTP source-validation concern.
+     */
     private localMediaSdps() {
         return this.registry.list().filter(other => !this.registry.get(other.callId)?.peerDialog);
     }
@@ -1556,6 +1560,7 @@ export class SipGateway {
             return sending;
         };
         let waiting = false;
+        let respondPending = false;
         let reinvited = false;
         try {
             // I6: the ACK obligation exists from the moment the offerless re-INVITE is on the wire, so a BYE issued
@@ -1579,12 +1584,20 @@ export class SipGateway {
             const ackWait = dialog.awaitPeerAck(req.cseq, this.handoffAckTimeoutMs);
             waiting = true;
             ackWait.catch(() => undefined);
-            try {
-                await res.respond(200, { body: localOffer, headers: SDP_HEADERS });
-            } catch (err) {
-                dialog.cancelPeerAckWait(req.cseq);
-                throw err;
-            }
+            // The 200 may stall (a native command awaits write confirmation); the ACK deadline must not wait for it, so
+            // the cleanup below runs as soon as either fails. While the 200 is in flight no second final response is sent.
+            respondPending = true;
+            const responding = res
+                .respond(200, { body: localOffer, headers: SDP_HEADERS })
+                .catch(err => {
+                    dialog.cancelPeerAckWait(req.cseq);
+                    throw err;
+                })
+                .finally(() => {
+                    respondPending = false;
+                });
+            responding.catch(() => undefined);
+            await Promise.race([responding, ackWait.then(() => responding)]);
             const ackBody = await ackWait;
             this.assertLiveCall(call);
             if (!ackBody) throw new Error('Missing SDP answer in ACK');
@@ -1611,7 +1624,7 @@ export class SipGateway {
                     // A peer whose ACK failed is still ended by the BYE below (an uncertain one is fenced and never commanded).
                 }
             }
-            if (!res.finalResponseSent) await res.respond(488).catch(() => undefined);
+            if (!res.finalResponseSent && !respondPending) await res.respond(488).catch(() => undefined);
             // The peer's offer was rejected (or never answered): the legs no longer agree on media, so end the call.
             await this.byeCall(call, 'renegotiation-failed').catch(() => undefined);
         }

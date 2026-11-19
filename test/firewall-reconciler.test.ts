@@ -646,3 +646,26 @@ test('the requested-block index is computed once per newer revision, not per rem
     assert.ok(backend.calls.includes('add 10.1.0.0/16 600'), 'covering CIDR installed');
     assert.equal(computed.filter(revision => revision === 3).length, 1, `index recomputed: ${computed.join(',')}`);
 });
+
+test('a covering range that expires midway through clearing stops the clearing and restores the removed hosts', async () => {
+    let now = start;
+    const backend = new Backend();
+    const reconciler = new FirewallReconciler(backend, () => now);
+    const long = new Date(start + 600_000).toISOString();
+    const hosts = [1, 2, 3, 4, 5].map(i => ({ target: `192.0.2.${i}`, expiresAt: long }));
+    reconciler.accept(snapshot(1, hosts));
+    await reconciler.reconcile();
+    const cover = { target: '192.0.2.0/24', expiresAt: new Date(start + 10_000).toISOString() };
+    reconciler.accept(snapshot(2, [...hosts, cover]));
+    const remove = backend.remove.bind(backend);
+    let removed = 0;
+    backend.remove = async (target: string) => {
+        await remove(target);
+        // The second removal outlasts the cover's TTL.
+        if (++removed === 2) now = start + 10_000;
+    };
+    backend.calls.length = 0;
+    await reconciler.reconcile();
+    assert.deepEqual(backend.calls, ['remove 192.0.2.1', 'remove 192.0.2.2', 'add 192.0.2.1 590', 'add 192.0.2.2 590']);
+    assert.ok(!backend.calls.includes('add 192.0.2.0/24 0'));
+});

@@ -150,51 +150,56 @@ const STATIC_ENCODINGS: Record<string, string> = {
     '18': 'g729/8000'
 };
 
-/**
- * Identity of a payload type: static types are `encoding/clock`, dynamic ones `pt:encoding/clock|fmtp`. Static types (< 96) have a fixed meaning
- * (RFC 3551), so any rtpmap is ignored for them on both sides; a dynamic type unmapped in `section` takes the mapping of
- * `fallbacks` (RFC 3264 6.1: an answer keeps the meaning the offer gave a type it leaves unmapped).
- */
-function codecIdentity(section: MediaSection, pt: string, ...fallbacks: (MediaSection | undefined)[]): string {
-    if (Number(pt) < 96) return STATIC_ENCODINGS[pt] ?? `static:${pt}`;
-    const sources = [section, ...fallbacks];
-    const mapped = sources.map(source => source?.rtpmap.get(pt)).find(Boolean);
-    const fmtp = sources.map(source => source?.fmtp.get(pt)).find(value => value !== undefined) ?? '';
-    // A dynamic type is only the same codec when its number and format parameters agree (AMR 97 octet-align=0 is not 98 octet-align=1).
-    return `${pt}:${mapped ?? 'dynamic'}|${fmtp}`;
+/** Framing-relevant fmtp parameters (RFC 4867 8.3.1) that must match for AMR / AMR-WB interop, with RFC defaults. */
+const AMR_FRAMING: [string, string][] = [
+    ['octet-align', '0'],
+    ['crc', '0'],
+    ['robust-sorting', '0'],
+    ['interleaving', '']
+];
+
+interface VoiceFormat {
+    pt: string;
+    /** Lowercase `encoding/clock`. */
+    encoding: string;
+    /** Framing-relevant fmtp parameters only (empty for codecs without any). */
+    framing: string;
 }
 
-/** The set of voice-codec identities of a stream (telephone-event, CN and repair formats excluded). */
-function voiceCodecs(section: MediaSection, ...fallbacks: (MediaSection | undefined)[]): Set<string> {
-    const found = new Set<string>();
+/**
+ * The voice formats of a section. Static types (< 96) have a fixed meaning (RFC 3551), so any rtpmap is ignored for
+ * them; a dynamic type unmapped in `section` takes the mapping of `fallbacks` (RFC 3264 6.1: an answer keeps the
+ * meaning the offer gave a type it leaves unmapped). telephone-event, CN and repair formats are excluded.
+ */
+function voiceFormats(section: MediaSection, ...fallbacks: (MediaSection | undefined)[]): VoiceFormat[] {
+    const sources = [section, ...fallbacks];
+    const found: VoiceFormat[] = [];
     for (const pt of section.formats) {
         if (
-            isVoiceFormat(
+            !isVoiceFormat(
                 section,
                 pt,
                 fallbacks.find(other => other?.rtpmap.has(pt))
             )
         )
-            found.add(codecIdentity(section, pt, ...fallbacks));
+            continue;
+        const encoding =
+            Number(pt) < 96
+                ? (STATIC_ENCODINGS[pt] ?? `static:${pt}`)
+                : (sources.map(source => source?.rtpmap.get(pt)).find(Boolean) ?? `unmapped:${pt}`);
+        let framing = '';
+        if (/^amr(-wb)?\//.test(encoding)) {
+            const fmtp = sources.map(source => source?.fmtp.get(pt)).find(value => value !== undefined) ?? '';
+            const params = new Map(fmtp.split(';').map(part => part.split('=') as [string, string | undefined]));
+            framing = AMR_FRAMING.map(([key, fallback]) => `${key}=${params.get(key) ?? fallback}`).join(';');
+        }
+        found.push({ pt, encoding, framing });
     }
     return found;
 }
 
-/**
- * The voice codecs the untouched leg and the carrier negotiated on each audio stream both still use: the
- * intersection of the leg's description and the carrier's previous one.
- */
-function negotiatedVoiceCodecs(leg: string, previousRemoteSdp: string): Map<number, Set<string>> {
-    const negotiated = new Map<number, Set<string>>();
-    const before = parseMediaSections(previousRemoteSdp);
-    for (const [index, section] of parseMediaSections(leg).entries()) {
-        const other = before[index];
-        if (section.type !== 'audio' || !(section.port > 0) || !other || !(other.port > 0)) continue;
-        const theirs = voiceCodecs(other, section);
-        negotiated.set(index, new Set([...voiceCodecs(section, other)].filter(identity => theirs.has(identity))));
-    }
-    return negotiated;
-}
+/** Rollback identity: carrier payload number, encoding/clock and framing parameters. */
+const rollbackIdentity = (format: VoiceFormat) => `${format.pt}:${format.encoding}|${format.framing}`;
 
 /**
  * A rejected audio stream or an incompatible answer cannot be a successful handoff. The answer may list additional
@@ -231,9 +236,9 @@ const ANSWER_DIRECTION: Record<string, string> = {
  * payload types are allowed (RFC 3264 6.1); anything that changes the carrier's media address cannot be repaired.
  * SDES keys cannot be re-derived by the restored side: an active stream whose previous carrier description had
  * a=crypto must answer only with keys it already had.
- * The restore offer is the untouched leg's own description, so the answer's voice codecs must equal, per stream, the
- * set negotiated before (the voice codecs in both `restoreOffer` and `previousRemoteSdp`; dynamic types by number and fmtp):
- * dropping one leaves the untouched leg sending a format nobody expects, and adding one the untouched leg may not decode.
+ * The restore offer O is the untouched leg's own description. Per stream, the voice formats of the previous carrier
+ * description and of the answer, restricted to the encodings in O (anything else can never reach the untouched leg),
+ * must be the same set (payload number, encoding/clock and AMR framing parameters); other fmtp parameters are ignored.
  * Non-voice formats (telephone-event, CN) are ignored.
  */
 export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, restoreOffer: string) {
@@ -257,11 +262,20 @@ export function assertRollbackAnswer(answer: string, previousRemoteSdp: string, 
         if (media.type === 'audio') audioActive = true;
     }
     if (!audioActive) throw new Error('Rollback audio was rejected');
-    // The other leg keeps using the codecs it negotiated: the restored answer must offer exactly that voice set.
-    for (const [index, expected] of negotiatedVoiceCodecs(restoreOffer, previousRemoteSdp)) {
-        const media = answered[index];
-        if (!media || !(media.port > 0) || !expected.size) continue;
-        const actual = voiceCodecs(media, restored[index]);
+    // The untouched leg keeps using the codecs it negotiated: compare what both carrier descriptions offer within its set.
+    for (const [index, media] of answered.entries()) {
+        const offered = restored[index];
+        const before = previous[index];
+        if (media.type !== 'audio' || !(media.port > 0) || !(offered.port > 0) || !before) continue;
+        const known = new Set(voiceFormats(offered).map(format => format.encoding));
+        const within = (section: MediaSection) =>
+            new Set(
+                voiceFormats(section, offered)
+                    .filter(format => known.has(format.encoding))
+                    .map(rollbackIdentity)
+            );
+        const expected = within(before);
+        const actual = within(media);
         if (actual.size !== expected.size || [...actual].some(identity => !expected.has(identity))) {
             throw new Error('Rollback answer changed the negotiated voice codecs of the other leg');
         }
@@ -333,11 +347,22 @@ export function sharesMediaEndpoint(a: string, b: string): boolean {
     return false;
 }
 
+/** Voice encodings (with AMR framing) of `section` that `other` also carries: what the two sides negotiated. */
+function sharedVoice(section: MediaSection, other: MediaSection | undefined): Set<string> {
+    const theirs = new Set(other ? voiceFormats(other, section).map(format => format.encoding) : []);
+    return new Set(
+        voiceFormats(section, other)
+            .filter(format => theirs.has(format.encoding))
+            .map(format => `${format.encoding}|${format.framing}`)
+    );
+}
+
 /**
  * True when `next` keeps every media parameter a peer negotiated against `previous`: address/port/protocol, direction,
- * SDES keys and voice codec identities on each stream. Anything else needs a renegotiation.
+ * SDES keys, and the voice encodings (with AMR framing) each shares with `remote` (the other side of that negotiation).
+ * A single-codec answer on the same endpoint for the codec the carrier selected needs no renegotiation.
  */
-export function preservesMediaParameters(previous: string, next: string): boolean {
+export function preservesMediaParameters(previous: string, next: string, remote: string): boolean {
     try {
         if (mediaAddressKey(previous) !== mediaAddressKey(next)) return false;
     } catch {
@@ -345,13 +370,14 @@ export function preservesMediaParameters(previous: string, next: string): boolea
     }
     const before = parseMediaSections(previous);
     const after = parseMediaSections(next);
+    const peer = parseMediaSections(remote);
     if (before.length !== after.length) return false;
     return before.every((media, index) => {
         const other = after[index];
         if (media.direction !== other.direction) return false;
         if (media.crypto.size !== other.crypto.size || [...media.crypto].some(key => !other.crypto.has(key))) return false;
-        const left = voiceCodecs(media);
-        const right = voiceCodecs(other);
+        const left = sharedVoice(media, peer[index]);
+        const right = sharedVoice(other, peer[index]);
         return left.size === right.size && [...left].every(identity => right.has(identity));
     });
 }

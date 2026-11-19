@@ -245,6 +245,9 @@ export class FirewallReconciler {
                     for (const [other] of [...this.mirror]) {
                         if (other === target || !covers(range, rangeFor(other))) continue;
                         if (stale() && latestExpiry(target) === undefined) break;
+                        // Removals can outlast the cover's TTL: once it has expired, stop clearing (the covered entries
+                        // keep their protection) and let the expired-cover path below restore what was removed.
+                        if ((stale() ? latestExpiry(target)! : expiresAt) <= this.now()) break;
                         if (await attempt('remove', other, () => this.backend.remove(other))) {
                             // Restore only what the current snapshot still requests, with the snapshot's TTL (not the mirror's).
                             const wanted = requested.get(other);

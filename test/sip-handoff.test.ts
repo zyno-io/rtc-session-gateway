@@ -12,6 +12,7 @@ import {
     assertRollbackAnswer,
     parseReferTarget,
     parseReplaces,
+    preservesMediaParameters,
     rejectSdpOffer,
     relaySdp,
     sharesMediaEndpoint,
@@ -3222,4 +3223,86 @@ test('a compact r Refer-To header is handled like refer-to', async () => {
     g.center.emit('request', request('REFER', '', 43, { r: '<sip:inbound@gateway.example>', 'refer-to': '<sip:inbound@gateway.example>' }), both);
     await settle();
     assert.ok(both.statuses.includes(400), `statuses ${both.statuses}`);
+});
+
+test('rollback codec rule: framing-relevant identity within the restore offer set (opus, extras, stereo, AMR, inbound multi-codec)', () => {
+    const opusMaps = ['a=rtpmap:111 opus/48000/2', 'a=rtpmap:101 telephone-event/48000'];
+    const rtpbridgeFmtp = 'a=fmtp:111 minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0';
+    // Outbound: the app offered `111 9 0 101`; the carrier answered `111 0 101` with its own opus fmtp; the identical rollback answer is kept.
+    const appOffer = media('10.0.0.3', 40000, '111 9 0 101', [...opusMaps, rtpbridgeFmtp, 'a=rtpmap:9 G722/8000', PCMU]);
+    const carrier = media('10.0.0.1', 30000, '111 0 101', [...opusMaps, 'a=fmtp:111 useinbandfec=1', PCMU]);
+    assertRollbackAnswer(carrier, carrier, appOffer);
+    // Formats outside the restore offer (8, 18) are ignored.
+    const pcmuOffer = media('10.0.0.3', 40000, '0 101', [PCMU, TELEPHONE_EVENT]);
+    const pcmuCarrier = media('10.0.0.1', 30000, '0 101', [PCMU, TELEPHONE_EVENT]);
+    assertRollbackAnswer(media('10.0.0.1', 30000, '0 8 18 101', [PCMU, PCMA, 'a=rtpmap:18 G729/8000', TELEPHONE_EVENT]), pcmuCarrier, pcmuOffer);
+    // opus stereo=1 vs stereo=0 between the legs is ignored, but dropping PCMU from the negotiated {opus, PCMU} ends the call.
+    const stereoOffer = media('10.0.0.3', 40000, '111 0 101', [...opusMaps, 'a=fmtp:111 stereo=1', PCMU]);
+    assertRollbackAnswer(carrier, carrier, stereoOffer);
+    assert.throws(() => assertRollbackAnswer(media('10.0.0.1', 30000, '0 101', [PCMU, TELEPHONE_EVENT]), carrier, stereoOffer), /voice codecs/);
+    // AMR: PT 97 octet-align=0 -> PT 98 octet-align=1 ends; same PT with extra mode-change-capability is kept.
+    const amr = (pt: string, fmtp: string) => media('10.0.0.1', 30000, pt, [`a=rtpmap:${pt} AMR/8000`, `a=fmtp:${pt} ${fmtp}`]);
+    const amrRestore = media('10.0.0.3', 40000, '97 98', [
+        'a=rtpmap:97 AMR/8000',
+        'a=fmtp:97 octet-align=0',
+        'a=rtpmap:98 AMR/8000',
+        'a=fmtp:98 octet-align=1'
+    ]);
+    assert.throws(() => assertRollbackAnswer(amr('98', 'octet-align=1'), amr('97', 'octet-align=0'), amrRestore), /voice codecs/);
+    assertRollbackAnswer(amr('97', 'octet-align=0; mode-change-capability=2'), amr('97', 'octet-align=0'), amrRestore);
+    assertRollbackAnswer(amr('97', ''), amr('97', 'octet-align=0'), amrRestore); // RFC default octet-align=0
+    assert.throws(() => assertRollbackAnswer(amr('97', 'octet-align=1'), amr('97', ''), amrRestore), /voice codecs/);
+    // Inbound: the carrier offered `0 8 18 101`, the app answered `0 101`: `0 101` is kept, `8 101` ends (Prev={0}, Ans={}).
+    const carrierMulti = media('10.0.0.1', 30000, '0 8 18 101', [PCMU, PCMA, 'a=rtpmap:18 G729/8000', TELEPHONE_EVENT]);
+    assertRollbackAnswer(media('10.0.0.1', 30000, '0 101', [PCMU, TELEPHONE_EVENT]), carrierMulti, pcmuOffer);
+    assert.throws(() => assertRollbackAnswer(media('10.0.0.1', 30000, '8 101', [PCMA, TELEPHONE_EVENT]), carrierMulti, pcmuOffer), /voice codecs/);
+});
+
+test('preservesMediaParameters compares what each SDP negotiated with the remote, not raw codec lists', () => {
+    const opusMaps = ['a=rtpmap:111 opus/48000/2', 'a=rtpmap:101 telephone-event/48000'];
+    const committed = media('10.0.0.3', 40000, '111 9 0 101', [...opusMaps, 'a=rtpmap:9 G722/8000', PCMU]);
+    const carrier = media('10.0.0.1', 30000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000']);
+    const single = media('10.0.0.3', 40000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000']);
+    assert.equal(preservesMediaParameters(committed, single, carrier), true);
+    const other = media('10.0.0.3', 40000, '8 101', [PCMA, TELEPHONE_EVENT]);
+    assert.equal(preservesMediaParameters(committed, other, carrier), false);
+    assert.equal(preservesMediaParameters(committed, single.replaceAll('10.0.0.3', '10.0.0.4'), carrier), false);
+});
+
+test('an app-owned Replaces restore answering the carrier-selected codec on the same endpoint needs no re-INVITE', async () => {
+    const f = await fixture();
+    const opusMaps = ['a=rtpmap:111 opus/48000/2', 'a=rtpmap:101 telephone-event/48000'];
+    f.call.localSdp = media('10.0.0.8', 48000, '111 9 0 101', [...opusMaps, 'a=rtpmap:9 G722/8000', PCMU]);
+    f.caller.remoteSdp = f.call.remoteSdp = media('10.0.0.1', 30000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000']);
+    const answers = [sdp('10.0.0.9', 49000), media('10.0.0.8', 48000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000'])];
+    f.hub.request = async () => ({ action: 'answer', sdp: answers.shift()! }) as never;
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    await f.gateway.handleInvite(
+        invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
+        response as never
+    );
+    await settle(10);
+    assert.equal(f.caller.reinvites.length, 0);
+    assert.equal(f.caller.byes, 0);
+    assert.ok(f.registry.get('caller'));
+});
+
+test('an offerless relay ACK deadline cleans up the peer even while the requester 200 is stalled', async () => {
+    const f = await handedOff({ timeout: 20 });
+    const gate = Promise.withResolvers<void>();
+    const stalled = new Response();
+    const respond = stalled.respond.bind(stalled);
+    stalled.respond = async (status, options) => {
+        if (status === 200) await gate.promise;
+        return respond(status, options);
+    };
+    f.caller.emit('request', request('INVITE', '', 43), stalled);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    assert.equal(f.center.acks.length, 2, 'the peer rejection ACK is not held behind the stalled 200');
+    assert.match(f.center.acks[1], /m=audio 0 /);
+    assert.ok(f.log.indexOf('center:ack') < f.log.indexOf('center:bye'));
+    assert.equal(f.registry.size, 0);
+    gate.resolve();
+    await settle(10);
+    assert.deepEqual(stalled.statuses, [200], 'no second final response is sent to the requester');
 });
