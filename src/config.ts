@@ -30,6 +30,7 @@ export interface GatewayConfig {
     RTPBRIDGE_REQUIRED?: boolean;
     ROUTES_REQUIRED?: boolean;
     SIP_ALLOWED_DOMAINS?: string[];
+    SIP_SHARED_MEDIA_HANDOFF_SECRET?: string;
     COTURN_URLS?: string[];
     COTURN_AUTH_SECRET?: string;
     COTURN_CREDENTIAL_TTL_SECONDS: number;
@@ -76,6 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         ROUTES_REQUIRED: readBoolean(env.ROUTES_REQUIRED, false, 'ROUTES_REQUIRED'),
         RTPBRIDGE_REQUIRED: mediaRequired,
         SIP_ALLOWED_DOMAINS: parseAllowedSipDomains(env.SIP_ALLOWED_DOMAINS_JSON),
+        SIP_SHARED_MEDIA_HANDOFF_SECRET: env.SIP_SHARED_MEDIA_HANDOFF_SECRET || undefined,
         COTURN_URLS: iceUrls,
         COTURN_AUTH_SECRET: env.COTURN_AUTH_SECRET || undefined,
         COTURN_CREDENTIAL_TTL_SECONDS: readPositiveInteger(env.COTURN_CREDENTIAL_TTL_SECONDS, 86_400, 'COTURN_CREDENTIAL_TTL_SECONDS'),

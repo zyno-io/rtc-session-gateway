@@ -1,4 +1,4 @@
-import type { SipReturnMetadata, SipTransferStatus } from './sip-handoff-contract';
+import type { SipHandoffAnswer, SipReturnMetadata, SipTransferStatus } from './sip-handoff-contract';
 
 export type SipHeaders = Record<string, string>;
 
@@ -31,7 +31,7 @@ export interface FollowUpHttpEvent {
     receivedAt: string;
 }
 
-export interface AnswerAction {
+export interface AnswerAction extends SipHandoffAnswer {
     action: 'answer';
     sdp: string;
     status?: number;
@@ -66,7 +66,21 @@ export function parseSipActionResponse(input: unknown, options?: { allowReceiver
         }
 
         const status = parseOptionalStatus(data.status, 200, 200, 'answer status');
-        return { action: 'answer', sdp: data.sdp, status, headers, receiverUrl };
+        const sharedMediaSessionId = data.sharedMediaSessionId;
+        if (sharedMediaSessionId !== undefined && (typeof sharedMediaSessionId !== 'string' || !sharedMediaSessionId.trim())) {
+            throw new InvalidHttpActionError('Invalid sharedMediaSessionId');
+        }
+        if (data.fixedCarrierMedia !== undefined && typeof data.fixedCarrierMedia !== 'boolean')
+            throw new InvalidHttpActionError('Invalid fixedCarrierMedia');
+        return {
+            action: 'answer',
+            sdp: data.sdp,
+            status,
+            headers,
+            receiverUrl,
+            ...(sharedMediaSessionId ? { sharedMediaSessionId } : {}),
+            ...(data.fixedCarrierMedia ? { fixedCarrierMedia: true } : {})
+        };
     }
 
     if (data.action === 'reject') {

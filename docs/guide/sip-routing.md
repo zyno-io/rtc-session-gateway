@@ -80,3 +80,21 @@ This gateway resolves returns only against dialogs it holds (one gateway, one
 sipbridge). In-dialog requests such as REFER must arrive on the dialog's established
 transport connection; a REFER on a new TCP connection is refused with `403`.
 See the [handoff design](../development/sip-handoff-plan.md).
+
+### Shared rtpbridge with ZynoTalk
+
+Set `SIP_SHARED_MEDIA_HANDOFF_SECRET` to the same dedicated peer secret that
+Nexus uses for the admitted Talk tenant. Both systems resolve the same
+rtpbridge registry backend ID to the same running instance. Set
+`fixedCarrierMedia: true` in the application's initial SIP answer. Include
+`sharedMediaReturnUri` on `sip.transfer` and register that
+URI as an inbound route. The transfer destination is the Talk tenant's SIP
+interconnect URI. Talk phones blind-transfer the handed-off call to the user
+part of the configured return URI.
+
+On return, `sip.invite.sharedMedia` gives the application a prepared
+`mediaSessionId`, the original `backendId` and `endpointId`, and the established
+local `sdp`. Reply with an answer containing that SDP and
+`sharedMediaSessionId` equal to the prepared media session ID. Wait for the
+correlated `sip.answered` before starting any media work. The gateway retains
+the carrier dialog and its initial SDP through both moves.

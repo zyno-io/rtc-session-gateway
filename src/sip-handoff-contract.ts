@@ -11,6 +11,8 @@ export interface SipTransferParams {
     callingName?: string;
     proxy?: string;
     auth?: { username: string; password: string };
+    /** Enable shared rtpbridge handoff and reserve this local SIP URI for return. */
+    sharedMediaReturnUri?: string;
 }
 
 export interface FinalizedSipRecording {
@@ -34,12 +36,27 @@ export interface SipTransferStatus {
     failure?: string;
 }
 
+export interface SipHandoffAnswer {
+    /** Freeze the initially negotiated carrier media on this dialog. */
+    fixedCarrierMedia?: boolean;
+    /** Acknowledge the prepared destination session on a shared media return. */
+    sharedMediaSessionId?: string;
+}
+
+export interface SharedMediaReturn {
+    backendId: string;
+    endpointId: string;
+    mediaSessionId: string;
+    sdp: string;
+}
+
 export interface SipReturnMetadata {
     logicalCallId: string;
     returning?: boolean;
     previousSessionId?: string;
     /** Unique per return attempt; echoed on that attempt's `answered` and `terminated` events. */
     returnAttemptId?: string;
+    sharedMedia?: SharedMediaReturn;
 }
 
 export function isSipTransferStatus(value: unknown): value is SipTransferStatus {

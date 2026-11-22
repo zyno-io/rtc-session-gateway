@@ -155,6 +155,7 @@ interface Context {
      * application/sdp). Undefined until the answered event arrives. sipbridge ACKs any other body itself.
      */
     answerIsSdp?: boolean;
+    finalResponse?: SipMessage;
 }
 /** sipbridge's own rule for an SDP body: one Content-Type header whose media type is application/sdp (parameters allowed). */
 export function messageCarriesSdp(message: { body: Uint8Array; headers: { name: string; value: string }[] }) {
@@ -239,6 +240,9 @@ export class NativeDialog extends EventEmitter {
      * offer: sipbridge ACKs it automatically and accepts no ACK answer. Unknown (event not seen yet) reads as false: an
      * unknown never counts as an SDP offer. Outbound setup waits for the answered event, so it is known once delivered.
      */
+    get finalResponse(): SipMessage | undefined {
+        return this.state.finalResponse;
+    }
     get answerIsSdp() {
         return this.state.answerIsSdp ?? false;
     }
@@ -764,7 +768,10 @@ export class SipbridgeSignaling extends EventEmitter {
             // open); it is kept as an ended tombstone, never refused for capacity.
             const state = this.remember(peer, client, event.snapshot, terminal ? 'force' : 'enforce', terminal);
             const { created } = this.receipt(key, fingerprint);
-            if (created && event.kind === DialogEvent_Kind.ANSWERED) state.answerIsSdp = event.message ? messageCarriesSdp(event.message) : false;
+            if (created && event.kind === DialogEvent_Kind.ANSWERED) {
+                state.answerIsSdp = event.message ? messageCarriesSdp(event.message) : false;
+                state.finalResponse = event.message;
+            }
             // The terminal flag is set in the same synchronous turn as the snapshot update, before the receipt write is
             // awaited, so isEnded never lags the snapshot.
             if (created && terminal) {

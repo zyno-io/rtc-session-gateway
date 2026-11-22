@@ -133,3 +133,29 @@ SDP, bearer tokens or raw upstream errors. Its HTTP listener binds loopback by
 default; mutation/report access requires the configured owner token. Tests against
 fixtures and its media smoke scenarios do not establish real audio/TURN/drain
 acceptance; the deployment runner must collect those separately.
+
+## Shared rtpbridge SIP handoff
+
+The application selects `fixedCarrierMedia: true` in its initial answer.
+RTC rejects later requests to renegotiate that carrier dialog. The opt-in
+`sip.transfer.sharedMediaReturnUri` mode requires that initial answer policy
+and retains the original carrier dialog and SDP. The destination dialog exchanges
+inactive SDP and a private signed handoff offer and answer. The gateway requires
+a known rtpbridge registry backend ID and moves the original RTP endpoint into
+the destination session on that backend after the destination has answered.
+Recording finalization precedes the move. The destination verifies exact
+endpoint inventory before connecting media.
+
+A return REFER is accepted from the linked destination dialog for the saved
+return URI. The gateway creates an empty session owned by the selected
+application on the original backend. The return invite gives the application
+that session ID, the original endpoint ID and the established local SDP. The
+application prepares its binding and echoes the session ID. The gateway asks the
+destination to move the endpoint by in-dialog INFO with a signed deadline
+for starting the move. An exact inventory match commits the return. After an
+ambiguous reply the gateway waits through the move window and checks inventory
+again. A verified absence preserves the Talk call. When ownership cannot be
+verified, the gateway closes both dialogs to release the call. A successful
+return registers the endpoint under the prepared session before publishing the answer event and retiring the old SIP dialog. The peer dialog
+also refuses SDP modifications. The application starts returned IVR work after
+the answer event.

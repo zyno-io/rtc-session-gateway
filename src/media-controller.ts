@@ -118,6 +118,7 @@ export interface BridgeResult {
 }
 
 export interface CreateMediaSessionParams {
+    backendId?: string;
     callId?: string;
     ownerConnectionId?: string;
 }
@@ -132,6 +133,10 @@ export interface GatewayMediaController {
         source?: { endpointId?: string; sdp: string }
     ): Promise<import('./sip-handoff-contract').FinalizedSipRecording[]>;
     releaseHandoff?(sessionId: string, token: object): void;
+    moveHandoffEndpoint?(sessionId: string, endpointId: string, targetSessionId: string): Promise<void>;
+    releaseMovedHandoffEndpoint?(sessionId: string, endpointId: string): void;
+    hasHandoffEndpoint?(sessionId: string, endpointId: string): Promise<boolean>;
+    adoptHandoffEndpoint?(sessionId: string, endpointId: string, sdp: string): Promise<void>;
     list(): MediaSessionSnapshot[];
     get(sessionId: string): MediaSessionSnapshot | undefined;
     createSession(params?: CreateMediaSessionParams): Promise<MediaSessionSnapshot>;
