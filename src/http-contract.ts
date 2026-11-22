@@ -70,8 +70,8 @@ export function parseSipActionResponse(input: unknown, options?: { allowReceiver
         if (sharedMediaSessionId !== undefined && (typeof sharedMediaSessionId !== 'string' || !sharedMediaSessionId.trim())) {
             throw new InvalidHttpActionError('Invalid sharedMediaSessionId');
         }
-        if (data.fixedCarrierMedia !== undefined && typeof data.fixedCarrierMedia !== 'boolean')
-            throw new InvalidHttpActionError('Invalid fixedCarrierMedia');
+        if (data.fixedCallerMedia !== undefined && typeof data.fixedCallerMedia !== 'boolean')
+            throw new InvalidHttpActionError('Invalid fixedCallerMedia');
         return {
             action: 'answer',
             sdp: data.sdp,
@@ -79,7 +79,7 @@ export function parseSipActionResponse(input: unknown, options?: { allowReceiver
             headers,
             receiverUrl,
             ...(sharedMediaSessionId ? { sharedMediaSessionId } : {}),
-            ...(data.fixedCarrierMedia ? { fixedCarrierMedia: true } : {})
+            ...(data.fixedCallerMedia ? { fixedCallerMedia: true } : {})
         };
     }
 

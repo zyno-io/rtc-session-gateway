@@ -11,8 +11,6 @@ export interface SipTransferParams {
     callingName?: string;
     proxy?: string;
     auth?: { username: string; password: string };
-    /** Enable shared rtpbridge handoff and reserve this local SIP URI for return. */
-    sharedMediaReturnUri?: string;
 }
 
 export interface FinalizedSipRecording {
@@ -37,8 +35,8 @@ export interface SipTransferStatus {
 }
 
 export interface SipHandoffAnswer {
-    /** Freeze the initially negotiated carrier media on this dialog. */
-    fixedCarrierMedia?: boolean;
+    /** Freeze the initial caller media and use shared rtpbridge for SIP transfers. */
+    fixedCallerMedia?: boolean;
     /** Acknowledge the prepared destination session on a shared media return. */
     sharedMediaSessionId?: string;
 }

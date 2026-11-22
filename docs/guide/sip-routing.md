@@ -89,17 +89,20 @@ allowlist on the peer using the source addresses observed on that network.
 Both systems must resolve the same rtpbridge backend ID to the same running
 instance.
 
-Set `fixedCarrierMedia: true` in the application's initial SIP answer. In
-`sip.transfer`, set `requestUri` to the peer's SIP destination and
-`sharedMediaReturnUri` to a registered inbound route on the gateway. Set
-`proxy` when the peer's trusted next hop differs from the destination host.
-The gateway pins the SIP leg to an allowlisted IP. For TLS, the peer's
-certificate must cover the pinned IP. To return the call, the peer sends an
-in-dialog REFER targeting the registered route.
+Set `fixedCallerMedia: true` in the application's initial SIP answer to use
+shared media for subsequent SIP transfers. In `sip.transfer`, set
+`requestUri` to the peer's SIP destination. Set `proxy` when the peer's trusted
+next hop differs from the destination host. The gateway pins the SIP leg to an
+allowlisted IP. For TLS, the peer's certificate must cover the pinned IP.
+
+To hand the call back, the peer sends an in-dialog REFER with the handoff
+correlation data. Use the gateway's dialog Contact for Refer-To. The gateway
+resumes the application route it saved on the call. The peer opens its own
+outbound SIP dialog for other destinations.
 
 On return, `sip.invite.sharedMedia` gives the application a prepared
 `mediaSessionId`, the original `backendId` and `endpointId`, and the established
 local `sdp`. Reply with an answer containing that SDP and
 `sharedMediaSessionId` equal to the prepared media session ID. Wait for the
 correlated `sip.answered` before starting any media work. The gateway retains
-the carrier dialog and its initial SDP through both moves.
+the caller dialog and its initial SDP through both moves.

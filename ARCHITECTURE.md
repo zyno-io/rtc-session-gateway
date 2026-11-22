@@ -136,11 +136,10 @@ acceptance; the deployment runner must collect those separately.
 
 ## Shared rtpbridge SIP handoff
 
-The application selects `fixedCarrierMedia: true` in its initial answer.
-RTC rejects later requests to renegotiate that carrier dialog. The opt-in
-`sip.transfer.sharedMediaReturnUri` mode requires that initial answer policy
-and retains the original carrier dialog and SDP. The destination dialog exchanges
-inactive SDP and private handoff metadata. The gateway resolves the SIP next
+The application selects `fixedCallerMedia: true` in its initial answer.
+RTC rejects later requests to renegotiate that caller dialog and uses shared
+media for its SIP transfers. The destination dialog exchanges inactive SDP
+and private handoff metadata. The gateway resolves the SIP next
 hop and pins the outbound flow to a numeric address in the configured peer
 subnet. In-dialog return requests require a source in that allowlist and the
 matching peer dialog and handoff nonce. The gateway requires
@@ -149,9 +148,10 @@ the destination session on that backend after the destination has answered.
 Recording finalization precedes the move. The destination verifies exact
 endpoint inventory before connecting media.
 
-A return REFER is accepted from the linked destination dialog for the saved
-return URI. The gateway creates an empty session owned by the selected
-application on the original backend. The return invite gives the application
+A return REFER from the linked destination dialog resumes the saved
+application route. The gateway validates the SIP Refer-To field and chooses
+the current owner of the saved route. The gateway creates an empty session
+owned by that application on the original backend. The return invite gives the application
 that session ID, the original endpoint ID and the established local SDP. The
 application prepares its binding and echoes the session ID. The gateway asks the
 destination to move the endpoint by in-dialog INFO with a deadline

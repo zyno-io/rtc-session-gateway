@@ -7,7 +7,6 @@ export interface SharedMediaOffer {
     nonce: string;
     backendId: string;
     endpointId: string;
-    returnUri: string;
 }
 
 export function sipTarget(uri: string): string | undefined {
@@ -37,12 +36,12 @@ export function readHandoff(kind: HandoffMessage, value: string | undefined, fie
 }
 
 export function readSharedOffer(header: string, requestUri: string): SharedMediaOffer | undefined {
-    const fields = readHandoff('offer', header, 6);
+    const fields = readHandoff('offer', header, 5);
     if (!fields) return;
-    const [nonce, backendId, endpointId, returnUri, target, timestamp] = fields;
-    if (!tokenPattern.test(nonce) || !tokenPattern.test(backendId) || !tokenPattern.test(endpointId) || !sipTarget(returnUri)) return;
+    const [nonce, backendId, endpointId, target, timestamp] = fields;
+    if (!tokenPattern.test(nonce) || !tokenPattern.test(backendId) || !tokenPattern.test(endpointId)) return;
     if (target !== sipTarget(requestUri) || !/^\d{13}$/.test(timestamp) || Math.abs(Date.now() - Number(timestamp)) > 45000) return;
-    return { nonce, backendId, endpointId, returnUri };
+    return { nonce, backendId, endpointId };
 }
 
 export function isHandoffToken(value: string | undefined): value is string {

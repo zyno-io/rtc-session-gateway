@@ -188,7 +188,6 @@ export class SessionCommandHandler {
                 mediaSessionId: requiredString(body.mediaSessionId, 'mediaSessionId'),
                 requestUri: requiredString(body.requestUri, 'requestUri'),
                 transferId,
-                sharedMediaReturnUri: optionalString(body.sharedMediaReturnUri, 'sharedMediaReturnUri'),
                 headers: parseOptionalHeaders(body.headers),
                 callingNumber: optionalString(body.callingNumber, 'callingNumber'),
                 callingName: optionalString(body.callingName, 'callingName'),

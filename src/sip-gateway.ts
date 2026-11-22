@@ -128,7 +128,7 @@ export class SipGateway {
     private transferRequests = new WeakMap<ActiveCall, PendingOutboundSipCall>();
     /** Calls with a cross-leg SDP operation in flight; at most one per call (I2). Keyed by instance: a reused callId is a different call. */
     private modifyingPairs = new Set<ActiveCall>();
-    private readonly fixedCarrierMedia = new WeakSet<ActiveCall>();
+    private readonly fixedCallerMedia = new WeakSet<ActiveCall>();
     private readonly sharedHandoffs = new WeakMap<ActiveCall, SharedMediaOffer>();
     /** Pairs whose lock outlives the REFER handler: held until a detached final NOTIFY settles. */
     private retainedPairLocks = new Set<ActiveCall>();
@@ -332,7 +332,7 @@ export class SipGateway {
             }
             replacing = match.call;
             replacedDialog = current.dialog;
-            if (this.fixedCarrierMedia.has(replacing)) {
+            if (this.fixedCallerMedia.has(replacing)) {
                 await res.respond(488);
                 return;
             }
@@ -484,7 +484,7 @@ export class SipGateway {
                 dialog
             });
 
-            if (action.fixedCarrierMedia) this.fixedCarrierMedia.add(call);
+            if (action.fixedCallerMedia) this.fixedCallerMedia.add(call);
             this.bindDialog(call);
             answeredDialog = undefined;
             // The call now holds the endpoint through its committed SDP; the owner-less claim would only block a transfer
@@ -889,7 +889,7 @@ export class SipGateway {
         const call = this.registry.get(callId);
         if (!call) throw new CallNotFoundError(`Call ${callId} not found`);
         if (call.ownership && call.ownership !== 'application') throw new SipOperationConflictError('Call is owned by a SIP handoff');
-        if (this.fixedCarrierMedia.has(call)) throw new SipOperationConflictError('Shared handoff requires fixed carrier media');
+        if (this.fixedCallerMedia.has(call)) throw new SipOperationConflictError('Shared handoff requires fixed caller media');
         if (this.modifyingPairs.has(call)) throw new SipOperationConflictError('SIP renegotiation is in progress');
         this.assertMediaUnreserved(sdp, call);
         this.modifyingPairs.add(call);
@@ -910,9 +910,9 @@ export class SipGateway {
     }
 
     /**
-     * Hands an established application call to an external SIP destination. The destination is dialed offerless
-     * (late offer), recording is stopped, the carrier is re-INVITEd with the destination's offer and the destination
-     * is ACKed with the carrier's answer. The gateway then keeps both dialogs and relays between them.
+     * Hands an established application call to a SIP destination and retains both dialogs.
+     * Calls with fixed caller media move their endpoint on a shared rtpbridge backend.
+     * Standard transfers stop recording and exchange the late offer and answer between the two dialogs.
      */
     async transfer(params: SipTransferParams, controlConnectionId?: string): Promise<SipTransferStatus> {
         this.lifecycle?.assertAccepting();
@@ -959,11 +959,8 @@ export class SipGateway {
         }
         const sourceEndpointId = media.assertHandoffMedia(params.mediaSessionId, controlConnectionId, call.localSdp) || undefined;
         let shared: SharedMediaOffer | undefined;
-        if (params.sharedMediaReturnUri !== undefined) {
-            if (!this.fixedCarrierMedia.has(call)) throw new InvalidCallStateError('Shared handoff requires fixedCarrierMedia on the initial answer');
+        if (this.fixedCallerMedia.has(call)) {
             const backendId = media.get(params.mediaSessionId)?.backendId;
-            const returnUri = params.sharedMediaReturnUri;
-            const returnTarget = { destinationUri: stripSipUri(returnUri), destinationUser: getSipUser(returnUri) };
             if (
                 !this.config.SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS?.length ||
                 !media.moveHandoffEndpoint ||
@@ -973,16 +970,13 @@ export class SipGateway {
                 !this.config.RTC_ENDPOINTS_FILE ||
                 !backendId ||
                 !sourceEndpointId ||
-                !sipTarget(params.requestUri) ||
-                !sipTarget(returnUri) ||
-                !acceptsSipHost(returnTarget.destinationUri, this.config.SIP_ALLOWED_DOMAINS) ||
-                (!this.controlHub?.findRoute(returnTarget) && !matchRoute(this.config.ROUTES, returnTarget))
+                !sipTarget(params.requestUri)
             )
-                throw new InvalidCallStateError('Shared handoff requires a peer allowlist, shared registry and local return route');
+                throw new InvalidCallStateError('Shared handoff requires a peer allowlist, shared registry and SIP destination');
             if (Object.keys(params.headers ?? {}).some(name => [HANDOFF_HEADER.toLowerCase(), 'content-type', 'c'].includes(name.toLowerCase())))
                 throw new InvalidCallStateError('Shared handoff reserves its signaling headers');
-            shared = { nonce: randomUUID(), backendId, endpointId: sourceEndpointId, returnUri };
-        } else if (this.fixedCarrierMedia.has(call)) throw new InvalidCallStateError('This call requires shared media handoff');
+            shared = { nonce: randomUUID(), backendId, endpointId: sourceEndpointId };
+        }
         this.assertExclusiveMedia(call);
         // Reserved synchronously with the check above: from here until teardown completes no other call may bind to the
         // source endpoint, because the handoff destroys the media session behind it.
@@ -1136,7 +1130,6 @@ export class SipGateway {
                           shared.nonce,
                           shared.backendId,
                           shared.endpointId,
-                          shared.returnUri,
                           sipTarget(params.requestUri)!,
                           String(Date.now())
                       ])
@@ -1680,7 +1673,7 @@ export class SipGateway {
             } else if (req.method === 'UPDATE' && !req.body) {
                 // A refresh without SDP changes no media; it is answered per dialog and never relayed.
                 void res.respond(200).catch(fail);
-            } else if (this.fixedCarrierMedia.has(call)) {
+            } else if (this.fixedCallerMedia.has(call)) {
                 void res.respond(req.method === 'INVITE' || req.method === 'UPDATE' ? 488 : 405).catch(fail);
             } else if (call.peerDialog) {
                 this.handlePairedModify(call, dialog, req, res).catch(fail);
@@ -1967,7 +1960,6 @@ export class SipGateway {
             if (
                 dialog !== call.peerDialog ||
                 !this.isSharedHandoffPeer(req.source?.ip) ||
-                sipTarget(uri) !== sipTarget(shared.returnUri) ||
                 proof?.[0] !== shared.nonce ||
                 proof[1] !== shared.endpointId ||
                 proof[2] !== dialog.sipCallId ||
@@ -1978,12 +1970,14 @@ export class SipGateway {
             }
             returnToken = proof[3];
         }
-        const destinationUri = stripSipUri(uri);
+        // The shared handoff REFER resumes the retained application route.
+        const destinationUri = shared ? call.destinationUri : stripSipUri(uri);
+        const destinationUser = shared ? call.destinationUser : getSipUser(destinationUri);
         if (!acceptsSipHost(destinationUri, this.config.SIP_ALLOWED_DOMAINS)) {
             await res.respond(404);
             return;
         }
-        const routeDestination = { destinationUri, destinationUser: getSipUser(destinationUri) };
+        const routeDestination = { destinationUri, destinationUser };
         const controlRoute = this.controlHub?.findRoute(routeDestination);
         const httpRoute = matchRoute(this.config.ROUTES, routeDestination);
         if (!controlRoute && !httpRoute) {
