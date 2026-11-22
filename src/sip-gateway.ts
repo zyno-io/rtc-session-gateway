@@ -47,14 +47,14 @@ import {
     sharesMediaEndpoint,
     usesHostnameMedia
 } from './sip-sdp';
-import { sourceIp } from './firewall-address';
+import { addressRange, overlaps, sourceIp } from './firewall-address';
 import {
     HANDOFF_HEADER,
     HANDOFF_SDP,
     HANDOFF_MOVE_TIMEOUT_MS,
     isHandoffToken,
     readHandoff,
-    signHandoff,
+    encodeHandoff,
     sipTarget,
     targetSession
 } from './shared-media-handoff';
@@ -965,7 +965,7 @@ export class SipGateway {
             const returnUri = params.sharedMediaReturnUri;
             const returnTarget = { destinationUri: stripSipUri(returnUri), destinationUser: getSipUser(returnUri) };
             if (
-                !this.config.SIP_SHARED_MEDIA_HANDOFF_SECRET ||
+                !this.config.SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS?.length ||
                 !media.moveHandoffEndpoint ||
                 !media.hasHandoffEndpoint ||
                 !media.adoptHandoffEndpoint ||
@@ -978,7 +978,7 @@ export class SipGateway {
                 !acceptsSipHost(returnTarget.destinationUri, this.config.SIP_ALLOWED_DOMAINS) ||
                 (!this.controlHub?.findRoute(returnTarget) && !matchRoute(this.config.ROUTES, returnTarget))
             )
-                throw new InvalidCallStateError('Shared handoff requires an authenticated peer, shared registry and local return route');
+                throw new InvalidCallStateError('Shared handoff requires a peer allowlist, shared registry and local return route');
             if (Object.keys(params.headers ?? {}).some(name => [HANDOFF_HEADER.toLowerCase(), 'content-type', 'c'].includes(name.toLowerCase())))
                 throw new InvalidCallStateError('Shared handoff reserves its signaling headers');
             shared = { nonce: randomUUID(), backendId, endpointId: sourceEndpointId, returnUri };
@@ -1128,12 +1128,11 @@ export class SipGateway {
             else await ackDestination(rejectSdpOffer(destinationOffer));
         };
         try {
-            const secret = this.config.SIP_SHARED_MEDIA_HANDOFF_SECRET;
             const headers = shared
                 ? {
                       ...params.headers,
                       ...SDP_HEADERS,
-                      [HANDOFF_HEADER]: signHandoff(secret!, 'offer', [
+                      [HANDOFF_HEADER]: encodeHandoff('offer', [
                           shared.nonce,
                           shared.backendId,
                           shared.endpointId,
@@ -1143,11 +1142,16 @@ export class SipGateway {
                       ])
                   }
                 : params.headers;
+            const proxy = shared ? await this.sharedHandoffProxy(params.proxy ?? params.requestUri) : params.proxy;
+            if (shared) {
+                this.assertLiveCall(call);
+                if (pending.cancelRequested) throw new InvalidCallStateError('Transfer cancelled');
+            }
             attempt = this.signaling.openDialog({
                 requestUri: params.requestUri,
                 sdp: shared ? HANDOFF_SDP : '',
                 headers,
-                proxy: params.proxy,
+                proxy,
                 auth: params.auth,
                 callingNumber: params.callingNumber,
                 callingName: params.callingName
@@ -1168,11 +1172,7 @@ export class SipGateway {
             if (pending.cancelRequested) throw new InvalidCallStateError('Transfer cancelled');
             if (shared) {
                 const ready = destination.finalResponse?.headers.filter(h => h.name.toLowerCase() === HANDOFF_HEADER.toLowerCase()) ?? [];
-                const target = targetSession(
-                    readHandoff(secret!, 'ready', ready.length === 1 ? ready[0].value : undefined, 4),
-                    shared,
-                    destination.sipCallId
-                );
+                const target = targetSession(readHandoff('ready', ready.length === 1 ? ready[0].value : undefined, 4), shared, destination.sipCallId);
                 if (!target || target === params.mediaSessionId || !destination.answerIsSdp || destination.remoteSdp.trim() !== HANDOFF_SDP.trim())
                     throw new InvalidCallStateError('Destination did not prepare shared media');
                 if (!this.syncRemoteSdp(call)) throw new InvalidCallStateError('Carrier media is not yet established');
@@ -1185,7 +1185,7 @@ export class SipGateway {
                 try {
                     await media.moveHandoffEndpoint!(params.mediaSessionId, shared.endpointId, target);
                 } catch (err) {
-                    const proof = signHandoff(secret!, 'status', [shared.nonce, shared.endpointId, destination.sipCallId, target]);
+                    const proof = encodeHandoff('status', [shared.nonce, shared.endpointId, destination.sipCallId, target]);
                     const moved = await destination.request('INFO', { headers: { [HANDOFF_HEADER]: proof } }).then(
                         () => true,
                         () => false
@@ -1259,7 +1259,7 @@ export class SipGateway {
             }
             call.peerDialog = destination;
             call.peerAddress = destination.peerSource?.ip;
-            call.peerHost = call.peerAddress ? undefined : uriHost(params.proxy ?? params.requestUri);
+            call.peerHost = call.peerAddress ? undefined : uriHost(proxy ?? params.requestUri);
             if (call.peerHost) {
                 const host = call.peerHost;
                 // Recorded for later Replaces authorization so it does not depend on DNS at that moment.
@@ -1919,6 +1919,24 @@ export class SipGateway {
         }
     }
 
+    private isSharedHandoffPeer(ip: string | undefined): boolean {
+        const normalized = sourceIp(ip);
+        if (!normalized) return false;
+        const address = addressRange(normalized);
+        return this.config.SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS?.some(range => overlaps(range, address)) ?? false;
+    }
+
+    private async sharedHandoffProxy(nextHop: string): Promise<string> {
+        const target = /^(?:sips?:)?(?:[+\w.-]+@)?(\[[0-9a-f:.]+\]|[\w.-]+)(?::(\d{1,5}))?(?:;[^?\s<>]*)?$/i.exec(nextHop);
+        const port = target?.[2];
+        if (!target || (port && (+port < 1 || +port > 65535))) throw new InvalidCallStateError('Invalid shared handoff SIP next hop');
+        const host = target[1].replace(/^\[|\]$/g, '');
+        const addresses = await resolveHost(host);
+        const ip = addresses?.find(address => this.isSharedHandoffPeer(address));
+        if (!ip) throw new InvalidCallStateError('Shared handoff SIP next hop is outside the peer allowlist');
+        return `sip:${isIP(ip) === 6 ? `[${ip}]` : ip}${port ? `:${port}` : ''}`;
+    }
+
     private async handleRefer(call: ActiveCall, dialog: NativeDialog, req: IncomingSipRequest, res: SipResponse) {
         // Only a return on a handed-off call is supported; an application-owned call never accepted REFER.
         if (call.ownership === 'application') {
@@ -1945,9 +1963,10 @@ export class SipGateway {
         const shared = this.sharedHandoffs.get(call);
         let returnToken: string | undefined;
         if (shared) {
-            const proof = readHandoff(this.config.SIP_SHARED_MEDIA_HANDOFF_SECRET!, 'return', readHeader(req, HANDOFF_HEADER), 4);
+            const proof = readHandoff('return', readHeader(req, HANDOFF_HEADER), 4);
             if (
                 dialog !== call.peerDialog ||
+                !this.isSharedHandoffPeer(req.source?.ip) ||
                 sipTarget(uri) !== sipTarget(shared.returnUri) ||
                 proof?.[0] !== shared.nonce ||
                 proof[1] !== shared.endpointId ||
@@ -1992,7 +2011,7 @@ export class SipGateway {
                         'Content-Type': 'message/sipfrag',
                         ...(shared && returnToken && final
                             ? {
-                                  [HANDOFF_HEADER]: signHandoff(this.config.SIP_SHARED_MEDIA_HANDOFF_SECRET!, 'result', [
+                                  [HANDOFF_HEADER]: encodeHandoff('result', [
                                       shared.nonce,
                                       shared.endpointId,
                                       dialog.sipCallId,
@@ -2222,7 +2241,7 @@ export class SipGateway {
                 answer = offer;
                 const targetSessionId = sharedTarget.mediaSessionId;
                 const moveDeadline = Date.now() + HANDOFF_MOVE_TIMEOUT_MS;
-                const proof = signHandoff(this.config.SIP_SHARED_MEDIA_HANDOFF_SECRET!, 'move', [
+                const proof = encodeHandoff('move', [
                     shared.nonce,
                     shared.endpointId,
                     referrer.sipCallId,

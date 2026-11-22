@@ -83,14 +83,19 @@ See the [handoff design](../development/sip-handoff-plan.md).
 
 ### Shared rtpbridge handoff
 
-Configure the same dedicated secret on the SIP peer and in the gateway's
-`SIP_SHARED_MEDIA_HANDOFF_SECRET`. Both systems must resolve the same rtpbridge
-registry backend ID to the same running instance.
+Set `SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS` to the peer's dedicated SIP subnet
+or a comma-separated list of peer subnets. Configure the reciprocal
+allowlist on the peer using the source addresses observed on that network.
+Both systems must resolve the same rtpbridge backend ID to the same running
+instance.
 
 Set `fixedCarrierMedia: true` in the application's initial SIP answer. In
 `sip.transfer`, set `requestUri` to the peer's SIP destination and
-`sharedMediaReturnUri` to a registered inbound route on the gateway. To return
-the call, the peer sends an in-dialog REFER targeting that route.
+`sharedMediaReturnUri` to a registered inbound route on the gateway. Set
+`proxy` when the peer's trusted next hop differs from the destination host.
+The gateway pins the SIP leg to an allowlisted IP. For TLS, the peer's
+certificate must cover the pinned IP. To return the call, the peer sends an
+in-dialog REFER targeting the registered route.
 
 On return, `sip.invite.sharedMedia` gives the application a prepared
 `mediaSessionId`, the original `backendId` and `endpointId`, and the established

@@ -140,7 +140,10 @@ The application selects `fixedCarrierMedia: true` in its initial answer.
 RTC rejects later requests to renegotiate that carrier dialog. The opt-in
 `sip.transfer.sharedMediaReturnUri` mode requires that initial answer policy
 and retains the original carrier dialog and SDP. The destination dialog exchanges
-inactive SDP and a private signed handoff offer and answer. The gateway requires
+inactive SDP and private handoff metadata. The gateway resolves the SIP next
+hop and pins the outbound flow to a numeric address in the configured peer
+subnet. In-dialog return requests require a source in that allowlist and the
+matching peer dialog and handoff nonce. The gateway requires
 a known rtpbridge registry backend ID and moves the original RTP endpoint into
 the destination session on that backend after the destination has answered.
 Recording finalization precedes the move. The destination verifies exact
@@ -151,11 +154,11 @@ return URI. The gateway creates an empty session owned by the selected
 application on the original backend. The return invite gives the application
 that session ID, the original endpoint ID and the established local SDP. The
 application prepares its binding and echoes the session ID. The gateway asks the
-destination to move the endpoint by in-dialog INFO with a signed deadline
+destination to move the endpoint by in-dialog INFO with a deadline
 for starting the move. An exact inventory match commits the return. After an
 ambiguous reply the gateway waits through the move window and checks inventory
-again. A verified absence preserves the Talk call. When ownership cannot be
-verified, the gateway closes both dialogs to release the call. A successful
-return registers the endpoint under the prepared session before publishing the answer event and retiring the old SIP dialog. The peer dialog
-also refuses SDP modifications. The application starts returned IVR work after
-the answer event.
+again. A verified absence keeps the call on the peer. When ownership cannot
+be verified, the gateway closes both dialogs to release the call. A successful
+return registers the endpoint in the prepared session before publishing the
+answer event and retiring the peer dialog. The peer dialog also refuses SDP
+modifications. The application starts returned IVR work after the answer event.

@@ -3,11 +3,12 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { CallRegistry } from '../src/call-registry';
+import { addressRange } from '../src/firewall-address';
 import { InvalidHttpActionError } from '../src/http-contract';
 import { GatewayLifecycle } from '../src/gateway-lifecycle';
 import { controlErrorForCommand } from '../src/session-commands';
 import { SipGateway, SipOperationConflictError } from '../src/sip-gateway';
-import { HANDOFF_HEADER, HANDOFF_SDP, readHandoff, readSharedOffer, signHandoff } from '../src/shared-media-handoff';
+import { HANDOFF_HEADER, HANDOFF_SDP, readHandoff, readSharedOffer, encodeHandoff } from '../src/shared-media-handoff';
 import { isSipTransferStatus } from '../src/sip-handoff-contract';
 import {
     assertDirectMediaAnswer,
@@ -203,10 +204,11 @@ function invite(headers: Record<string, string> = {}, callId = 'caller', address
     };
 }
 
-function request(method: string, body = '', cseq = 42, headers: Record<string, string> = {}) {
+function request(method: string, body = '', cseq = 42, headers: Record<string, string> = {}, sourceIp?: string) {
     const all: Record<string, string> = { cseq: `${cseq} ${method}`, ...(body ? { 'content-type': 'application/sdp' } : {}), ...headers };
     return {
         method,
+        ...(sourceIp ? { source: { ip: sourceIp, port: 5070, transport: 'tcp' } } : {}),
         uri: 'sip:inbound@gateway.example',
         callId: 'x',
         body,
@@ -219,7 +221,7 @@ function request(method: string, body = '', cseq = 42, headers: Record<string, s
 async function fixture(
     options: {
         timeout?: number;
-        sharedSecret?: string;
+        sharedPeers?: boolean;
         lifecycle?: GatewayLifecycle;
         firewall?: SipFirewall;
         centerAddress?: string;
@@ -270,7 +272,7 @@ async function fixture(
             return {
                 action: 'answer',
                 sdp: sdp('10.0.0.3'),
-                ...(options.sharedSecret ? { fixedCarrierMedia: true } : {})
+                ...(options.sharedPeers ? { fixedCarrierMedia: true } : {})
             };
         },
         sendEvent(_id: string, event: unknown) {
@@ -355,7 +357,7 @@ async function fixture(
             SIP_ALLOWED_DOMAINS: ['gateway.example'],
             ROUTES: [],
             EVENT_HTTP_TIMEOUT_MS: 1000,
-            ...(options.sharedSecret ? { SIP_SHARED_MEDIA_HANDOFF_SECRET: options.sharedSecret, RTC_ENDPOINTS_FILE: 'fixture' } : {})
+            ...(options.sharedPeers ? { SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS: [addressRange('10.0.0.0/24')], RTC_ENDPOINTS_FILE: 'fixture' } : {})
         } as never,
         registry,
         {
@@ -4890,37 +4892,37 @@ test('a WS-owned call sip.bye is not delayed by an HTTP return owner return-fail
 });
 
 test('shared handoff moves the same endpoint both ways while retaining the initial carrier SDP', async () => {
-    const secret = 'dedicated-peer-test-secret';
-    const f = await fixture({ sharedSecret: secret });
+    const f = await fixture({ sharedPeers: true });
     const returnUri = 'sip:inbound@gateway.example';
     const carrierSdp = f.call.localSdp;
     let returnProof = '';
     const returned = Promise.withResolvers<void>();
     f.delayDial(async () => {
-        const opened = f.opened[0] as { sdp: string; headers: Record<string, string> };
+        const opened = f.opened[0] as { sdp: string; proxy: string; headers: Record<string, string> };
         assert.equal(opened.sdp, HANDOFF_SDP);
-        const shared = readSharedOffer(secret, opened.headers[HANDOFF_HEADER], f.params.requestUri);
+        assert.equal(opened.proxy, 'sip:10.0.0.2:5070');
+        const shared = readSharedOffer(opened.headers[HANDOFF_HEADER], f.params.requestUri);
         assert.ok(shared);
         assert.equal(shared.backendId, 'media-a');
         assert.equal(shared.endpointId, 'endpoint-a');
         f.center.remoteSdp = HANDOFF_SDP;
         f.center.finalResponse = {
-            headers: [{ name: HANDOFF_HEADER, value: signHandoff(secret, 'ready', [shared.nonce, shared.endpointId, 'center', 'talk-session']) }]
+            headers: [{ name: HANDOFF_HEADER, value: encodeHandoff('ready', [shared.nonce, shared.endpointId, 'center', 'talk-session']) }]
         };
-        returnProof = signHandoff(secret, 'return', [shared.nonce, shared.endpointId, 'center', 'return-ticket']);
+        returnProof = encodeHandoff('return', [shared.nonce, shared.endpointId, 'center', 'return-ticket']);
         f.center.requestHook = (method, headers) => {
-            if (method === 'NOTIFY' && readHandoff(secret, 'result', headers?.[HANDOFF_HEADER], 5)?.[4] === '200') {
+            if (method === 'NOTIFY' && readHandoff('result', headers?.[HANDOFF_HEADER], 5)?.[4] === '200') {
                 returned.resolve();
             }
             if (method !== 'INFO') return;
-            const move = readHandoff(secret, 'move', headers?.[HANDOFF_HEADER], 6);
+            const move = readHandoff('move', headers?.[HANDOFF_HEADER], 6);
             assert.deepEqual(move?.slice(0, 5), [shared.nonce, shared.endpointId, 'center', 'return-session', 'return-ticket']);
             assert.ok(Number(move?.[5]) > Date.now());
             f.moveBack();
             throw new NativeOperationError('INFO response lost', false, false, 0, false, true);
         };
     });
-    const status = await f.gateway.transfer({ ...f.params, sharedMediaReturnUri: returnUri }, 'app');
+    const status = await f.gateway.transfer({ ...f.params, sharedMediaReturnUri: returnUri, proxy: 'sip:10.0.0.2:5070' }, 'app');
     assert.equal(status.state, 'completed');
     assert.deepEqual(f.log, ['stop-recording', 'move-to-talk', 'delete-media']);
 
@@ -4944,8 +4946,15 @@ test('shared handoff moves the same endpoint both ways while retaining the initi
         });
         return { action: 'answer', sdp: returned.sharedMedia.sdp, sharedMediaSessionId: 'return-session' };
     };
+    const referHeaders = { 'refer-to': `<${returnUri}>`, [HANDOFF_HEADER.toLowerCase()]: returnProof };
+    const outsidePeer = new Response();
+    f.center.emit('request', request('REFER', '', 43, referHeaders, '192.0.2.10'), outsidePeer);
+    await turn();
+    assert.equal(outsidePeer.status, 403);
+    assert.equal(f.call.ownership, 'handed-off');
+
     const refer = new Response();
-    f.center.emit('request', request('REFER', '', 43, { 'refer-to': `<${returnUri}>`, [HANDOFF_HEADER.toLowerCase()]: returnProof }), refer);
+    f.center.emit('request', request('REFER', '', 44, referHeaders, '10.0.0.2'), refer);
     await returned.promise;
     assert.equal(refer.status, 202);
     assert.equal(f.call.ownership, 'application');
@@ -4955,19 +4964,29 @@ test('shared handoff moves the same endpoint both ways while retaining the initi
     assert.ok(f.log.includes('adopt-on-return'));
     assert.ok(f.log.includes('center:notify-200'));
     const final = f.center.requests.find(entry => entry.method === 'NOTIFY' && entry.body?.includes('200 OK'));
-    const proof = readHandoff(secret, 'result', final?.headers?.[HANDOFF_HEADER], 5);
+    const proof = readHandoff('result', final?.headers?.[HANDOFF_HEADER], 5);
     assert.deepEqual(proof?.slice(1), ['endpoint-a', 'center', 'return-ticket', '200']);
     await assert.rejects(f.gateway.reinvite('caller', sdp('10.0.0.4')), /fixed carrier media/);
 });
 
-test('shared handoff rejects an unsigned peer answer before stopping recording or moving media', async () => {
-    const f = await fixture({ sharedSecret: 'dedicated-peer-test-secret' });
+test('shared handoff rejects an answer without the prepared media session before stopping recording or moving media', async () => {
+    const f = await fixture({ sharedPeers: true });
     f.center.remoteSdp = HANDOFF_SDP;
     await assert.rejects(
-        f.gateway.transfer({ ...f.params, sharedMediaReturnUri: 'sip:inbound@gateway.example' }, 'app'),
+        f.gateway.transfer({ ...f.params, sharedMediaReturnUri: 'sip:inbound@gateway.example', proxy: 'sip:10.0.0.2' }, 'app'),
         /Destination did not prepare shared media/
     );
     assert.equal(f.call.ownership, 'application');
     assert.deepEqual(f.log, ['center:bye']);
     assert.deepEqual(f.caller.reinvites, []);
+});
+
+test('shared handoff refuses an outbound SIP next hop outside the peer subnet', async () => {
+    const f = await fixture({ sharedPeers: true });
+    await assert.rejects(
+        f.gateway.transfer({ ...f.params, sharedMediaReturnUri: 'sip:inbound@gateway.example', proxy: 'sip:192.0.2.10' }, 'app'),
+        /outside the peer allowlist/
+    );
+    assert.equal(f.dials(), 0);
+    assert.equal(f.call.ownership, 'application');
 });
