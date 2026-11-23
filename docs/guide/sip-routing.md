@@ -95,9 +95,9 @@ shared media for subsequent SIP transfers. In `sip.transfer`, set
 next hop differs from the destination host. The gateway pins the SIP leg to an
 allowlisted IP. For TLS, the peer's certificate must cover the pinned IP.
 
-To hand the call back, the peer sends an in-dialog REFER using the gateway's
-dialog Contact for Refer-To. The gateway resumes the application route it
-saved on the call. Once the application accepts the prepared session, the
+To hand the call back, the peer sends an in-dialog REFER with a SIP
+Refer-To URI. The gateway resumes the application route it saved on the
+call. Once the application accepts the prepared session, the
 gateway returns a 202 with the endpoint, target session and move deadline.
 The peer moves the endpoint from its own session. The gateway confirms
 arrival through rtpbridge inventory and reports the result by NOTIFY. The
