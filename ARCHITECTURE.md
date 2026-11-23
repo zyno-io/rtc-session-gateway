@@ -153,11 +153,12 @@ application route. The gateway validates the SIP Refer-To field and chooses
 the current owner of the saved route. The gateway creates an empty session
 owned by that application on the original backend. The return invite gives the application
 that session ID, the original endpoint ID and the established local SDP. The
-application prepares its binding and echoes the session ID. The gateway asks the
-destination to move the endpoint by in-dialog INFO. The INFO carries the
-handoff identity, the REFER CSeq and a deadline for starting the move.
+application prepares its binding and echoes the session ID. The gateway then
+accepts the REFER with a 202 carrying the handoff identity, prepared session ID
+and deadline for starting the move. A setup failure before acceptance receives
+a non-2xx final response. The peer moves the endpoint from its own session.
 An exact inventory match commits the return and the REFER NOTIFY reports
-the outcome with that CSeq as its Event id. After an
+the outcome with the REFER CSeq as its Event id. After an
 ambiguous reply the gateway waits through the move window and checks inventory
 again. A verified absence keeps the call on the peer. When ownership cannot
 be verified, the gateway closes both dialogs to release the call. A successful

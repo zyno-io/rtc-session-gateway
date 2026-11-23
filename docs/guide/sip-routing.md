@@ -97,9 +97,11 @@ allowlisted IP. For TLS, the peer's certificate must cover the pinned IP.
 
 To hand the call back, the peer sends an in-dialog REFER using the gateway's
 dialog Contact for Refer-To. The gateway resumes the application route it
-saved on the call. The subsequent media-move INFO identifies the endpoint,
-target session and REFER CSeq. The peer opens its own outbound SIP dialog
-for other destinations.
+saved on the call. Once the application accepts the prepared session, the
+gateway returns a 202 with the endpoint, target session and move deadline.
+The peer moves the endpoint from its own session. The gateway confirms
+arrival through rtpbridge inventory and reports the result by NOTIFY. The
+peer opens its own outbound SIP dialog for other destinations.
 
 On return, `sip.invite.sharedMedia` gives the application a prepared
 `mediaSessionId`, the original `backendId` and `endpointId`, and the established

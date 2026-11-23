@@ -4895,6 +4895,7 @@ test('shared handoff resumes the saved route and moves the same endpoint without
     const f = await fixture({ sharedPeers: true });
     const referTarget = 'sip:rtc@private-sip.example:5080;transport=tcp';
     const callerSdp = f.call.localSdp;
+    let nonce: string | undefined;
     const returned = Promise.withResolvers<void>();
     f.delayDial(async () => {
         const opened = f.opened[0] as { sdp: string; proxy: string; headers: Record<string, string> };
@@ -4904,20 +4905,13 @@ test('shared handoff resumes the saved route and moves the same endpoint without
         assert.ok(shared);
         assert.equal(shared.backendId, 'media-a');
         assert.equal(shared.endpointId, 'endpoint-a');
+        nonce = shared.nonce;
         f.center.remoteSdp = HANDOFF_SDP;
         f.center.finalResponse = {
             headers: [{ name: HANDOFF_HEADER, value: encodeHandoff('ready', [shared.nonce, shared.endpointId, 'center', 'talk-session']) }]
         };
-        f.center.requestHook = (method, headers, body) => {
-            if (method === 'NOTIFY' && body?.includes('200 OK')) {
-                returned.resolve();
-            }
-            if (method !== 'INFO') return;
-            const move = readHandoff('move', headers?.[HANDOFF_HEADER], 6);
-            assert.deepEqual(move?.slice(0, 5), [shared.nonce, shared.endpointId, 'center', 'return-session', '44']);
-            assert.ok(Number(move?.[5]) > Date.now());
-            f.moveBack();
-            throw new NativeOperationError('INFO response lost', false, false, 0, false, true);
+        f.center.requestHook = (method, _headers, body) => {
+            if (method === 'NOTIFY' && body?.includes('200 OK')) returned.resolve();
         };
     });
     const status = await f.gateway.transfer({ ...f.params, proxy: 'sip:10.0.0.2:5070' }, 'app');
@@ -4934,6 +4928,7 @@ test('shared handoff resumes the saved route and moves the same endpoint without
     assert.equal(callerRefer.status, 403);
     assert.equal(f.call.ownership, 'handed-off');
 
+    let appAccepts = false;
     f.hub.request = async (_id, method, params) => {
         f.requests.push({ method, params });
         const returned = params as {
@@ -4949,7 +4944,9 @@ test('shared handoff resumes the saved route and moves the same endpoint without
             endpointId: 'endpoint-a',
             sdp: callerSdp
         });
-        return { action: 'answer', sdp: returned.sharedMedia.sdp, sharedMediaSessionId: 'return-session' };
+        return appAccepts
+            ? { action: 'answer', sdp: returned.sharedMedia.sdp, sharedMediaSessionId: 'return-session' }
+            : { action: 'reject', status: 486 };
     };
     const outsidePeer = new Response();
     f.center.emit('request', request('REFER', '', 43, referHeaders, '192.0.2.10'), outsidePeer);
@@ -4957,8 +4954,26 @@ test('shared handoff resumes the saved route and moves the same endpoint without
     assert.equal(outsidePeer.status, 403);
     assert.equal(f.call.ownership, 'handed-off');
 
+    const declined = new Response();
+    f.center.emit('request', request('REFER', '', 44, referHeaders, '10.0.0.2'), declined);
+    await turn();
+    assert.equal(declined.status, 503);
+    assert.equal(declined.options?.headers?.[HANDOFF_HEADER], undefined);
+    assert.equal(f.call.ownership, 'handed-off');
+    assert.equal(f.center.requests.filter(entry => entry.method === 'NOTIFY').length, 0);
+
+    appAccepts = true;
     const refer = new Response();
-    f.center.emit('request', request('REFER', '', 44, referHeaders, '10.0.0.2'), refer);
+    const respond = refer.respond.bind(refer);
+    refer.respond = async (status, options) => {
+        assert.equal(status, 202);
+        const move = readHandoff('move', options?.headers?.[HANDOFF_HEADER], 5);
+        assert.deepEqual(move?.slice(0, 4), [nonce, 'endpoint-a', 'center', 'return-session']);
+        assert.ok(Number(move?.[4]) > Date.now());
+        await respond(status, options);
+        f.moveBack();
+    };
+    f.center.emit('request', request('REFER', '', 45, referHeaders, '10.0.0.2'), refer);
     await returned.promise;
     assert.equal(refer.status, 202);
     assert.equal(f.call.ownership, 'application');
@@ -4969,9 +4984,46 @@ test('shared handoff resumes the saved route and moves the same endpoint without
     assert.ok(f.log.includes('adopt-on-return'));
     assert.ok(f.log.includes('center:notify-200'));
     const final = f.center.requests.find(entry => entry.method === 'NOTIFY' && entry.body?.includes('200 OK'));
-    assert.equal(final?.headers?.Event, 'refer;id=44');
+    assert.equal(final?.headers?.Event, 'refer;id=45');
     assert.equal(final?.headers?.[HANDOFF_HEADER], undefined);
+    assert.equal(f.center.requests.filter(entry => entry.method === 'INFO').length, 0);
     await assert.rejects(f.gateway.reinvite('caller', sdp('10.0.0.4')), /fixed caller media/);
+});
+
+test('shared handback commits when the peer received the 202 but its native send receipt was lost', async () => {
+    const f = await fixture({ sharedPeers: true });
+    f.delayDial(async () => {
+        const opened = f.opened[0] as { headers: Record<string, string> };
+        const offer = readSharedOffer(opened.headers[HANDOFF_HEADER], f.params.requestUri);
+        assert.ok(offer);
+        f.center.remoteSdp = HANDOFF_SDP;
+        f.center.finalResponse = {
+            headers: [{ name: HANDOFF_HEADER, value: encodeHandoff('ready', [offer.nonce, offer.endpointId, 'center', 'talk-session']) }]
+        };
+    });
+    const status = await f.gateway.transfer({ ...f.params, proxy: 'sip:10.0.0.2' }, 'app');
+    assert.equal(status.state, 'completed');
+
+    f.hub.request = async () => ({ action: 'answer', sdp: f.call.localSdp, sharedMediaSessionId: 'return-session' });
+    const answered = Promise.withResolvers<void>();
+    const sendEvent = f.hub.sendEvent;
+    f.hub.sendEvent = (owner, event) => {
+        if ((event as { event?: string }).event === 'sip.answered') answered.resolve();
+        return sendEvent(owner, event);
+    };
+    const response = new Response();
+    response.respond = async (status, options) => {
+        assert.equal(status, 202);
+        assert.ok(readHandoff('move', options?.headers?.[HANDOFF_HEADER], 5));
+        f.moveBack();
+        f.center.fence();
+        throw new NativeOperationError('REFER send receipt lost', true);
+    };
+    f.center.emit('request', request('REFER', '', 42, { 'refer-to': '<sip:rtc@private-sip.example>' }, '10.0.0.2'), response);
+    await answered.promise;
+    assert.equal(f.call.ownership, 'application');
+    assert.deepEqual(f.caller.reinvites, []);
+    assert.ok(f.log.includes('adopt-on-return'));
 });
 
 test('shared handoff rejects an answer without the prepared media session before stopping recording or moving media', async () => {

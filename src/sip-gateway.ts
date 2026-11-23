@@ -1971,10 +1971,11 @@ export class SipGateway {
         // RFC 4488: suppression is only in effect when the 202 echoes `Refer-Sub: false`; otherwise NOTIFYs must be sent.
         const suppressNotify = readHeader(req, 'refer-sub')?.split(';')[0].trim().toLowerCase() === 'false';
         let subscriptionGone = false;
+        let accepted = false;
         let progress: Promise<void> | undefined;
         const notify = async (status: number, final: boolean) => {
             if (final) await progress?.catch(() => undefined);
-            if (subscriptionGone || suppressNotify || dialog.isFenced || dialog.isEnded) return;
+            if (!accepted || subscriptionGone || suppressNotify || dialog.isFenced || dialog.isEnded) return;
             const send = () =>
                 dialog.request('NOTIFY', {
                     headers: {
@@ -1995,6 +1996,12 @@ export class SipGateway {
                     if (err instanceof NativeOperationError && (err.sipStatus >= 300 || err.uncertain || err.completed)) subscriptionGone = true;
                 });
         };
+        const accept = async (headers?: SipHeaders) => {
+            const responseHeaders = suppressNotify ? { ...headers, 'Refer-Sub': 'false' } : headers;
+            await res.respond(202, responseHeaders ? { headers: responseHeaders } : undefined);
+            accepted = true;
+            progress = notify(100, false);
+        };
         const returning = call.ownership === 'handed-off';
         // I1: the return claim is synchronous with the ownership check above.
         if (returning) {
@@ -2002,7 +2009,7 @@ export class SipGateway {
             this.modifyingPairs.add(call);
         }
         try {
-            await res.respond(202, suppressNotify ? { headers: { 'Refer-Sub': 'false' } } : undefined);
+            if (!shared) await accept();
         } catch (err) {
             if (returning) {
                 // An UNKNOWN 202 fences the referring leg (I5): the pair cannot be kept, so the call ends. bye() takes the
@@ -2035,9 +2042,25 @@ export class SipGateway {
             }
             throw err;
         }
-        progress = notify(100, false);
+        const sharedRefer = shared
+            ? {
+                  accept,
+                  reject: async () => {
+                      if (!accepted && !res.finalResponseSent && !dialog.isFenced && !dialog.isEnded) await res.respond(503).catch(() => undefined);
+                  }
+              }
+            : undefined;
         try {
-            await this.returnToApplication(call, notify, dialog, destinationUri, routeDestination.destinationUser, controlRoute, httpRoute, req.cseq);
+            await this.returnToApplication(
+                call,
+                notify,
+                dialog,
+                destinationUri,
+                routeDestination.destinationUser,
+                controlRoute,
+                httpRoute,
+                sharedRefer
+            );
         } finally {
             if (!this.retainedPairLocks.has(call)) this.modifyingPairs.delete(call);
         }
@@ -2065,7 +2088,7 @@ export class SipGateway {
         destinationUser: string | undefined,
         initialControlRoute: ReturnType<ControlHub['findRoute']>,
         initialHttpRoute: ReturnType<typeof matchRoute>,
-        referCseq: number
+        sharedRefer?: { accept(headers: SipHeaders): Promise<void>; reject(): Promise<void> }
     ) {
         let controlRoute = initialControlRoute;
         let httpRoute = initialHttpRoute;
@@ -2121,8 +2144,7 @@ export class SipGateway {
         try {
             const offer = previousRemoteSdp;
             if (!offer) throw new InvalidCallStateError('Caller has no media description');
-            // The 202 await let the carrier hang up (the end handler already removed the call and told its owner sip.bye):
-            // a dead call is never offered to the application, so it can never see an invite after a bye.
+            // A dead call is never offered to the application, so it can never see an invite after a bye.
             this.assertLiveCall(call);
             if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             const routeDestination = { destinationUri, destinationUser };
@@ -2186,34 +2208,31 @@ export class SipGateway {
                 throw new InvalidCallStateError('Return owner no longer holds the route');
             if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             let answer: string;
-            if (shared && sharedTarget) {
-                if (action.sharedMediaSessionId !== sharedTarget.mediaSessionId || action.sdp !== sharedTarget.sdp || referrer !== call.peerDialog)
+            if (shared) {
+                if (
+                    !sharedTarget ||
+                    !sharedRefer ||
+                    action.sharedMediaSessionId !== sharedTarget.mediaSessionId ||
+                    action.sdp !== sharedTarget.sdp ||
+                    referrer !== call.peerDialog
+                )
                     throw new InvalidCallStateError('Application did not prepare shared media return');
                 localSdp = sharedTarget.sdp;
                 answer = offer;
                 const targetSessionId = sharedTarget.mediaSessionId;
                 const moveDeadline = Date.now() + HANDOFF_MOVE_TIMEOUT_MS;
-                const proof = encodeHandoff('move', [
-                    shared.nonce,
-                    shared.endpointId,
-                    referrer.sipCallId,
-                    targetSessionId,
-                    String(referCseq),
-                    String(moveDeadline)
-                ]);
+                const proof = encodeHandoff('move', [shared.nonce, shared.endpointId, referrer.sipCallId, targetSessionId, String(moveDeadline)]);
                 sharedMoveAtRisk = true;
-                let moveError: unknown;
-                let moveAcknowledged = false;
+                let responseError: NativeOperationError | undefined;
                 try {
-                    await referrer.request('INFO', { headers: { [HANDOFF_HEADER]: proof } });
-                    moveAcknowledged = true;
+                    await sharedRefer.accept({ [HANDOFF_HEADER]: proof });
                 } catch (err) {
-                    // Nexus sends 409 only before it dispatches endpoint.transfer for this attempt.
-                    if (err instanceof NativeOperationError && err.completed && err.sipStatus === 409) {
+                    // A lost native receipt can still mean the peer received the move authorization.
+                    if (!(err instanceof NativeOperationError && err.uncertain)) {
                         sharedMoveAtRisk = false;
                         throw err;
                     }
-                    moveError = err;
+                    responseError = err;
                 }
                 const inventoryDeadline = moveDeadline + HANDOFF_MOVE_TIMEOUT_MS;
                 while (true) {
@@ -2222,8 +2241,8 @@ export class SipGateway {
                     if (arrived) break;
                     this.assertLiveCall(call);
                     if (observedAt >= inventoryDeadline) {
-                        sharedMoveAtRisk = moveAcknowledged || arrived === undefined;
-                        throw moveError ?? new InvalidCallStateError('Return media could not be confirmed');
+                        sharedMoveAtRisk = arrived === undefined;
+                        throw responseError ?? new InvalidCallStateError('Return media could not be confirmed');
                     }
                     await delay(100);
                 }
@@ -2303,6 +2322,7 @@ export class SipGateway {
             sendAnswered();
         } catch (err) {
             this.logger.warn({ callId: call.callId, failure: 'return-failed' }, errorMessage(err));
+            if (sharedRefer) await sharedRefer.reject();
             if (sharedMoveAtRisk && !sharedCommitted && this.registry.get(call.callId) === call)
                 await this.byeCall(call, 'shared-media-return-aborted').catch(() => undefined);
             // A fenced carrier (UNKNOWN re-INVITE outcome) may already be on application media while the destination is
