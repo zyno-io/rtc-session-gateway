@@ -133,3 +133,35 @@ SDP, bearer tokens or raw upstream errors. Its HTTP listener binds loopback by
 default; mutation/report access requires the configured owner token. Tests against
 fixtures and its media smoke scenarios do not establish real audio/TURN/drain
 acceptance; the deployment runner must collect those separately.
+
+## Shared rtpbridge SIP handoff
+
+The application selects `fixedCallerMedia: true` in its initial answer.
+RTC rejects later requests to renegotiate that caller dialog and uses shared
+media for its SIP transfers. The destination dialog exchanges inactive SDP
+and private handoff metadata. The gateway resolves the SIP next
+hop and pins the outbound flow to a numeric address in the configured peer
+subnet. A return REFER requires a source in that allowlist and the matching
+peer dialog from the active shared media handoff. The gateway requires
+a known rtpbridge registry backend ID and moves the original RTP endpoint into
+the destination session on that backend after the destination has answered.
+Recording finalization precedes the move. The destination verifies exact
+endpoint inventory before connecting media.
+
+A return REFER from the linked destination dialog resumes the saved
+application route. The gateway validates the SIP Refer-To field and chooses
+the current owner of the saved route. The gateway creates an empty session
+owned by that application on the original backend. The return invite gives the application
+that session ID, the original endpoint ID and the established local SDP. The
+application prepares its binding and echoes the session ID. The gateway then
+accepts the REFER with a 202 carrying the handoff identity, prepared session ID
+and deadline for starting the move. A setup failure before acceptance receives
+a non-2xx final response. The peer moves the endpoint from its own session.
+An exact inventory match commits the return and the REFER NOTIFY reports
+the outcome with the REFER CSeq as its Event id. After an
+ambiguous reply the gateway waits through the move window and checks inventory
+again. A verified absence keeps the call on the peer. When ownership cannot
+be verified, the gateway closes both dialogs to release the call. A successful
+return registers the endpoint in the prepared session before publishing the
+answer event and retiring the peer dialog. The peer dialog also refuses SDP
+modifications. The application starts returned IVR work after the answer event.

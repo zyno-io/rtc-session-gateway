@@ -11,6 +11,7 @@ import {
 } from './sipbridge-signaling';
 import type { SipMessage } from './sipbridge/generated/sipbridge-control';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
@@ -46,7 +47,10 @@ import {
     sharesMediaEndpoint,
     usesHostnameMedia
 } from './sip-sdp';
-import { sourceIp } from './firewall-address';
+import { addressRange, overlaps, sourceIp } from './firewall-address';
+import { HANDOFF_HEADER, HANDOFF_SDP, HANDOFF_MOVE_TIMEOUT_MS, readHandoff, encodeHandoff, sipTarget, targetSession } from './shared-media-handoff';
+import type { SharedMediaOffer } from './shared-media-handoff';
+import type { SharedMediaReturn } from './sip-handoff-contract';
 import { acceptsSipHost, getSipUser, matchRoute, stripSipUri } from './routing';
 
 export class CallNotFoundError extends Error {}
@@ -115,6 +119,8 @@ export class SipGateway {
     private transferRequests = new WeakMap<ActiveCall, PendingOutboundSipCall>();
     /** Calls with a cross-leg SDP operation in flight; at most one per call (I2). Keyed by instance: a reused callId is a different call. */
     private modifyingPairs = new Set<ActiveCall>();
+    private readonly fixedCallerMedia = new WeakSet<ActiveCall>();
+    private readonly sharedHandoffs = new WeakMap<ActiveCall, SharedMediaOffer>();
     /** Pairs whose lock outlives the REFER handler: held until a detached final NOTIFY settles. */
     private retainedPairLocks = new Set<ActiveCall>();
     /** Local media of calls under transfer, reserved from admission through teardown: no other call may bind to it. */
@@ -317,6 +323,10 @@ export class SipGateway {
             }
             replacing = match.call;
             replacedDialog = current.dialog;
+            if (this.fixedCallerMedia.has(replacing)) {
+                await res.respond(488);
+                return;
+            }
             if (replacing.ownership === 'application') {
                 if ((selectedControlRoute?.connectionId ?? selectedHttpRoute?.url) !== (replacing.controlConnectionId ?? replacing.routeUrl)) {
                     await res.respond(403);
@@ -465,6 +475,7 @@ export class SipGateway {
                 dialog
             });
 
+            if (action.fixedCallerMedia) this.fixedCallerMedia.add(call);
             this.bindDialog(call);
             answeredDialog = undefined;
             // The call now holds the endpoint through its committed SDP; the owner-less claim would only block a transfer
@@ -869,6 +880,7 @@ export class SipGateway {
         const call = this.registry.get(callId);
         if (!call) throw new CallNotFoundError(`Call ${callId} not found`);
         if (call.ownership && call.ownership !== 'application') throw new SipOperationConflictError('Call is owned by a SIP handoff');
+        if (this.fixedCallerMedia.has(call)) throw new SipOperationConflictError('Shared handoff requires fixed caller media');
         if (this.modifyingPairs.has(call)) throw new SipOperationConflictError('SIP renegotiation is in progress');
         this.assertMediaUnreserved(sdp, call);
         this.modifyingPairs.add(call);
@@ -889,9 +901,9 @@ export class SipGateway {
     }
 
     /**
-     * Hands an established application call to an external SIP destination. The destination is dialed offerless
-     * (late offer), recording is stopped, the carrier is re-INVITEd with the destination's offer and the destination
-     * is ACKed with the carrier's answer. The gateway then keeps both dialogs and relays between them.
+     * Hands an established application call to a SIP destination and retains both dialogs.
+     * Calls with fixed caller media move their endpoint on a shared rtpbridge backend.
+     * Standard transfers stop recording and exchange the late offer and answer between the two dialogs.
      */
     async transfer(params: SipTransferParams, controlConnectionId?: string): Promise<SipTransferStatus> {
         this.lifecycle?.assertAccepting();
@@ -937,6 +949,25 @@ export class SipGateway {
             throw new SipOperationConflictError('Too many transfers have been attempted on this call');
         }
         const sourceEndpointId = media.assertHandoffMedia(params.mediaSessionId, controlConnectionId, call.localSdp) || undefined;
+        let shared: SharedMediaOffer | undefined;
+        if (this.fixedCallerMedia.has(call)) {
+            const backendId = media.get(params.mediaSessionId)?.backendId;
+            if (
+                !this.config.SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS?.length ||
+                !media.moveHandoffEndpoint ||
+                !media.hasHandoffEndpoint ||
+                !media.adoptHandoffEndpoint ||
+                !media.releaseMovedHandoffEndpoint ||
+                !this.config.RTC_ENDPOINTS_FILE ||
+                !backendId ||
+                !sourceEndpointId ||
+                !sipTarget(params.requestUri)
+            )
+                throw new InvalidCallStateError('Shared handoff requires a peer allowlist, shared registry and SIP destination');
+            if (Object.keys(params.headers ?? {}).some(name => [HANDOFF_HEADER.toLowerCase(), 'content-type', 'c'].includes(name.toLowerCase())))
+                throw new InvalidCallStateError('Shared handoff reserves its signaling headers');
+            shared = { nonce: randomUUID(), backendId, endpointId: sourceEndpointId };
+        }
         this.assertExclusiveMedia(call);
         // Reserved synchronously with the check above: from here until teardown completes no other call may bind to the
         // source endpoint, because the handoff destroys the media session behind it.
@@ -948,7 +979,7 @@ export class SipGateway {
         const handoffAttempt = this.registerPendingOutboundCall(handoffKey, call.controlConnectionId);
         (call.admittedTransferIds ??= new Set()).add(params.transferId);
         // I1: performTransfer takes ownership synchronously, before its first await.
-        const operation = this.performTransfer(call, params, media, handoffAttempt, handoffKey, handoffSource);
+        const operation = this.performTransfer(call, params, media, handoffAttempt, handoffKey, handoffSource, shared);
         this.transfers.set(call, { id: params.transferId, promise: operation });
         try {
             return await operation;
@@ -1027,7 +1058,8 @@ export class SipGateway {
         media: GatewayMediaController,
         pending: PendingOutboundSipCall,
         handoffKey: string,
-        handoffSource: { endpointId?: string; sdp: string }
+        handoffSource: { endpointId?: string; sdp: string },
+        shared?: SharedMediaOffer
     ): Promise<SipTransferStatus> {
         call.ownership = 'transferring';
         this.modifyingPairs.add(call);
@@ -1050,6 +1082,7 @@ export class SipGateway {
         let destinationAck: Promise<void> | undefined;
         let relayedOffer = '';
         let switched = false;
+        let sharedMoveUnresolved = false;
         let carrierPending = false;
         let expired = false;
         let timer: NodeJS.Timeout | undefined;
@@ -1080,11 +1113,29 @@ export class SipGateway {
             else await ackDestination(rejectSdpOffer(destinationOffer));
         };
         try {
+            const headers = shared
+                ? {
+                      ...params.headers,
+                      ...SDP_HEADERS,
+                      [HANDOFF_HEADER]: encodeHandoff('offer', [
+                          shared.nonce,
+                          shared.backendId,
+                          shared.endpointId,
+                          sipTarget(params.requestUri)!,
+                          String(Date.now())
+                      ])
+                  }
+                : params.headers;
+            const proxy = shared ? await this.sharedHandoffProxy(params.proxy ?? params.requestUri) : params.proxy;
+            if (shared) {
+                this.assertLiveCall(call);
+                if (pending.cancelRequested) throw new InvalidCallStateError('Transfer cancelled');
+            }
             attempt = this.signaling.openDialog({
                 requestUri: params.requestUri,
-                sdp: '',
-                headers: params.headers,
-                proxy: params.proxy,
+                sdp: shared ? HANDOFF_SDP : '',
+                headers,
+                proxy,
                 auth: params.auth,
                 callingNumber: params.callingNumber,
                 callingName: params.callingName
@@ -1098,68 +1149,101 @@ export class SipGateway {
             // Recorded before any check can fail: an answered destination is owed an ACK whatever happens next (I6).
             // A body that is not SDP (mislabeled) is no late offer: sipbridge already ACKed it with an empty ACK and accepts no
             // ACK answer, so nothing is owed and the transfer fails before recordings or the carrier are touched.
-            destinationOffer = destination.answerIsSdp !== false ? destination.remoteSdp : '';
+            destinationOffer = !shared && destination.answerIsSdp !== false ? destination.remoteSdp : '';
             destinationAnsweredAt = Date.now();
             if (destinationOffer) this.ackOwed.set(destination, { settle: settleDestinationAck, answeredAt: () => destinationAnsweredAt });
             this.assertLiveCall(call);
             if (pending.cancelRequested) throw new InvalidCallStateError('Transfer cancelled');
-            if (!destinationOffer) throw new InvalidCallStateError('Destination provided no late offer');
-            relayedOffer = relaySdp(destinationOffer, call.localSdp);
-            const negotiate = async () => {
-                // Re-checked at the last moment before media is touched: another call may have claimed the endpoint meanwhile.
-                this.assertExclusiveMedia(call);
-                // Checked before prepareHandoff: a transfer that cannot proceed must not have stopped recordings.
+            if (shared) {
+                const ready = destination.finalResponse?.headers.filter(h => h.name.toLowerCase() === HANDOFF_HEADER.toLowerCase()) ?? [];
+                const target = targetSession(readHandoff('ready', ready.length === 1 ? ready[0].value : undefined, 4), shared, destination.sipCallId);
+                if (!target || target === params.mediaSessionId || !destination.answerIsSdp || destination.remoteSdp.trim() !== HANDOFF_SDP.trim())
+                    throw new InvalidCallStateError('Destination did not prepare shared media');
                 if (!this.syncRemoteSdp(call)) throw new InvalidCallStateError('Carrier media is not yet established');
-                // I3: recording is stopped and confirmed before any destination SDP reaches the carrier.
                 status.recordings = await media.prepareHandoff!(params.mediaSessionId, call.controlConnectionId, handoffToken, handoffSource);
                 this.assertLiveCall(call);
-                if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                if (call.dialog.isFenced || destination!.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
-                if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
-                // The rollback baseline is the carrier's negotiated SDP now, not at admission: an offerless inbound call's
-                // ACK may have arrived while the destination rang. Still unknown: fail before the carrier is touched.
-                previousRemoteSdp = this.syncRemoteSdp(call);
-                if (!previousRemoteSdp) throw new InvalidCallStateError('Carrier media is not yet established');
-                carrierPending = true;
-                let answer: string;
+                if (pending.cancelRequested || destination.isEnded || destination.isFenced || call.dialog.isFenced)
+                    throw new InvalidCallStateError('Shared media handoff ended before the move');
+                sharedMoveUnresolved = true;
+                const started = Date.now();
                 try {
-                    answer = await call.dialog.reinvite(relayedOffer);
+                    await media.moveHandoffEndpoint!(params.mediaSessionId, shared.endpointId, target);
                 } catch (err) {
-                    // A definite refusal or rejection means the carrier never switched media: no timeout BYE is owed.
-                    if (err instanceof NativeOperationError && !err.uncertain) carrierPending = false;
-                    throw err;
+                    const proof = encodeHandoff('status', [shared.nonce, shared.endpointId, destination.sipCallId, target]);
+                    const moved = await destination.request('INFO', { headers: { [HANDOFF_HEADER]: proof } }).then(
+                        () => true,
+                        () => false
+                    );
+                    if (!moved) {
+                        await delay(Math.max(0, HANDOFF_MOVE_TIMEOUT_MS - (Date.now() - started)));
+                        const retained = await media.hasHandoffEndpoint!(params.mediaSessionId, shared.endpointId);
+                        if (retained) sharedMoveUnresolved = false;
+                        throw err;
+                    }
                 }
-                // The carrier accepted the destination's media; failures from here on must restore its previous media.
-                switched = true;
-                this.sentSdp.set(call.dialog, relayedOffer);
-                assertDirectMediaAnswer(destinationOffer, answer);
-                // A late carrier answer must not leave the caller connected to an abandoned destination.
-                if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                this.assertLiveCall(call);
-                if (!(await ackDestination(answer))) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                this.sentSdp.set(destination!, answer);
-                if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
-                this.assertLiveCall(call);
-                if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
-                this.updateCallSdp(call, { localSdp: relayedOffer, remoteSdp: answer });
-            };
-            await Promise.race([
-                negotiate(),
-                new Promise<never>((_, reject) => {
-                    timer = setTimeout(() => {
-                        expired = true;
-                        reject(new InvalidCallStateError('Transfer ACK deadline expired'));
-                    }, this.handoffAckTimeoutMs);
-                })
-            ]);
+            } else {
+                if (!destinationOffer) throw new InvalidCallStateError('Destination provided no late offer');
+                relayedOffer = relaySdp(destinationOffer, call.localSdp);
+                const negotiate = async () => {
+                    // Re-checked at the last moment before media is touched: another call may have claimed the endpoint meanwhile.
+                    this.assertExclusiveMedia(call);
+                    // Checked before prepareHandoff: a transfer that cannot proceed must not have stopped recordings.
+                    if (!this.syncRemoteSdp(call)) throw new InvalidCallStateError('Carrier media is not yet established');
+                    // I3: recording is stopped and confirmed before any destination SDP reaches the carrier.
+                    status.recordings = await media.prepareHandoff!(params.mediaSessionId, call.controlConnectionId, handoffToken, handoffSource);
+                    this.assertLiveCall(call);
+                    if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                    if (call.dialog.isFenced || destination!.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
+                    if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
+                    // The rollback baseline is the carrier's negotiated SDP now, not at admission: an offerless inbound call's
+                    // ACK may have arrived while the destination rang. Still unknown: fail before the carrier is touched.
+                    previousRemoteSdp = this.syncRemoteSdp(call);
+                    if (!previousRemoteSdp) throw new InvalidCallStateError('Carrier media is not yet established');
+                    carrierPending = true;
+                    let answer: string;
+                    try {
+                        answer = await call.dialog.reinvite(relayedOffer);
+                    } catch (err) {
+                        // A definite refusal or rejection means the carrier never switched media: no timeout BYE is owed.
+                        if (err instanceof NativeOperationError && !err.uncertain) carrierPending = false;
+                        throw err;
+                    }
+                    // The carrier accepted the destination's media; failures from here on must restore its previous media.
+                    switched = true;
+                    this.sentSdp.set(call.dialog, relayedOffer);
+                    assertDirectMediaAnswer(destinationOffer, answer);
+                    // A late carrier answer must not leave the caller connected to an abandoned destination.
+                    if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                    this.assertLiveCall(call);
+                    if (!(await ackDestination(answer))) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                    this.sentSdp.set(destination!, answer);
+                    if (expired) throw new InvalidCallStateError('Transfer ACK deadline expired');
+                    this.assertLiveCall(call);
+                    if (destination!.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
+                    this.updateCallSdp(call, { localSdp: relayedOffer, remoteSdp: answer });
+                };
+                await Promise.race([
+                    negotiate(),
+                    new Promise<never>((_, reject) => {
+                        timer = setTimeout(() => {
+                            expired = true;
+                            reject(new InvalidCallStateError('Transfer ACK deadline expired'));
+                        }, this.handoffAckTimeoutMs);
+                    })
+                ]);
+            }
             // Commit synchronously (I1), re-checking liveness after the race resolved.
             this.assertLiveCall(call);
             // The carrier may have fenced while the destination ACK was in flight; the catch takes the carrier-lost path.
             if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             if (destination.isEnded) throw new InvalidCallStateError('Destination ended during handoff');
+            if (shared) {
+                media.releaseMovedHandoffEndpoint!(params.mediaSessionId, shared.endpointId);
+                this.sharedHandoffs.set(call, shared);
+            }
             call.peerDialog = destination;
             call.peerAddress = destination.peerSource?.ip;
-            call.peerHost = call.peerAddress ? undefined : uriHost(params.proxy ?? params.requestUri);
+            call.peerHost = call.peerAddress ? undefined : uriHost(proxy ?? params.requestUri);
             if (call.peerHost) {
                 const host = call.peerHost;
                 // Recorded for later Replaces authorization so it does not depend on DNS at that moment.
@@ -1202,8 +1286,14 @@ export class SipGateway {
             // leaves the call unrecoverable: the registry token is taken synchronously, before any command (I7).
             // A carrier known to have ended (an ended command result whose terminal event is still pending) is lost as well.
             const lostReasonNow = () =>
-                call.dialog.isFenced ? 'transfer-carrier-uncertain' : call.dialog.isEnded ? 'transfer-carrier-ended' : 'transfer-ack-timeout';
-            const carrierLost = live && (call.dialog.isFenced || call.dialog.isEnded || (expired && carrierPending));
+                sharedMoveUnresolved
+                    ? 'shared-media-move-uncertain'
+                    : call.dialog.isFenced
+                      ? 'transfer-carrier-uncertain'
+                      : call.dialog.isEnded
+                        ? 'transfer-carrier-ended'
+                        : 'transfer-ack-timeout';
+            const carrierLost = live && (call.dialog.isFenced || call.dialog.isEnded || (expired && carrierPending) || sharedMoveUnresolved);
             const removedCall = carrierLost ? this.registry.remove(call.callId) : undefined;
             const lostReason = lostReasonNow();
             // The terminal event does not wait for any command (the carrier may be hung on a queued re-INVITE).
@@ -1574,6 +1664,8 @@ export class SipGateway {
             } else if (req.method === 'UPDATE' && !req.body) {
                 // A refresh without SDP changes no media; it is answered per dialog and never relayed.
                 void res.respond(200).catch(fail);
+            } else if (this.fixedCallerMedia.has(call)) {
+                void res.respond(req.method === 'INVITE' || req.method === 'UPDATE' ? 488 : 405).catch(fail);
             } else if (call.peerDialog) {
                 this.handlePairedModify(call, dialog, req, res).catch(fail);
             } else {
@@ -1811,6 +1903,24 @@ export class SipGateway {
         }
     }
 
+    private isSharedHandoffPeer(ip: string | undefined): boolean {
+        const normalized = sourceIp(ip);
+        if (!normalized) return false;
+        const address = addressRange(normalized);
+        return this.config.SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS?.some(range => overlaps(range, address)) ?? false;
+    }
+
+    private async sharedHandoffProxy(nextHop: string): Promise<string> {
+        const target = /^(?:sips?:)?(?:[+\w.-]+@)?(\[[0-9a-f:.]+\]|[\w.-]+)(?::(\d{1,5}))?(?:;[^?\s<>]*)?$/i.exec(nextHop);
+        const port = target?.[2];
+        if (!target || (port && (+port < 1 || +port > 65535))) throw new InvalidCallStateError('Invalid shared handoff SIP next hop');
+        const host = target[1].replace(/^\[|\]$/g, '');
+        const addresses = await resolveHost(host);
+        const ip = addresses?.find(address => this.isSharedHandoffPeer(address));
+        if (!ip) throw new InvalidCallStateError('Shared handoff SIP next hop is outside the peer allowlist');
+        return `sip:${isIP(ip) === 6 ? `[${ip}]` : ip}${port ? `:${port}` : ''}`;
+    }
+
     private async handleRefer(call: ActiveCall, dialog: NativeDialog, req: IncomingSipRequest, res: SipResponse) {
         // Only a return on a handed-off call is supported; an application-owned call never accepted REFER.
         if (call.ownership === 'application') {
@@ -1834,12 +1944,19 @@ export class SipGateway {
             await res.respond(400);
             return;
         }
-        const destinationUri = stripSipUri(uri);
+        const shared = this.sharedHandoffs.get(call);
+        if (shared && (dialog !== call.peerDialog || !this.isSharedHandoffPeer(req.source?.ip))) {
+            await res.respond(403);
+            return;
+        }
+        // The shared handoff REFER resumes the retained application route.
+        const destinationUri = shared ? call.destinationUri : stripSipUri(uri);
+        const destinationUser = shared ? call.destinationUser : getSipUser(destinationUri);
         if (!acceptsSipHost(destinationUri, this.config.SIP_ALLOWED_DOMAINS)) {
             await res.respond(404);
             return;
         }
-        const routeDestination = { destinationUri, destinationUser: getSipUser(destinationUri) };
+        const routeDestination = { destinationUri, destinationUser };
         const controlRoute = this.controlHub?.findRoute(routeDestination);
         const httpRoute = matchRoute(this.config.ROUTES, routeDestination);
         if (!controlRoute && !httpRoute) {
@@ -1854,15 +1971,15 @@ export class SipGateway {
         // RFC 4488: suppression is only in effect when the 202 echoes `Refer-Sub: false`; otherwise NOTIFYs must be sent.
         const suppressNotify = readHeader(req, 'refer-sub')?.split(';')[0].trim().toLowerCase() === 'false';
         let subscriptionGone = false;
+        let accepted = false;
         let progress: Promise<void> | undefined;
         const notify = async (status: number, final: boolean) => {
             if (final) await progress?.catch(() => undefined);
-            if (subscriptionGone || suppressNotify || dialog.isFenced || dialog.isEnded) return;
-            const sequence = req.cseq || undefined;
+            if (!accepted || subscriptionGone || suppressNotify || dialog.isFenced || dialog.isEnded) return;
             const send = () =>
                 dialog.request('NOTIFY', {
                     headers: {
-                        Event: sequence ? `refer;id=${sequence}` : 'refer',
+                        Event: shared || req.cseq ? `refer;id=${req.cseq}` : 'refer',
                         'Subscription-State': final ? 'terminated;reason=noresource' : 'active;expires=60',
                         'Content-Type': 'message/sipfrag'
                     },
@@ -1879,6 +1996,12 @@ export class SipGateway {
                     if (err instanceof NativeOperationError && (err.sipStatus >= 300 || err.uncertain || err.completed)) subscriptionGone = true;
                 });
         };
+        const accept = async (headers?: SipHeaders) => {
+            const responseHeaders = suppressNotify ? { ...headers, 'Refer-Sub': 'false' } : headers;
+            await res.respond(202, responseHeaders ? { headers: responseHeaders } : undefined);
+            accepted = true;
+            progress = notify(100, false);
+        };
         const returning = call.ownership === 'handed-off';
         // I1: the return claim is synchronous with the ownership check above.
         if (returning) {
@@ -1886,7 +2009,7 @@ export class SipGateway {
             this.modifyingPairs.add(call);
         }
         try {
-            await res.respond(202, suppressNotify ? { headers: { 'Refer-Sub': 'false' } } : undefined);
+            if (!shared) await accept();
         } catch (err) {
             if (returning) {
                 // An UNKNOWN 202 fences the referring leg (I5): the pair cannot be kept, so the call ends. bye() takes the
@@ -1919,9 +2042,25 @@ export class SipGateway {
             }
             throw err;
         }
-        progress = notify(100, false);
+        const sharedRefer = shared
+            ? {
+                  accept,
+                  reject: async () => {
+                      if (!accepted && !res.finalResponseSent && !dialog.isFenced && !dialog.isEnded) await res.respond(503).catch(() => undefined);
+                  }
+              }
+            : undefined;
         try {
-            await this.returnToApplication(call, notify, dialog, destinationUri, routeDestination.destinationUser, controlRoute, httpRoute);
+            await this.returnToApplication(
+                call,
+                notify,
+                dialog,
+                destinationUri,
+                routeDestination.destinationUser,
+                controlRoute,
+                httpRoute,
+                sharedRefer
+            );
         } finally {
             if (!this.retainedPairLocks.has(call)) this.modifyingPairs.delete(call);
         }
@@ -1948,11 +2087,16 @@ export class SipGateway {
         destinationUri: string,
         destinationUser: string | undefined,
         initialControlRoute: ReturnType<ControlHub['findRoute']>,
-        initialHttpRoute: ReturnType<typeof matchRoute>
+        initialHttpRoute: ReturnType<typeof matchRoute>,
+        sharedRefer?: { accept(headers: SipHeaders): Promise<void>; reject(): Promise<void> }
     ) {
         let controlRoute = initialControlRoute;
         let httpRoute = initialHttpRoute;
         let preparedCall: ActiveCall | undefined;
+        const shared = this.sharedHandoffs.get(call);
+        let sharedTarget: SharedMediaReturn | undefined;
+        let sharedMoveAtRisk = false;
+        let sharedCommitted = false;
         const previousSdp = call.localSdp;
         const previousRemoteSdp = this.syncRemoteSdp(call);
         let switched = false;
@@ -2000,8 +2144,7 @@ export class SipGateway {
         try {
             const offer = previousRemoteSdp;
             if (!offer) throw new InvalidCallStateError('Caller has no media description');
-            // The 202 await let the carrier hang up (the end handler already removed the call and told its owner sip.bye):
-            // a dead call is never offered to the application, so it can never see an invite after a bye.
+            // A dead call is never offered to the application, so it can never see an invite after a bye.
             this.assertLiveCall(call);
             if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
             const routeDestination = { destinationUri, destinationUser };
@@ -2015,11 +2158,30 @@ export class SipGateway {
             controlRoute = this.controlHub?.findRoute(routeDestination);
             httpRoute = matchRoute(this.config.ROUTES, routeDestination);
             if (!controlRoute && !httpRoute) throw new InvalidCallStateError('No application route for return');
+            if (shared) {
+                const target = await this.media!.createSession({
+                    callId: call.callId,
+                    backendId: shared.backendId,
+                    ownerConnectionId: controlRoute?.connectionId
+                });
+                sharedTarget = { mediaSessionId: target.sessionId, backendId: shared.backendId, endpointId: shared.endpointId, sdp: previousSdp! };
+                if (target.backendId !== shared.backendId || target.endpoints.length)
+                    throw new InvalidCallStateError('Return target is on different media');
+                this.assertLiveCall(call);
+                preparedCall = {
+                    ...call,
+                    peerDialog: undefined,
+                    controlConnectionId: controlRoute?.connectionId,
+                    routeUrl: controlRoute?.route.url ?? httpRoute!.url,
+                    receiverUrl: controlRoute?.route.url ?? httpRoute!.url
+                };
+            }
             const invite: InviteHttpRequest = {
                 event: 'invite',
                 callId: call.callId,
                 sipCallId: call.sipCallId,
                 logicalCallId: call.logicalCallId,
+                ...(sharedTarget ? { sharedMedia: sharedTarget } : {}),
                 returning: true,
                 previousSessionId: call.callId,
                 returnAttemptId,
@@ -2045,17 +2207,59 @@ export class SipGateway {
             if (!this.routeOwnerHolds(routeDestination, controlRoute, httpRoute))
                 throw new InvalidCallStateError('Return owner no longer holds the route');
             if (call.dialog.isFenced) throw new NativeOperationError('Native signaling outcome unknown', true);
-            this.assertMediaUnreserved(action.sdp, call);
-            localSdp = relaySdp(action.sdp, this.legSdp(call.dialog));
-            releaseMedia = this.claimLocalMedia(localSdp, call);
-            const answer = await call.dialog.reinvite(localSdp);
-            // Only an accepted re-INVITE changed the carrier's media; a refused one needs no restore.
-            switched = true;
-            this.sentSdp.set(call.dialog, localSdp);
-            // A 200 that rejects audio is not a successful return: restore through the failure path below.
-            assertDirectMediaAnswer(localSdp, answer);
-            // The application already configured its media from the carrier SDP in the return invite.
-            assertRollbackAnswer(answer, offer, localSdp);
+            let answer: string;
+            if (shared) {
+                if (
+                    !sharedTarget ||
+                    !sharedRefer ||
+                    action.sharedMediaSessionId !== sharedTarget.mediaSessionId ||
+                    action.sdp !== sharedTarget.sdp ||
+                    referrer !== call.peerDialog
+                )
+                    throw new InvalidCallStateError('Application did not prepare shared media return');
+                localSdp = sharedTarget.sdp;
+                answer = offer;
+                const targetSessionId = sharedTarget.mediaSessionId;
+                const moveDeadline = Date.now() + HANDOFF_MOVE_TIMEOUT_MS;
+                const proof = encodeHandoff('move', [shared.nonce, shared.endpointId, referrer.sipCallId, targetSessionId, String(moveDeadline)]);
+                sharedMoveAtRisk = true;
+                let responseError: NativeOperationError | undefined;
+                try {
+                    await sharedRefer.accept({ [HANDOFF_HEADER]: proof });
+                } catch (err) {
+                    // A lost native receipt can still mean the peer received the move authorization.
+                    if (!(err instanceof NativeOperationError && err.uncertain)) {
+                        sharedMoveAtRisk = false;
+                        throw err;
+                    }
+                    responseError = err;
+                }
+                const inventoryDeadline = moveDeadline + HANDOFF_MOVE_TIMEOUT_MS;
+                while (true) {
+                    const observedAt = Date.now();
+                    const arrived = await this.media!.hasHandoffEndpoint!(targetSessionId, shared.endpointId).catch(() => undefined);
+                    if (arrived) break;
+                    this.assertLiveCall(call);
+                    if (observedAt >= inventoryDeadline) {
+                        sharedMoveAtRisk = arrived === undefined;
+                        throw responseError ?? new InvalidCallStateError('Return media could not be confirmed');
+                    }
+                    await delay(100);
+                }
+                await this.media!.adoptHandoffEndpoint!(targetSessionId, shared.endpointId, localSdp);
+            } else {
+                this.assertMediaUnreserved(action.sdp, call);
+                localSdp = relaySdp(action.sdp, this.legSdp(call.dialog));
+                releaseMedia = this.claimLocalMedia(localSdp, call);
+                answer = await call.dialog.reinvite(localSdp);
+                // Only an accepted re-INVITE changed the carrier's media; a refused one needs no restore.
+                switched = true;
+                this.sentSdp.set(call.dialog, localSdp);
+                // A 200 that rejects audio is not a successful return: restore through the failure path below.
+                assertDirectMediaAnswer(localSdp, answer);
+                // The application already configured its media from the carrier SDP in the return invite.
+                assertRollbackAnswer(answer, offer, localSdp);
+            }
             this.assertLiveCall(call);
             if (!this.routeOwnerHolds(routeDestination, controlRoute, httpRoute))
                 throw new InvalidCallStateError('Return owner no longer holds the route');
@@ -2074,7 +2278,10 @@ export class SipGateway {
             call.destinationUri = destinationUri;
             call.destinationUser = destinationUser;
             call.ownership = 'application';
-            this.updateCallSdp(call, { localSdp, remoteSdp: answer });
+            if (shared) {
+                this.sharedHandoffs.delete(call);
+                sharedCommitted = true;
+            } else this.updateCallSdp(call, { localSdp, remoteSdp: answer });
             const sendAnswered = () =>
                 void this.sendFollowUpEvent(call, {
                     event: 'answered',
@@ -2115,6 +2322,9 @@ export class SipGateway {
             sendAnswered();
         } catch (err) {
             this.logger.warn({ callId: call.callId, failure: 'return-failed' }, errorMessage(err));
+            if (sharedRefer) await sharedRefer.reject();
+            if (sharedMoveAtRisk && !sharedCommitted && this.registry.get(call.callId) === call)
+                await this.byeCall(call, 'shared-media-return-aborted').catch(() => undefined);
             // A fenced carrier (UNKNOWN re-INVITE outcome) may already be on application media while the destination is
             // still connected to it: the call cannot be recovered. The registry token is taken before any await (I7);
             // the fenced carrier is never commanded (I5), the destination is ended after the final NOTIFY.
@@ -2242,6 +2452,7 @@ export class SipGateway {
                 });
             }
         } finally {
+            if (sharedTarget && !sharedCommitted) await this.media!.destroySession(sharedTarget.mediaSessionId).catch(() => undefined);
             releaseMedia();
         }
     }

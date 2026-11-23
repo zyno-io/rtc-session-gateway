@@ -81,8 +81,9 @@ new transfers with `SHUTTING_DOWN`.
 }
 ```
 
-The destination is dialed with an INVITE without SDP and must provide a final SDP
-offer. Provisional (early) SDP is ignored and never relayed. All recording stops
+Calls answered with `fixedCallerMedia: true` use [shared rtpbridge handoff](../guide/sip-routing.md#shared-rtpbridge-handoff).
+For standard handoff, the destination is dialed with an INVITE without SDP and must
+provide a final SDP offer. Provisional (early) SDP is ignored and never relayed. All recording stops
 must succeed before the carrier receives the destination offer. Success releases
 call media and retains both SIP dialogs with `ownership: "handed-off"`; media flows
 directly between the remote endpoints.

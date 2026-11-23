@@ -251,6 +251,20 @@ export class RtpbridgeClient extends EventEmitter {
         return reply as { recordingId: string };
     }
 
+    async transferEndpoint(endpointId: string, targetSessionId: string): Promise<void> {
+        const reply = await this.sendRequest('endpoint.transfer', { endpointId, targetSessionId });
+        if (reply?.endpointId !== endpointId || reply?.targetSessionId !== targetSessionId)
+            throw new RtpbridgeRequestError('Invalid endpoint.transfer acknowledgement', 'protocol_error');
+    }
+
+    async hasSessionEndpoint(endpointId: string): Promise<boolean> {
+        const reply = await this.sendRequest('session.info', {});
+        const endpoints: unknown = reply?.endpoints;
+        if (!Array.isArray(endpoints) || endpoints.some(endpoint => typeof endpoint?.endpointId !== 'string'))
+            throw new RtpbridgeRequestError('Invalid session.info endpoint inventory', 'protocol_error');
+        return endpoints.some(endpoint => endpoint.endpointId === endpointId);
+    }
+
     /** Recordings rtpbridge currently holds for this connection's session (`session.info`). */
     async listSessionRecordings(): Promise<RtpbridgeRecordingInfo[]> {
         const response = await this.sendRequest('session.info', {});

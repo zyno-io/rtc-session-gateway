@@ -1,4 +1,5 @@
 import { parseRoutesJson, parseAllowedSipDomains, RouteConfig } from './routing';
+import { addressRange, type AddressRange } from './firewall-address';
 import { parseIceUrls } from './endpoint-catalog';
 import { loadFirewallConfig, type SipFirewallConfig } from './sip-firewall';
 
@@ -30,6 +31,7 @@ export interface GatewayConfig {
     RTPBRIDGE_REQUIRED?: boolean;
     ROUTES_REQUIRED?: boolean;
     SIP_ALLOWED_DOMAINS?: string[];
+    SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS?: AddressRange[];
     COTURN_URLS?: string[];
     COTURN_AUTH_SECRET?: string;
     COTURN_CREDENTIAL_TTL_SECONDS: number;
@@ -76,6 +78,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         ROUTES_REQUIRED: readBoolean(env.ROUTES_REQUIRED, false, 'ROUTES_REQUIRED'),
         RTPBRIDGE_REQUIRED: mediaRequired,
         SIP_ALLOWED_DOMAINS: parseAllowedSipDomains(env.SIP_ALLOWED_DOMAINS_JSON),
+        SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS: readHandoffPeerCidrs(env.SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS),
         COTURN_URLS: iceUrls,
         COTURN_AUTH_SECRET: env.COTURN_AUTH_SECRET || undefined,
         COTURN_CREDENTIAL_TTL_SECONDS: readPositiveInteger(env.COTURN_CREDENTIAL_TTL_SECONDS, 86_400, 'COTURN_CREDENTIAL_TTL_SECONDS'),
@@ -85,6 +88,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         EVENT_HTTP_TIMEOUT_MS: readPositiveInteger(env.EVENT_HTTP_TIMEOUT_MS, 15_000, 'EVENT_HTTP_TIMEOUT_MS'),
         ROUTES: parseRoutesJson(env.ROUTES_JSON)
     };
+}
+
+function readHandoffPeerCidrs(value: string | undefined): AddressRange[] | undefined {
+    if (!value?.trim()) return;
+    try {
+        const ranges = value.split(',').map(cidr => addressRange(cidr.trim()));
+        if (ranges.every(range => range.prefix > 0)) return ranges;
+    } catch {
+        // Report the configuration key without echoing values.
+    }
+    throw new Error('SIP_SHARED_MEDIA_HANDOFF_PEER_CIDRS must list IP addresses or specific CIDRs');
 }
 
 function readRecordingPathPrefix(value: string | undefined): string | undefined {

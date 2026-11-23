@@ -34,12 +34,27 @@ export interface SipTransferStatus {
     failure?: string;
 }
 
+export interface SipHandoffAnswer {
+    /** Freeze the initial caller media and use shared rtpbridge for SIP transfers. */
+    fixedCallerMedia?: boolean;
+    /** Acknowledge the prepared destination session on a shared media return. */
+    sharedMediaSessionId?: string;
+}
+
+export interface SharedMediaReturn {
+    backendId: string;
+    endpointId: string;
+    mediaSessionId: string;
+    sdp: string;
+}
+
 export interface SipReturnMetadata {
     logicalCallId: string;
     returning?: boolean;
     previousSessionId?: string;
     /** Unique per return attempt; echoed on that attempt's `answered` and `terminated` events. */
     returnAttemptId?: string;
+    sharedMedia?: SharedMediaReturn;
 }
 
 export function isSipTransferStatus(value: unknown): value is SipTransferStatus {

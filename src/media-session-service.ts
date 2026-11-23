@@ -136,7 +136,7 @@ export class MediaSessionService implements GatewayMediaController {
     }
 
     private async createAdmittedSession(params?: CreateMediaSessionParams) {
-        const client = await this.mediaServers.createClient({ callId: params?.callId });
+        const client = await this.mediaServers.createClient({ callId: params?.callId, backendId: params?.backendId });
         let sessionId: string | undefined;
         try {
             sessionId = await client.createSession();
@@ -599,6 +599,33 @@ export class MediaSessionService implements GatewayMediaController {
             this.releaseHandoff(sessionId, token);
             throw err;
         }
+    }
+
+    async moveHandoffEndpoint(sessionId: string, endpointId: string, targetSessionId: string) {
+        const session = this.requireSession(sessionId);
+        if (!this.handoffSessions.has(sessionId) || !session.endpoints.has(endpointId))
+            throw new MediaActionConflictError('Handoff media is no longer reserved');
+        if (this.activeEndpointActions.has(endpointId) || this.sensitiveGatherEndpointIds.has(endpointId))
+            throw new MediaActionConflictError('Cannot move an endpoint with an active media action');
+        await session.client.transferEndpoint(endpointId, targetSessionId);
+    }
+
+    releaseMovedHandoffEndpoint(sessionId: string, endpointId: string) {
+        const session = this.sessions.get(sessionId);
+        if (session) this.removeEndpointSnapshot(session, endpointId);
+    }
+
+    async hasHandoffEndpoint(sessionId: string, endpointId: string) {
+        const session = this.requireSession(sessionId);
+        return session.client.hasSessionEndpoint(endpointId);
+    }
+
+    async adoptHandoffEndpoint(sessionId: string, endpointId: string, sdp: string) {
+        const session = this.requireSession(sessionId);
+        if (session.endpoints.size || this.endpointToSession.has(endpointId)) throw new MediaActionConflictError('Handoff target is no longer empty');
+        await session.client.updateDirection(endpointId, 'sendrecv');
+        if (!this.addEndpoint(session, endpointId, 'rtp', 'sendrecv')) throw new MediaActionConflictError('Handoff target session ended');
+        this.rtpLocalSdp.set(endpointId, sdp);
     }
 
     /** True if rtpbridge still reports the recording active. Fails closed when state cannot be verified. */
