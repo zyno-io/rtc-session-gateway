@@ -56,7 +56,7 @@ class Dialog extends EventEmitter {
     name = 'dialog';
     answerIsSdp = true;
     finalResponse?: { headers: { name: string; value: string }[] };
-    requestHook?: (method: string, headers?: Record<string, string>) => void;
+    requestHook?: (method: string, headers?: Record<string, string>, body?: string) => void;
     reinviteFailure?: Error;
     /** Fences the leg when the re-INVITE fails, as an UNKNOWN native outcome does. */
     fenceOnReinviteFailure = false;
@@ -117,7 +117,7 @@ class Dialog extends EventEmitter {
         this.requests.push({ method, ...options });
         const status = method === 'NOTIFY' ? /SIP\/2\.0 (\d+)/.exec(options.body ?? '')?.[1] : undefined;
         this.log?.push(`${this.name}:${method.toLowerCase()}${status ? `-${status}` : ''}`);
-        this.requestHook?.(method, options.headers);
+        this.requestHook?.(method, options.headers, options.body);
     }
     async bye() {
         if (this.byeFailure && this.byeFailureLimit-- > 0) throw this.byeFailure;
@@ -4895,7 +4895,6 @@ test('shared handoff resumes the saved route and moves the same endpoint without
     const f = await fixture({ sharedPeers: true });
     const referTarget = 'sip:rtc@private-sip.example:5080;transport=tcp';
     const callerSdp = f.call.localSdp;
-    let returnProof = '';
     const returned = Promise.withResolvers<void>();
     f.delayDial(async () => {
         const opened = f.opened[0] as { sdp: string; proxy: string; headers: Record<string, string> };
@@ -4909,14 +4908,13 @@ test('shared handoff resumes the saved route and moves the same endpoint without
         f.center.finalResponse = {
             headers: [{ name: HANDOFF_HEADER, value: encodeHandoff('ready', [shared.nonce, shared.endpointId, 'center', 'talk-session']) }]
         };
-        returnProof = encodeHandoff('return', [shared.nonce, shared.endpointId, 'center', 'return-ticket']);
-        f.center.requestHook = (method, headers) => {
-            if (method === 'NOTIFY' && readHandoff('result', headers?.[HANDOFF_HEADER], 5)?.[4] === '200') {
+        f.center.requestHook = (method, headers, body) => {
+            if (method === 'NOTIFY' && body?.includes('200 OK')) {
                 returned.resolve();
             }
             if (method !== 'INFO') return;
             const move = readHandoff('move', headers?.[HANDOFF_HEADER], 6);
-            assert.deepEqual(move?.slice(0, 5), [shared.nonce, shared.endpointId, 'center', 'return-session', 'return-ticket']);
+            assert.deepEqual(move?.slice(0, 5), [shared.nonce, shared.endpointId, 'center', 'return-session', '44']);
             assert.ok(Number(move?.[5]) > Date.now());
             f.moveBack();
             throw new NativeOperationError('INFO response lost', false, false, 0, false, true);
@@ -4928,11 +4926,12 @@ test('shared handoff resumes the saved route and moves the same endpoint without
 
     const modification = new Response();
     f.caller.emit('request', request('INVITE', sdp('10.0.0.9')), modification);
-    const unauthenticated = new Response();
-    f.center.emit('request', request('REFER', '', 42, { 'refer-to': `<${referTarget}>` }), unauthenticated);
+    const callerRefer = new Response();
+    const referHeaders = { 'refer-to': `<${referTarget}>` };
+    f.caller.emit('request', request('REFER', '', 42, referHeaders, '10.0.0.2'), callerRefer);
     await turn();
     assert.equal(modification.status, 488);
-    assert.equal(unauthenticated.status, 403);
+    assert.equal(callerRefer.status, 403);
     assert.equal(f.call.ownership, 'handed-off');
 
     f.hub.request = async (_id, method, params) => {
@@ -4952,7 +4951,6 @@ test('shared handoff resumes the saved route and moves the same endpoint without
         });
         return { action: 'answer', sdp: returned.sharedMedia.sdp, sharedMediaSessionId: 'return-session' };
     };
-    const referHeaders = { 'refer-to': `<${referTarget}>`, [HANDOFF_HEADER.toLowerCase()]: returnProof };
     const outsidePeer = new Response();
     f.center.emit('request', request('REFER', '', 43, referHeaders, '192.0.2.10'), outsidePeer);
     await turn();
@@ -4971,8 +4969,8 @@ test('shared handoff resumes the saved route and moves the same endpoint without
     assert.ok(f.log.includes('adopt-on-return'));
     assert.ok(f.log.includes('center:notify-200'));
     const final = f.center.requests.find(entry => entry.method === 'NOTIFY' && entry.body?.includes('200 OK'));
-    const proof = readHandoff('result', final?.headers?.[HANDOFF_HEADER], 5);
-    assert.deepEqual(proof?.slice(1), ['endpoint-a', 'center', 'return-ticket', '200']);
+    assert.equal(final?.headers?.Event, 'refer;id=44');
+    assert.equal(final?.headers?.[HANDOFF_HEADER], undefined);
     await assert.rejects(f.gateway.reinvite('caller', sdp('10.0.0.4')), /fixed caller media/);
 });
 

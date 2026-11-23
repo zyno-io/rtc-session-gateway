@@ -48,16 +48,7 @@ import {
     usesHostnameMedia
 } from './sip-sdp';
 import { addressRange, overlaps, sourceIp } from './firewall-address';
-import {
-    HANDOFF_HEADER,
-    HANDOFF_SDP,
-    HANDOFF_MOVE_TIMEOUT_MS,
-    isHandoffToken,
-    readHandoff,
-    encodeHandoff,
-    sipTarget,
-    targetSession
-} from './shared-media-handoff';
+import { HANDOFF_HEADER, HANDOFF_SDP, HANDOFF_MOVE_TIMEOUT_MS, readHandoff, encodeHandoff, sipTarget, targetSession } from './shared-media-handoff';
 import type { SharedMediaOffer } from './shared-media-handoff';
 import type { SharedMediaReturn } from './sip-handoff-contract';
 import { acceptsSipHost, getSipUser, matchRoute, stripSipUri } from './routing';
@@ -1954,21 +1945,9 @@ export class SipGateway {
             return;
         }
         const shared = this.sharedHandoffs.get(call);
-        let returnToken: string | undefined;
-        if (shared) {
-            const proof = readHandoff('return', readHeader(req, HANDOFF_HEADER), 4);
-            if (
-                dialog !== call.peerDialog ||
-                !this.isSharedHandoffPeer(req.source?.ip) ||
-                proof?.[0] !== shared.nonce ||
-                proof[1] !== shared.endpointId ||
-                proof[2] !== dialog.sipCallId ||
-                !isHandoffToken(proof[3])
-            ) {
-                await res.respond(403);
-                return;
-            }
-            returnToken = proof[3];
+        if (shared && (dialog !== call.peerDialog || !this.isSharedHandoffPeer(req.source?.ip))) {
+            await res.respond(403);
+            return;
         }
         // The shared handoff REFER resumes the retained application route.
         const destinationUri = shared ? call.destinationUri : stripSipUri(uri);
@@ -1996,24 +1975,12 @@ export class SipGateway {
         const notify = async (status: number, final: boolean) => {
             if (final) await progress?.catch(() => undefined);
             if (subscriptionGone || suppressNotify || dialog.isFenced || dialog.isEnded) return;
-            const sequence = req.cseq || undefined;
             const send = () =>
                 dialog.request('NOTIFY', {
                     headers: {
-                        Event: sequence ? `refer;id=${sequence}` : 'refer',
+                        Event: shared || req.cseq ? `refer;id=${req.cseq}` : 'refer',
                         'Subscription-State': final ? 'terminated;reason=noresource' : 'active;expires=60',
-                        'Content-Type': 'message/sipfrag',
-                        ...(shared && returnToken && final
-                            ? {
-                                  [HANDOFF_HEADER]: encodeHandoff('result', [
-                                      shared.nonce,
-                                      shared.endpointId,
-                                      dialog.sipCallId,
-                                      returnToken,
-                                      String(status)
-                                  ])
-                              }
-                            : {})
+                        'Content-Type': 'message/sipfrag'
                     },
                     body: `SIP/2.0 ${status} ${status === 200 ? 'OK' : status === 100 ? 'Trying' : 'Return Failed'}\r\n`
                 });
@@ -2070,16 +2037,7 @@ export class SipGateway {
         }
         progress = notify(100, false);
         try {
-            await this.returnToApplication(
-                call,
-                notify,
-                dialog,
-                destinationUri,
-                routeDestination.destinationUser,
-                controlRoute,
-                httpRoute,
-                returnToken
-            );
+            await this.returnToApplication(call, notify, dialog, destinationUri, routeDestination.destinationUser, controlRoute, httpRoute, req.cseq);
         } finally {
             if (!this.retainedPairLocks.has(call)) this.modifyingPairs.delete(call);
         }
@@ -2107,7 +2065,7 @@ export class SipGateway {
         destinationUser: string | undefined,
         initialControlRoute: ReturnType<ControlHub['findRoute']>,
         initialHttpRoute: ReturnType<typeof matchRoute>,
-        returnToken?: string
+        referCseq: number
     ) {
         let controlRoute = initialControlRoute;
         let httpRoute = initialHttpRoute;
@@ -2240,7 +2198,7 @@ export class SipGateway {
                     shared.endpointId,
                     referrer.sipCallId,
                     targetSessionId,
-                    returnToken!,
+                    String(referCseq),
                     String(moveDeadline)
                 ]);
                 sharedMoveAtRisk = true;

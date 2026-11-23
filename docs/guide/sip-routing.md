@@ -95,10 +95,11 @@ shared media for subsequent SIP transfers. In `sip.transfer`, set
 next hop differs from the destination host. The gateway pins the SIP leg to an
 allowlisted IP. For TLS, the peer's certificate must cover the pinned IP.
 
-To hand the call back, the peer sends an in-dialog REFER with the handoff
-correlation data. Use the gateway's dialog Contact for Refer-To. The gateway
-resumes the application route it saved on the call. The peer opens its own
-outbound SIP dialog for other destinations.
+To hand the call back, the peer sends an in-dialog REFER using the gateway's
+dialog Contact for Refer-To. The gateway resumes the application route it
+saved on the call. The subsequent media-move INFO identifies the endpoint,
+target session and REFER CSeq. The peer opens its own outbound SIP dialog
+for other destinations.
 
 On return, `sip.invite.sharedMedia` gives the application a prepared
 `mediaSessionId`, the original `backendId` and `endpointId`, and the established

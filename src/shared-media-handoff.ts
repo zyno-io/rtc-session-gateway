@@ -14,7 +14,7 @@ export function sipTarget(uri: string): string | undefined {
     return match ? `${match[1]}@${match[2].toLowerCase()}` : undefined;
 }
 
-type HandoffMessage = 'offer' | 'ready' | 'return' | 'move' | 'status' | 'result';
+type HandoffMessage = 'offer' | 'ready' | 'move' | 'status';
 
 export function encodeHandoff(kind: HandoffMessage, fields: string[]): string {
     const payload = Buffer.from(JSON.stringify(fields)).toString('base64url');
@@ -42,10 +42,6 @@ export function readSharedOffer(header: string, requestUri: string): SharedMedia
     if (!tokenPattern.test(nonce) || !tokenPattern.test(backendId) || !tokenPattern.test(endpointId)) return;
     if (target !== sipTarget(requestUri) || !/^\d{13}$/.test(timestamp) || Math.abs(Date.now() - Number(timestamp)) > 45000) return;
     return { nonce, backendId, endpointId };
-}
-
-export function isHandoffToken(value: string | undefined): value is string {
-    return !!value && tokenPattern.test(value);
 }
 
 export function targetSession(fields: string[] | undefined, offer: SharedMediaOffer, callId: string): string | undefined {

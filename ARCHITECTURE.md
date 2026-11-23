@@ -141,8 +141,8 @@ RTC rejects later requests to renegotiate that caller dialog and uses shared
 media for its SIP transfers. The destination dialog exchanges inactive SDP
 and private handoff metadata. The gateway resolves the SIP next
 hop and pins the outbound flow to a numeric address in the configured peer
-subnet. In-dialog return requests require a source in that allowlist and the
-matching peer dialog and handoff nonce. The gateway requires
+subnet. A return REFER requires a source in that allowlist and the matching
+peer dialog from the active shared media handoff. The gateway requires
 a known rtpbridge registry backend ID and moves the original RTP endpoint into
 the destination session on that backend after the destination has answered.
 Recording finalization precedes the move. The destination verifies exact
@@ -154,8 +154,10 @@ the current owner of the saved route. The gateway creates an empty session
 owned by that application on the original backend. The return invite gives the application
 that session ID, the original endpoint ID and the established local SDP. The
 application prepares its binding and echoes the session ID. The gateway asks the
-destination to move the endpoint by in-dialog INFO with a deadline
-for starting the move. An exact inventory match commits the return. After an
+destination to move the endpoint by in-dialog INFO. The INFO carries the
+handoff identity, the REFER CSeq and a deadline for starting the move.
+An exact inventory match commits the return and the REFER NOTIFY reports
+the outcome with that CSeq as its Event id. After an
 ambiguous reply the gateway waits through the move window and checks inventory
 again. A verified absence keeps the call on the peer. When ownership cannot
 be verified, the gateway closes both dialogs to release the call. A successful
