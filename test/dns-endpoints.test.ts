@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { loadConfig } from '../src/config';
 import { resolveControlEndpoints, resolveMediaAlias } from '../src/dns-endpoints';
 import { MediaServerManager } from '../src/media-server-manager';
 
 const suffix = '.talk.svc.cluster.local';
 const primary = 'edge-discovery-rtp-pri' + suffix;
 const standby = 'edge-discovery-rtp-fo' + suffix;
-const fileService = 'edge-discovery-rtp-files' + suffix;
+const fileService = 'edge-discovery-rtpfiles' + suffix;
 const alias = 'talk-rtp-active' + suffix;
 const primaryId = 'pri-rtpbridge-0';
 const standbyId = 'fo-rtpbridge-0';
@@ -46,7 +47,7 @@ test('new allocations follow the DNS alias, calls stay pinned, and file reads re
         assert.equal((await manager.resolveBackend(primaryId)).httpUrl, 'https://172.18.8.209:9100');
         assert.equal((await manager.resolveBackend('rtpbridge-0')).serverName, 'control.example.test');
         assert.equal((await manager.resolveBackend('zc-stg-rtpbridge-0')).httpUrl, 'https://172.18.8.209:9100');
-        target = 'edge-discovery-rtp-all.other.svc.cluster.local';
+        target = 'edge-discovery-rtp.other.svc.cluster.local';
         await assert.rejects(() => manager.pickBackendForCall('invalid'));
         assert.equal(await manager.pickBackendForCall('active'), primaryId);
     } finally {
@@ -66,4 +67,22 @@ test('DNS ignores foreign targets and rejects ambiguous control coordinates', as
     };
     assert.deepEqual(await resolveControlEndpoints(primary, resolver), []);
     await assert.rejects(() => resolveMediaAlias(alias, resolver));
+});
+
+test('accepts the shared media pool and the dedicated recording name', async () => {
+    const shared = 'edge-discovery-rtp' + suffix;
+    const oldFiles = 'edge-discovery-rtp-files' + suffix;
+    const resolver = {
+        resolveCname: async () => [shared],
+        resolveSrv: async () => [{ name: primaryId + '.' + shared, port: 9100 }],
+        resolve4: async () => ['172.18.8.205']
+    };
+    assert.deepEqual(await resolveMediaAlias(alias, resolver), [{ name: primaryId, host: '172.18.8.205', port: 9100 }]);
+    assert.equal(loadConfig({ RTPBRIDGE_DNS_FILES: fileService }).RTPBRIDGE_DNS_FILES, fileService);
+    for (const service of [fileService, oldFiles]) {
+        await assert.rejects(resolveMediaAlias(alias, { ...resolver, resolveCname: async () => [service] }));
+    }
+    for (const service of [shared, oldFiles]) {
+        assert.throws(() => loadConfig({ RTPBRIDGE_DNS_FILES: service }), /Invalid discovery Service name/);
+    }
 });

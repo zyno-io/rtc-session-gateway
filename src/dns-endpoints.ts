@@ -15,12 +15,12 @@ export interface DnsEndpoint {
 export const endpointResolver = new Resolver({ timeout: 1000, tries: 1 });
 const label = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-export function discoveryService(value: string, prefix: string, namespace?: string): string {
+export function discoveryService(value: string, name: string | RegExp, namespace?: string): string {
     const service = value.replace(/\.$/, '');
     const parts = service.split('.');
     if (
         parts.length !== 5 ||
-        !parts[0].startsWith(prefix) ||
+        !(typeof name === 'string' ? parts[0] === name : name.test(parts[0])) ||
         !parts.slice(0, 2).every(part => label.test(part)) ||
         (namespace && parts[1] !== namespace) ||
         parts[2] !== 'svc' ||
@@ -34,7 +34,7 @@ export function discoveryService(value: string, prefix: string, namespace?: stri
 export async function resolveMediaAlias(alias: string, resolver: EndpointResolver): Promise<DnsEndpoint[]> {
     const names = await resolver.resolveCname(alias);
     if (names.length !== 1) throw new Error('Media alias must resolve to one Service');
-    const service = discoveryService(names[0], 'edge-discovery-rtp-', alias.split('.')[1]);
+    const service = discoveryService(names[0], /^edge-discovery-rtp(?:-.+)?$/, alias.split('.')[1]);
     if (service.split('.')[0] === 'edge-discovery-rtp-files') throw new Error('File discovery cannot admit new media sessions');
     return resolveControlEndpoints(service, resolver);
 }
