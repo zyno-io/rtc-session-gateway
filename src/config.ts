@@ -59,7 +59,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     }
     const sipService = env.SIPBRIDGE_DNS_SERVICE && discoveryService(env.SIPBRIDGE_DNS_SERVICE, 'edge-discovery-sip-sg');
     const mediaAlias = env.RTPBRIDGE_DNS_ALIAS && discoveryService(env.RTPBRIDGE_DNS_ALIAS, 'talk-rtp-active');
-    const fileService = env.RTPBRIDGE_DNS_FILES && discoveryService(env.RTPBRIDGE_DNS_FILES, 'edge-discovery-rtp-files');
+    const fileService = env.RTPBRIDGE_DNS_FILES && discoveryService(env.RTPBRIDGE_DNS_FILES, 'edge-discovery-rtpfiles');
     if (env.RTC_ENDPOINTS_FILE && (sipService || mediaAlias)) throw new Error('Choose either DNS discovery or RTC_ENDPOINTS_FILE');
     if (sipService && !(env.SIPBRIDGE_DNS_ENDPOINT_ID && env.SIPBRIDGE_TLS_SERVERNAME)) {
         throw new Error('SIP DNS requires the native endpoint ID and its TLS server name');
