@@ -30,7 +30,8 @@ async function run() {
     const firewall = new SipFirewall(Config.SIP_FIREWALL);
     const firewallPublisher = new FirewallPublisher(firewall);
     const controlHub = new ControlHub(Config.CONTROL_REQUEST_TIMEOUT_MS);
-    const mediaServers = Config.RTPBRIDGE_HOST || Config.RTC_ENDPOINTS_FILE ? new MediaServerManager(Config) : undefined;
+    const mediaServers =
+        Config.RTPBRIDGE_DNS_ALIAS || Config.RTPBRIDGE_HOST || Config.RTC_ENDPOINTS_FILE ? new MediaServerManager(Config) : undefined;
     let media: MediaSessionService | undefined;
     let gateway: SipGateway;
     let httpServer: HttpServer;

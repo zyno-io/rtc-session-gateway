@@ -7,6 +7,20 @@ reach sipbridge native control and rtpbridge. Operator-facing setup is in
 Download the [JSON Schema](/contracts/endpoint-catalog-v2.schema.json) and
 [synthetic example](/contracts/endpoint-catalog-v2.example.json).
 
+## Native DNS mode
+
+Deployments can give RTC a dedicated SIP control Service and an RTPbridge
+ExternalName. RTC reads the named `control` SRV records and resolves the selected
+ordinals directly. SIP discovery uses the configured native instance ID and TLS
+server name. The media alias selects the pool for new allocations, and a distinct
+file DNS Service stays available for exact, site-qualified ordinal lookups during
+drain. File requests resolve the recorded name against current DNS. An existing
+call keeps its concrete backend. TLS identities, the control HMAC, and TURN
+settings remain deployment inputs.
+
+The endpoint-file contract below continues to apply to deployments that supply
+`RTC_ENDPOINTS_FILE`.
+
 ## Ownership and transport
 
 The deployment supplies an atomically replaced file, through its own configuration

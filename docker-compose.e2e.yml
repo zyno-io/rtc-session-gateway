@@ -46,9 +46,8 @@ services:
       - rtpbridge
     command: &id002
       - turnserver
-      - --no-cli
+      # Coturn enables CLI and DTLS only when requested.
       - --no-tls
-      - --no-dtls
       - --fingerprint
       - --use-auth-secret
       - --static-auth-secret=e2e-turn-secret
