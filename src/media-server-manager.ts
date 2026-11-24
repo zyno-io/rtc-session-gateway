@@ -5,12 +5,14 @@ import type { GatewayConfig } from './config';
 import { BaseLogger } from './logger';
 import { RtpbridgeClient } from './rtpbridge-client';
 import { RtpbridgeTransport } from './rtpbridge-transport';
+import { endpointResolver, resolveControlEndpoints, resolveMediaAlias, type DnsEndpoint, type EndpointResolver } from './dns-endpoints';
 import { FileEndpointCatalog, type MediaBackend } from './endpoint-catalog';
 
 export type RtpbridgeBackend = MediaBackend;
 
 export interface MediaServerResolver {
-    resolveSrv(name: string): Promise<Array<{ name: string }>>;
+    resolveCname?(name: string): Promise<string[]>;
+    resolveSrv(name: string): Promise<Array<{ name: string; port?: number }>>;
     resolve4(name: string): Promise<string[]>;
 }
 
@@ -21,11 +23,15 @@ export class MediaBackendUnavailableError extends Error {}
 
 export class MediaServerManager {
     private logger = BaseLogger.child({ ns: 'MediaServerManager' });
-    private callToBackend = new Map<string, { backendId: string; createdAt: number; refs: number }>();
+    private callToBackend = new Map<string, { backendId: string; createdAt: number; refs: number; backend?: RtpbridgeBackend }>();
     private nextBackendIndex = 0;
     private sweepTimer: NodeJS.Timeout;
     private transport: RtpbridgeTransport;
     private catalog?: FileEndpointCatalog;
+    private dnsTimer?: NodeJS.Timeout;
+    private dnsReadiness = { observedAt: 0, eligibleBackends: 0 };
+    private checkingDns = false;
+    private readonly discovery: EndpointResolver;
     isCallActive?: (callId: string) => boolean;
 
     constructor(
@@ -41,6 +47,9 @@ export class MediaServerManager {
                     | 'RTPBRIDGE_TLS_CA_FILE'
                     | 'RTPBRIDGE_TLS_SERVERNAME'
                     | 'RTC_ENDPOINTS_FILE'
+                    | 'RTPBRIDGE_DNS_ALIAS'
+                    | 'RTPBRIDGE_DNS_FILES'
+                    | 'RTPBRIDGE_DNS_LEGACY_SITE'
                     | 'RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT'
                 >
             >,
@@ -53,6 +62,19 @@ export class MediaServerManager {
             servername: config.RTPBRIDGE_TLS_SERVERNAME ?? (config.RTPBRIDGE_TLS ? dnsHostname : undefined)
         });
         if (config.RTC_ENDPOINTS_FILE) this.catalog = new FileEndpointCatalog(config.RTC_ENDPOINTS_FILE, config.RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT);
+        this.discovery =
+            resolver.resolveCname && resolver !== dns
+                ? {
+                      resolveCname: resolver.resolveCname.bind(resolver),
+                      resolveSrv: resolver.resolveSrv.bind(resolver),
+                      resolve4: resolver.resolve4.bind(resolver)
+                  }
+                : endpointResolver;
+        if (config.RTPBRIDGE_DNS_ALIAS) {
+            void this.checkDnsReadiness();
+            this.dnsTimer = setInterval(() => void this.checkDnsReadiness(), 2000);
+            this.dnsTimer.unref();
+        }
         this.sweepTimer = setInterval(() => this.sweepStaleEntries(), 10 * 60 * 1000);
     }
 
@@ -106,6 +128,7 @@ export class MediaServerManager {
 
     destroy() {
         clearInterval(this.sweepTimer);
+        if (this.dnsTimer) clearInterval(this.dnsTimer);
         this.catalog?.destroy();
         this.transport.destroy();
     }
@@ -115,6 +138,10 @@ export class MediaServerManager {
     }
 
     get readiness() {
+        if (this.config.RTPBRIDGE_DNS_ALIAS) {
+            const valid = Date.now() - this.dnsReadiness.observedAt <= 5000;
+            return { valid, eligibleBackends: valid ? this.dnsReadiness.eligibleBackends : 0 };
+        }
         return (
             this.catalog?.status ?? {
                 valid: !!this.config.RTPBRIDGE_HOST,
@@ -123,8 +150,35 @@ export class MediaServerManager {
         );
     }
 
+    private async checkDnsReadiness(): Promise<void> {
+        if (this.checkingDns) return;
+        this.checkingDns = true;
+        try {
+            const backends = await this.resolveBackends();
+            this.dnsReadiness = { observedAt: Date.now(), eligibleBackends: backends.length };
+        } catch {
+            this.dnsReadiness = { observedAt: 0, eligibleBackends: 0 };
+        } finally {
+            this.checkingDns = false;
+        }
+    }
+
+    private dnsBackend(endpoint: DnsEndpoint): RtpbridgeBackend {
+        const backend = backendFromHost(endpoint.host, endpoint.port, true);
+        return {
+            ...backend,
+            id: endpoint.name,
+            serverName: this.config.RTPBRIDGE_TLS_SERVERNAME,
+            recordingServerName: this.config.RTPBRIDGE_TLS_SERVERNAME
+        };
+    }
+
     async resolveBackends(): Promise<RtpbridgeBackend[]> {
         if (this.catalog) return this.catalog.backends;
+        if (this.config.RTPBRIDGE_DNS_ALIAS) {
+            const endpoints = await resolveMediaAlias(this.config.RTPBRIDGE_DNS_ALIAS, this.discovery);
+            return endpoints.map(endpoint => this.dnsBackend(endpoint));
+        }
         const host = this.requireHost();
         const port = this.config.RTPBRIDGE_PORT;
 
@@ -154,6 +208,15 @@ export class MediaServerManager {
     }
 
     async resolveBackend(backendId: string): Promise<RtpbridgeBackend> {
+        if (this.config.RTPBRIDGE_DNS_FILES) {
+            const site = this.config.RTPBRIDGE_DNS_LEGACY_SITE;
+            const previousPrimary = /^zc-(?:stg|prd)-(rtpbridge-\d+)$/.exec(backendId);
+            const ordinal = previousPrimary?.[1] ?? backendId;
+            const name = site && /^rtpbridge-\d+$/.test(ordinal) ? `${site}-${ordinal}` : backendId;
+            const endpoints = await resolveControlEndpoints(this.config.RTPBRIDGE_DNS_FILES, this.discovery, name);
+            if (endpoints.length !== 1) throw new MediaBackendNotFoundError('RTPbridge ordinal is unavailable: ' + backendId);
+            return { ...this.dnsBackend(endpoints[0]), id: backendId };
+        }
         const backends = await this.resolveBackends();
         const backend = backends.find(candidate => candidate.id === backendId);
         if (!backend) throw new MediaBackendNotFoundError(`rtpbridge backend ${backendId} not found`);
@@ -161,6 +224,7 @@ export class MediaServerManager {
     }
 
     private async pickBackend(options?: { backendId?: string; callId?: string }) {
+        if (this.config.RTPBRIDGE_DNS_ALIAS) return this.pickDnsBackend(options);
         let backends: RtpbridgeBackend[];
         if (this.catalog) {
             const snapshot = this.catalog.snapshot;
@@ -173,6 +237,30 @@ export class MediaServerManager {
             throw new MediaBackendUnavailableError('Call is pinned to a different backend');
         const backend = this.selectBackend(backends, pinnedId ?? options?.backendId);
         if (options?.callId) this.pinCall(options.callId, backend.id);
+        return backend;
+    }
+
+    private async pickDnsBackend(options?: { backendId?: string; callId?: string }): Promise<RtpbridgeBackend> {
+        const callId = options?.callId;
+        const requested = options?.backendId;
+        const selectPinned = () => {
+            const entry = callId ? this.callToBackend.get(callId) : undefined;
+            if (entry && requested && requested !== entry.backendId) {
+                throw new MediaBackendUnavailableError('Call is pinned to a different backend');
+            }
+            return entry;
+        };
+        const initial = selectPinned();
+        if (initial?.backend) return initial.backend;
+        const exact = initial?.backendId ?? requested;
+        const backends = exact ? [await this.resolveBackend(exact)] : await this.resolveBackends();
+        const pinned = selectPinned();
+        const backend = pinned?.backend ?? this.selectBackend(backends, pinned?.backendId ?? exact);
+        if (callId) {
+            this.pinCall(callId, backend.id);
+            const entry = this.callToBackend.get(callId);
+            if (entry) entry.backend = backend;
+        }
         return backend;
     }
 

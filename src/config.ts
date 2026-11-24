@@ -1,11 +1,18 @@
 import { parseRoutesJson, parseAllowedSipDomains, RouteConfig } from './routing';
 import { addressRange, type AddressRange } from './firewall-address';
+import { discoveryService } from './dns-endpoints';
 import { parseIceUrls } from './endpoint-catalog';
 import { loadFirewallConfig, type SipFirewallConfig } from './sip-firewall';
 
 export interface GatewayConfig {
     SIP_FIREWALL?: SipFirewallConfig;
     RTC_ENDPOINTS_FILE?: string;
+    SIPBRIDGE_DNS_SERVICE?: string;
+    SIPBRIDGE_DNS_ENDPOINT_ID?: string;
+    SIPBRIDGE_TLS_SERVERNAME?: string;
+    RTPBRIDGE_DNS_ALIAS?: string;
+    RTPBRIDGE_DNS_FILES?: string;
+    RTPBRIDGE_DNS_LEGACY_SITE?: string;
     SIPBRIDGE_TLS_CERT_FILE?: string;
     SIPBRIDGE_TLS_KEY_FILE?: string;
     SIPBRIDGE_TLS_CA_FILE?: string;
@@ -47,12 +54,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         throw new Error('Removed SRF or catalog-v1 configuration');
     const controlAuthMode = readControlAuthMode(env);
     const mediaRequired = readBoolean(env.RTPBRIDGE_REQUIRED, false, 'RTPBRIDGE_REQUIRED');
-    if (mediaRequired && !env.RTPBRIDGE_HOST && !env.RTC_ENDPOINTS_FILE) throw new Error('Required media needs RTPBRIDGE_HOST or RTC_ENDPOINTS_FILE');
+    if (mediaRequired && !env.RTPBRIDGE_HOST && !env.RTC_ENDPOINTS_FILE && !env.RTPBRIDGE_DNS_ALIAS) {
+        throw new Error('Required media needs a DNS alias, RTPBRIDGE_HOST or RTC_ENDPOINTS_FILE');
+    }
+    const sipService = env.SIPBRIDGE_DNS_SERVICE && discoveryService(env.SIPBRIDGE_DNS_SERVICE, 'edge-discovery-sip-sg');
+    const mediaAlias = env.RTPBRIDGE_DNS_ALIAS && discoveryService(env.RTPBRIDGE_DNS_ALIAS, 'talk-rtp-active');
+    const fileService = env.RTPBRIDGE_DNS_FILES && discoveryService(env.RTPBRIDGE_DNS_FILES, 'edge-discovery-rtp-files');
+    if (env.RTC_ENDPOINTS_FILE && (sipService || mediaAlias)) throw new Error('Choose either DNS discovery or RTC_ENDPOINTS_FILE');
+    if (sipService && !(env.SIPBRIDGE_DNS_ENDPOINT_ID && env.SIPBRIDGE_TLS_SERVERNAME)) {
+        throw new Error('SIP DNS requires the native endpoint ID and its TLS server name');
+    }
+    if (mediaAlias && !(fileService && env.RTPBRIDGE_TLS_SERVERNAME && env.RTPBRIDGE_TLS_CA_FILE && env.RTPBRIDGE_AUTH_HMAC_SECRET_FILE))
+        throw new Error('Media DNS requires the file Service, TLS identity and control HMAC');
     const iceUrls = env.COTURN_URLS_JSON ? parseIceUrls(JSON.parse(env.COTURN_URLS_JSON)) : undefined;
     if (iceUrls?.some(url => url.startsWith('turn')) && !env.COTURN_AUTH_SECRET) throw new Error('TURN URLs require COTURN_AUTH_SECRET');
     return {
         SIP_FIREWALL: loadFirewallConfig(env),
         RTC_ENDPOINTS_FILE: env.RTC_ENDPOINTS_FILE || undefined,
+        SIPBRIDGE_DNS_SERVICE: sipService || undefined,
+        SIPBRIDGE_DNS_ENDPOINT_ID: env.SIPBRIDGE_DNS_ENDPOINT_ID || undefined,
+        SIPBRIDGE_TLS_SERVERNAME: env.SIPBRIDGE_TLS_SERVERNAME || undefined,
+        RTPBRIDGE_DNS_ALIAS: mediaAlias || undefined,
+        RTPBRIDGE_DNS_FILES: fileService || undefined,
+        RTPBRIDGE_DNS_LEGACY_SITE: env.RTPBRIDGE_DNS_LEGACY_SITE || undefined,
         SIPBRIDGE_TLS_CERT_FILE: env.SIPBRIDGE_TLS_CERT_FILE || undefined,
         SIPBRIDGE_TLS_KEY_FILE: env.SIPBRIDGE_TLS_KEY_FILE || undefined,
         SIPBRIDGE_TLS_CA_FILE: env.SIPBRIDGE_TLS_CA_FILE || undefined,

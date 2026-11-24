@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
+import { endpointResolver, resolveControlEndpoints } from './dns-endpoints';
 import { FileRtcEndpointCatalog, type SignalingBackend } from './endpoint-catalog';
 import type { GatewayConfig } from './config';
 import { SipbridgeControlClient, SipbridgeControlNotSentError } from './sipbridge/client';
@@ -354,6 +355,9 @@ export class SipbridgeSignaling extends EventEmitter {
     private attempt = 0n;
     private stopped = true;
     private catalog?: FileRtcEndpointCatalog;
+    private dnsBackends: SignalingBackend[] = [];
+    private dnsValidUntil = 0;
+    private dnsRefresh?: Promise<void>;
     private timer?: NodeJS.Timeout;
     onInvite?: (request: IncomingSipRequest, response: SipResponse) => Promise<void>;
     applicationReady: () => boolean = () => true;
@@ -371,7 +375,7 @@ export class SipbridgeSignaling extends EventEmitter {
         };
     }
     get isConnected() {
-        const view = this.catalog?.snapshot.signaling;
+        const view = this.signalingView;
         return (
             !this.stopped &&
             !!view?.valid &&
@@ -386,19 +390,53 @@ export class SipbridgeSignaling extends EventEmitter {
     }
     async start() {
         if (
-            !this.config.RTC_ENDPOINTS_FILE ||
+            (!this.config.RTC_ENDPOINTS_FILE && !this.config.SIPBRIDGE_DNS_SERVICE) ||
             !this.config.SIPBRIDGE_TLS_CERT_FILE ||
             !this.config.SIPBRIDGE_TLS_KEY_FILE ||
             !this.config.SIPBRIDGE_TLS_CA_FILE
         )
-            throw new Error('Native SIP requires RTC_ENDPOINTS_FILE and all SIPBRIDGE_TLS files');
-        this.catalog = new FileRtcEndpointCatalog(this.config.RTC_ENDPOINTS_FILE, this.config.RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT);
+            throw new Error('Native SIP requires DNS or RTC_ENDPOINTS_FILE and all SIPBRIDGE_TLS files');
+        if (this.config.RTC_ENDPOINTS_FILE) {
+            this.catalog = new FileRtcEndpointCatalog(this.config.RTC_ENDPOINTS_FILE, this.config.RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT);
+        }
         this.stopped = false;
         this.timer = setInterval(() => {
             void this.refresh();
         }, 500);
         this.timer.unref();
         await this.refresh();
+    }
+    private get signalingView(): { valid: boolean; backends: SignalingBackend[] } {
+        return this.catalog?.snapshot.signaling ?? { valid: Date.now() < this.dnsValidUntil, backends: this.dnsBackends };
+    }
+
+    private async refreshDns(service: string): Promise<void> {
+        if (this.dnsRefresh) return this.dnsRefresh;
+        const refresh = async () => {
+            try {
+                const entries = await resolveControlEndpoints(service, endpointResolver);
+                const [entry] = entries;
+                this.dnsBackends =
+                    entries.length === 1
+                        ? [
+                              {
+                                  id: this.config.SIPBRIDGE_DNS_ENDPOINT_ID!,
+                                  url: `wss://${entry.host}:${entry.port}/v1/control`,
+                                  serverName: this.config.SIPBRIDGE_TLS_SERVERNAME!,
+                                  acceptNew: true
+                              }
+                          ]
+                        : [];
+                this.dnsValidUntil = Date.now() + 3000;
+            } catch {
+                this.dnsBackends = [];
+                this.dnsValidUntil = Date.now() + 3000;
+            }
+        };
+        this.dnsRefresh = refresh().finally(() => {
+            this.dnsRefresh = undefined;
+        });
+        return this.dnsRefresh;
     }
     private async refresh() {
         if (this.stopped) return;
@@ -408,7 +446,11 @@ export class SipbridgeSignaling extends EventEmitter {
             if (state.retiredAt !== undefined && now - state.retiredAt > TOMBSTONE_RETENTION_MS) this.contexts.delete(key);
             else if (state.expiresAt !== undefined && state.expiresAt <= now && !state.ended) this.drop(state, 'expired');
         }
-        const view = this.catalog!.snapshot.signaling;
+        if (this.config.SIPBRIDGE_DNS_SERVICE && now >= this.dnsValidUntil - 2000) {
+            await this.refreshDns(this.config.SIPBRIDGE_DNS_SERVICE);
+        }
+        if (this.stopped) return;
+        const view = this.signalingView;
         if (view.valid)
             for (const endpoint of view.backends) {
                 const old = this.peers.get(endpoint.id);
