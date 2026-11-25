@@ -31,11 +31,22 @@ export function discoveryService(value: string, prefix: string, namespace?: stri
     return service;
 }
 
+function isFileDiscoveryService(service: string): boolean {
+    const [name] = service.split('.');
+    return name === 'edge-discovery-rtpfiles' || name.startsWith('edge-discovery-rtp-files');
+}
+
+export function fileDiscoveryService(value: string): string {
+    const service = discoveryService(value, 'edge-discovery-rtp');
+    if (!isFileDiscoveryService(service)) throw new Error('Invalid file discovery Service name');
+    return service;
+}
+
 export async function resolveMediaAlias(alias: string, resolver: EndpointResolver): Promise<DnsEndpoint[]> {
     const names = await resolver.resolveCname(alias);
     if (names.length !== 1) throw new Error('Media alias must resolve to one Service');
+    if (isFileDiscoveryService(names[0])) throw new Error('File discovery cannot admit new media sessions');
     const service = discoveryService(names[0], 'edge-discovery-rtp-', alias.split('.')[1]);
-    if (service.split('.')[0] === 'edge-discovery-rtp-files') throw new Error('File discovery cannot admit new media sessions');
     return resolveControlEndpoints(service, resolver);
 }
 

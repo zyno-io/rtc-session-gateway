@@ -11,6 +11,10 @@ file supplies endpoint metadata; it does not proxy control or grant call ownersh
   and atomic-file consumption. An invalid, missing or unreadable replacement keeps
   the last valid document without extending its expiry. A configured catalog never
   falls back to DNS.
+- `dns-endpoints.ts`: native DNS discovery for deployments that use Services
+  and EndpointSlices. Recording lookup accepts the `edge-discovery-rtpfiles`
+  Service and its legacy `edge-discovery-rtp-files` naming convention. File
+  endpoints are excluded from the new-media selection alias.
 - `sipbridge/`: the pinned generated wire contract, strict canonical JSON
   validation and the bounded mTLS control client.
 - `sipbridge-signaling.ts`: native session ownership, reconnect, retained-context
