@@ -66,7 +66,7 @@ The compose runner pulls the CI-published `ghcr.io/zyno-io/rtpbridge:main` image
 
 Core environment variables:
 
-- `RTC_ENDPOINTS_FILE`: required; atomically replaced endpoint catalog v2 listing the sipbridge control endpoint and rtpbridge media backends.
+- `RTC_ENDPOINTS_FILE`: atomically replaced endpoint catalog v2 for deployments that use file-based discovery.
 - `SIPBRIDGE_TLS_CERT_FILE`, `SIPBRIDGE_TLS_KEY_FILE`, `SIPBRIDGE_TLS_CA_FILE`: required; mounted native controller identity and server trust.
 - `SIPBRIDGE_INSTANCE_ID`: optional process instance name; each startup gets a fresh epoch.
 - `HTTP_PORT`: HTTP/control port, defaults to `3001`.
@@ -78,7 +78,7 @@ Core environment variables:
 - `RECORDINGS_PATH`: rtpbridge recording root, defaults to `/var/lib/rtpbridge/recordings`.
 - `ROUTES_JSON`: static HTTP route table, defaults to `[]`.
 
-The service exits at startup without the catalog and all three `SIPBRIDGE_TLS_*` files. Media backends come from the catalog's `media` section. See [Configuration](docs/guide/configuration.md) for the full list.
+The service requires all three `SIPBRIDGE_TLS_*` files and a catalog or [Kubernetes DNS discovery](docs/guide/configuration.md#kubernetes-dns-discovery). See [Configuration](docs/guide/configuration.md) for the full list.
 
 Example static routes:
 

@@ -148,7 +148,12 @@ test('controller bootstraps before gateway readiness; authenticated smoke report
     const directory = mkdtempSync(join(tmpdir(), 'rtc-owner-'));
     const file = join(directory, 'token');
     writeFileSync(file, 'synthetic-acceptance-token');
-    const controller = await startAcceptance({ RTC_ACCEPTANCE_CONTROL_URL: gateway.url, RTC_ACCEPTANCE_TOKEN_FILE: file, RTC_ACCEPTANCE_PORT: '0' });
+    const controller = await startAcceptance({
+        RTC_ACCEPTANCE_CONTROL_URL: gateway.url,
+        RTC_ACCEPTANCE_TOKEN_FILE: file,
+        RTC_ACCEPTANCE_PORT: '0',
+        RTC_ACCEPTANCE_ROUTE: 'rtc-acceptance'
+    });
     const url = `http://127.0.0.1:${(controller.server.address() as any).port}`;
     try {
         await until(() => controller.report().controllerReady);

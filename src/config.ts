@@ -1,6 +1,6 @@
 import { parseRoutesJson, parseAllowedSipDomains, RouteConfig } from './routing';
 import { addressRange, type AddressRange } from './firewall-address';
-import { discoveryService, fileDiscoveryService } from './dns-endpoints';
+import { discoveryService } from './dns-endpoints';
 import { parseIceUrls } from './endpoint-catalog';
 import { loadFirewallConfig, type SipFirewallConfig } from './sip-firewall';
 
@@ -13,6 +13,7 @@ export interface GatewayConfig {
     RTPBRIDGE_DNS_ALIAS?: string;
     RTPBRIDGE_DNS_FILES?: string;
     RTPBRIDGE_DNS_LEGACY_SITE?: string;
+    RTPBRIDGE_DNS_LEGACY_PREFIXES?: string[];
     SIPBRIDGE_TLS_CERT_FILE?: string;
     SIPBRIDGE_TLS_KEY_FILE?: string;
     SIPBRIDGE_TLS_CA_FILE?: string;
@@ -57,9 +58,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     if (mediaRequired && !env.RTPBRIDGE_HOST && !env.RTC_ENDPOINTS_FILE && !env.RTPBRIDGE_DNS_ALIAS) {
         throw new Error('Required media needs a DNS alias, RTPBRIDGE_HOST or RTC_ENDPOINTS_FILE');
     }
-    const sipService = env.SIPBRIDGE_DNS_SERVICE && discoveryService(env.SIPBRIDGE_DNS_SERVICE, 'edge-discovery-sip-sg');
-    const mediaAlias = env.RTPBRIDGE_DNS_ALIAS && discoveryService(env.RTPBRIDGE_DNS_ALIAS, 'talk-rtp-active');
-    const fileService = env.RTPBRIDGE_DNS_FILES && fileDiscoveryService(env.RTPBRIDGE_DNS_FILES);
+    const sipService = env.SIPBRIDGE_DNS_SERVICE && discoveryService(env.SIPBRIDGE_DNS_SERVICE);
+    const mediaAlias = env.RTPBRIDGE_DNS_ALIAS && discoveryService(env.RTPBRIDGE_DNS_ALIAS);
+    const fileService = env.RTPBRIDGE_DNS_FILES && discoveryService(env.RTPBRIDGE_DNS_FILES);
+    if (mediaAlias && mediaAlias === fileService) throw new Error('Media DNS requires separate allocation and file Services');
+    const legacyPrefixes: unknown = env.RTPBRIDGE_DNS_LEGACY_PREFIXES_JSON ? JSON.parse(env.RTPBRIDGE_DNS_LEGACY_PREFIXES_JSON) : undefined;
+    if (
+        legacyPrefixes !== undefined &&
+        (!Array.isArray(legacyPrefixes) || !legacyPrefixes.every(prefix => typeof prefix === 'string' && /^[a-z0-9][a-z0-9-]*-$/.test(prefix)))
+    )
+        throw new Error('RTPBRIDGE_DNS_LEGACY_PREFIXES_JSON must contain valid ID prefixes ending in a hyphen');
     if (env.RTC_ENDPOINTS_FILE && (sipService || mediaAlias)) throw new Error('Choose either DNS discovery or RTC_ENDPOINTS_FILE');
     if (sipService && !(env.SIPBRIDGE_DNS_ENDPOINT_ID && env.SIPBRIDGE_TLS_SERVERNAME)) {
         throw new Error('SIP DNS requires the native endpoint ID and its TLS server name');
@@ -77,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
         RTPBRIDGE_DNS_ALIAS: mediaAlias || undefined,
         RTPBRIDGE_DNS_FILES: fileService || undefined,
         RTPBRIDGE_DNS_LEGACY_SITE: env.RTPBRIDGE_DNS_LEGACY_SITE || undefined,
+        RTPBRIDGE_DNS_LEGACY_PREFIXES: Array.isArray(legacyPrefixes) ? legacyPrefixes : undefined,
         SIPBRIDGE_TLS_CERT_FILE: env.SIPBRIDGE_TLS_CERT_FILE || undefined,
         SIPBRIDGE_TLS_KEY_FILE: env.SIPBRIDGE_TLS_KEY_FILE || undefined,
         SIPBRIDGE_TLS_CA_FILE: env.SIPBRIDGE_TLS_CA_FILE || undefined,

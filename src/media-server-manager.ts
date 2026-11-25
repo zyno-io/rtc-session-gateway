@@ -50,6 +50,7 @@ export class MediaServerManager {
                     | 'RTPBRIDGE_DNS_ALIAS'
                     | 'RTPBRIDGE_DNS_FILES'
                     | 'RTPBRIDGE_DNS_LEGACY_SITE'
+                    | 'RTPBRIDGE_DNS_LEGACY_PREFIXES'
                     | 'RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT'
                 >
             >,
@@ -176,7 +177,7 @@ export class MediaServerManager {
     async resolveBackends(): Promise<RtpbridgeBackend[]> {
         if (this.catalog) return this.catalog.backends;
         if (this.config.RTPBRIDGE_DNS_ALIAS) {
-            const endpoints = await resolveMediaAlias(this.config.RTPBRIDGE_DNS_ALIAS, this.discovery);
+            const endpoints = await resolveMediaAlias(this.config.RTPBRIDGE_DNS_ALIAS, this.discovery, this.config.RTPBRIDGE_DNS_FILES);
             return endpoints.map(endpoint => this.dnsBackend(endpoint));
         }
         const host = this.requireHost();
@@ -210,12 +211,19 @@ export class MediaServerManager {
     async resolveBackend(backendId: string): Promise<RtpbridgeBackend> {
         if (this.config.RTPBRIDGE_DNS_FILES) {
             const site = this.config.RTPBRIDGE_DNS_LEGACY_SITE;
-            const previousPrimary = /^zc-(?:stg|prd)-(rtpbridge-\d+)$/.exec(backendId);
-            const ordinal = previousPrimary?.[1] ?? backendId;
-            const name = site && /^rtpbridge-\d+$/.test(ordinal) ? `${site}-${ordinal}` : backendId;
-            const endpoints = await resolveControlEndpoints(this.config.RTPBRIDGE_DNS_FILES, this.discovery, name);
-            if (endpoints.length !== 1) throw new MediaBackendNotFoundError('RTPbridge ordinal is unavailable: ' + backendId);
-            return { ...this.dnsBackend(endpoints[0]), id: backendId };
+            const names = new Set([backendId]);
+            if (site) {
+                for (const prefix of this.config.RTPBRIDGE_DNS_LEGACY_PREFIXES ?? []) {
+                    if (backendId.startsWith(prefix)) names.add(`${site}-${backendId.slice(prefix.length)}`);
+                }
+                names.add(`${site}-${backendId}`);
+            }
+            const endpoints = await resolveControlEndpoints(this.config.RTPBRIDGE_DNS_FILES, this.discovery, names);
+            for (const name of names) {
+                const endpoint = endpoints.find(candidate => candidate.name === name);
+                if (endpoint) return { ...this.dnsBackend(endpoint), id: backendId };
+            }
+            throw new MediaBackendNotFoundError('RTPbridge ordinal is unavailable: ' + backendId);
         }
         const backends = await this.resolveBackends();
         const backend = backends.find(candidate => candidate.id === backendId);

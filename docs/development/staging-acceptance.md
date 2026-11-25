@@ -12,6 +12,7 @@ immutable digest. The normal final Docker target remains `production`.
 ```sh
 RTC_ACCEPTANCE_CONTROL_URL=ws://gateway-instances:3001/control \
 RTC_ACCEPTANCE_RESOLVE_INSTANCES=true \
+RTC_ACCEPTANCE_ROUTE=rtc-acceptance-smoke \
 RTC_ACCEPTANCE_TOKEN_FILE=/run/owner-token/CONTROL_AUTH_TOKEN \
 node dist/acceptance/main.js
 ```
@@ -23,7 +24,7 @@ instance resolution enabled, the owner connects to each IPv4 address of the
 headless Service (maximum 16). That Service must publish not-ready addresses so
 routes can be registered before RTC admission becomes ready.
 
-`RTC_ACCEPTANCE_ROUTE` defaults to `rtc-acceptance`. Only exact test routes are
+`RTC_ACCEPTANCE_ROUTE` is required. Only exact test routes are
 registered: that name answers with media allocated through RTC, and the name
 with `-reject` appended rejects with 486 before media allocation. No wildcard or
 product route is registered. Calls remain pinned to the original owner connection;
@@ -56,6 +57,7 @@ routable address for the probe's UDP media sockets:
 ```sh
 RTC_ACCEPTANCE_GATEWAY_URL=http://gateway-instance:3001 \
 RTC_ACCEPTANCE_TOKEN_FILE=/run/owner-token/CONTROL_AUTH_TOKEN \
+RTC_ACCEPTANCE_ROUTE=rtc-acceptance-smoke \
 RTC_ACCEPTANCE_SIP_HOST=sip.example.test \
 RTC_ACCEPTANCE_SIP_DOMAIN=sip.example.test \
 RTC_ACCEPTANCE_ADVERTISE_IP=192.0.2.20 \
