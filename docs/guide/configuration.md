@@ -1,15 +1,15 @@
 # Configuration
 
-Configuration is read from environment variables at startup. The service exits
-at startup unless `RTC_ENDPOINTS_FILE` and all three `SIPBRIDGE_TLS_*` files are
-configured.
+The service reads environment variables at startup. Native signaling requires an
+endpoint catalog or [Kubernetes DNS discovery](#kubernetes-dns-discovery), plus
+all three `SIPBRIDGE_TLS_*` files.
 
 The optional [SIP firewall](./sip-firewall.md) settings (`SIP_FIREWALL_*`) are listed
 [below](#sip-firewall). Its default mode is `shadow`.
 
 | Variable                          | Default                         | Description                                                                                                                                                                                |
 | --------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `RTC_ENDPOINTS_FILE`              | required                        | Authoritative catalog v2 for signaling and media. See [cross-cluster deployment](./cross-cluster.md#endpoint-catalog-and-identity).                                                        |
+| `RTC_ENDPOINTS_FILE`              | unset                           | Authoritative catalog v2 for signaling and media. See [cross-cluster deployment](./cross-cluster.md#endpoint-catalog-and-identity).                                                        |
 | `SIPBRIDGE_TLS_CERT_FILE`         | required                        | Controller client certificate PEM, with a URI SAN that sipbridge authorizes.                                                                                                               |
 | `SIPBRIDGE_TLS_KEY_FILE`          | required                        | Controller private key PEM.                                                                                                                                                                |
 | `SIPBRIDGE_TLS_CA_FILE`           | required                        | Trusted native server CA PEM bundle.                                                                                                                                                       |
@@ -22,7 +22,7 @@ The optional [SIP firewall](./sip-firewall.md) settings (`SIP_FIREWALL_*`) are l
 | `CONTROL_AUTH_TOKEN`              | unset                           | Bearer token for WebSocket and protected HTTP command routes.                                                                                                                              |
 | `CONTROL_MAX_PAYLOAD_BYTES`       | `1048576`                       | Maximum WebSocket message payload.                                                                                                                                                         |
 | `CONTROL_REQUEST_TIMEOUT_MS`      | `15000`                         | Timeout for gateway-initiated control requests.                                                                                                                                            |
-| `RTPBRIDGE_HOST`                  | unset                           | DNS/SRV media discovery. Ignored when `RTC_ENDPOINTS_FILE` is set, so the shipped service always uses catalog media. See [DNS media discovery](#dns-media-discovery).                     |
+| `RTPBRIDGE_HOST`                  | unset                           | Fallback DNS/SRV media discovery when neither a catalog nor a Kubernetes media alias is configured. See [DNS media discovery](#dns-media-discovery).                     |
 | `RTPBRIDGE_PORT`                  | `9100`                          | rtpbridge WebSocket port for DNS discovery.                                                                                                                                                |
 | `RTPBRIDGE_SRV_PORT_NAME`         | `ws`                            | SRV record service name for DNS discovery.                                                                                                                                                 |
 | `RTPBRIDGE_REQUEST_TIMEOUT_MS`    | `10000`                         | rtpbridge JSON-RPC request timeout.                                                                                                                                                        |
@@ -102,7 +102,7 @@ Dynamic WebSocket route registration is preferred for applications that need con
 
 | Variable                              | Default                        | Behavior                                                                                    |
 | ------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------- |
-| `RTC_ENDPOINTS_FILE`                  | required                       | Catalog v2 with independently expiring signaling/media sections; overrides DNS.             |
+| `RTC_ENDPOINTS_FILE`                  | unset                          | Catalog v2 with independently expiring signaling and media sections.                        |
 | `RTPBRIDGE_ENDPOINTS_ALLOW_PLAINTEXT` | `false`                        | Permit WS/HTTP media catalog endpoints for development. Native control always requires WSS. |
 | `RTPBRIDGE_REQUIRED`                  | `false`                        | Require admitting media capacity for readiness and new-call admission.                      |
 | `ROUTES_REQUIRED`                     | `false`                        | Require a registered/static application route for readiness and new-call admission.         |
@@ -116,13 +116,30 @@ gateway does not derive a TURN hostname.
 The first `SIP_ALLOWED_DOMAINS_JSON` entry is also the host of the `From` URI
 built from `callingNumber` on outbound calls; without it the host is `rtc.invalid`.
 
+## Kubernetes DNS discovery
+
+Supply fully qualified Service names, including the deployment's DNS zone. Use
+this configuration with `RTC_ENDPOINTS_FILE` unset.
+
+| Variable | Behavior |
+| --- | --- |
+| `SIPBRIDGE_DNS_SERVICE` | Service publishing sipbridge control endpoints. |
+| `SIPBRIDGE_DNS_ENDPOINT_ID` | Exact DNS endpoint name to select within that Service. |
+| `SIPBRIDGE_TLS_SERVERNAME` | Certificate name to verify for the SIP endpoint. |
+| `RTPBRIDGE_DNS_ALIAS` | Service alias that selects the pool for new media sessions. Its CNAME target must be in the same namespace. |
+| `RTPBRIDGE_DNS_FILES` | Separate Service publishing recording owners. Required when the media alias is set. |
+| `RTPBRIDGE_DNS_LEGACY_SITE` | Optional site label to prepend when an older recording ID has no exact endpoint match. |
+| `RTPBRIDGE_DNS_LEGACY_PREFIXES_JSON` | Optional JSON array of former ID prefixes to strip before trying the configured site label. Prefixes end in a hyphen. |
+
+Services publish control endpoints through `_control._tcp` SRV records. Media
+alias discovery also requires `RTPBRIDGE_TLS_SERVERNAME`,
+`RTPBRIDGE_TLS_CA_FILE` and `RTPBRIDGE_AUTH_HMAC_SECRET_FILE`.
+
 ## DNS media discovery
 
-The media layer still supports `RTPBRIDGE_HOST` DNS/SRV discovery: SRV target
-names, the configured `RTPBRIDGE_PORT` and shared TLS name, and round-robin
-selection. It applies only when `RTC_ENDPOINTS_FILE` is unset. The native SIP
-client requires the catalog, so the shipped service does not currently start in
-this mode.
+Deployments without a catalog or Kubernetes media alias can use
+`RTPBRIDGE_HOST` for media discovery. New sessions use round-robin selection
+among the discovered hosts.
 
 ## Native protocol and migration
 

@@ -30,7 +30,7 @@ yarn docs:build
 CONTROL_AUTH_MODE=none yarn dev
 ```
 
-The service listens on `HTTP_PORT`, default `3001`. It exits at startup unless `RTC_ENDPOINTS_FILE`, `SIPBRIDGE_TLS_CERT_FILE`, `SIPBRIDGE_TLS_KEY_FILE` and `SIPBRIDGE_TLS_CA_FILE` are set. See [configuration](./configuration.md).
+The service listens on `HTTP_PORT`, default `3001`. Startup requires a discovery configuration and all three `SIPBRIDGE_TLS_*` files. See [configuration](./configuration.md).
 
 ## Minimal Dynamic Route
 
