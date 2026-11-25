@@ -12,10 +12,11 @@ file supplies endpoint metadata; it does not proxy control or grant call ownersh
   the last valid document without extending its expiry. A configured catalog never
   falls back to DNS.
 - `dns-endpoints.ts`: native DNS discovery for deployments that use Services
-  and EndpointSlices. Deployments supply their Service names and endpoint IDs.
-  The new-media alias resolves within its own namespace and cannot target the
-  configured recording Service. Recording lookup honors exact IDs first and
-  uses deployment-configured legacy prefixes and site labels for older IDs.
+  and EndpointSlices. Deployments supply their Service names, DNS zones, and
+  endpoint IDs. The new-media alias resolves within its own namespace and
+  cannot target the configured recording Service, including in another zone.
+  Recording lookup honors exact IDs first and uses deployment-configured legacy
+  prefixes and site labels for older IDs.
 - `sipbridge/`: the pinned generated wire contract, strict canonical JSON
   validation and the bounded mTLS control client.
 - `sipbridge-signaling.ts`: native session ownership, reconnect, retained-context

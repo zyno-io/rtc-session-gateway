@@ -5,7 +5,7 @@ import { loadConfig } from '../src/config';
 import { resolveControlEndpoints, resolveMediaAlias } from '../src/dns-endpoints';
 import { MediaServerManager } from '../src/media-server-manager';
 
-const suffix = '.voice.svc.cluster.local';
+const suffix = '.voice.svc.pods.example.test';
 const primary = 'pool-east' + suffix;
 const standby = 'pool-west' + suffix;
 const fileService = 'recording-owners' + suffix;
@@ -73,7 +73,7 @@ test('new allocations follow the DNS alias, calls stay pinned, and file reads re
         assert.equal((await manager.resolveBackend('media-0')).serverName, 'control.example.test');
         assert.equal((await manager.resolveBackend('old-media-0')).httpUrl, 'https://172.18.8.209:9100');
         await assert.rejects(() => manager.resolveBackend('unconfigured-media-0'));
-        target = 'pool-all.other.svc.cluster.local';
+        target = 'pool-all.other.svc.pods.example.test';
         await assert.rejects(() => manager.pickBackendForCall('invalid'));
         assert.equal(await manager.pickBackendForCall('active'), primaryId);
     } finally {
@@ -93,4 +93,6 @@ test('DNS ignores foreign targets and rejects ambiguous control coordinates', as
     };
     assert.deepEqual(await resolveControlEndpoints(primary, resolver), []);
     await assert.rejects(() => resolveMediaAlias(alias, resolver, fileService), /File discovery cannot admit new media sessions/);
+    const exportedFileService = { ...resolver, resolveCname: async () => ['recording-owners.voice.svc.peers.example.test'] };
+    await assert.rejects(() => resolveMediaAlias(alias, exportedFileService, fileService), /File discovery cannot admit new media sessions/);
 });

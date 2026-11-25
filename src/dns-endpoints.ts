@@ -19,12 +19,11 @@ export function discoveryService(value: string, namespace?: string): string {
     const service = value.replace(/\.$/, '');
     const parts = service.split('.');
     if (
-        parts.length !== 5 ||
-        !parts.slice(0, 2).every(part => label.test(part)) ||
+        service.length > 253 ||
+        parts.length < 4 ||
+        !parts.every(part => label.test(part)) ||
         (namespace && parts[1] !== namespace) ||
-        parts[2] !== 'svc' ||
-        !['cluster', 'clusterset'].includes(parts[3]) ||
-        parts[4] !== 'local'
+        parts[2] !== 'svc'
     )
         throw new Error('Invalid discovery Service name');
     return service;
@@ -34,7 +33,9 @@ export async function resolveMediaAlias(alias: string, resolver: EndpointResolve
     const names = await resolver.resolveCname(alias);
     if (names.length !== 1) throw new Error('Media alias must resolve to one Service');
     const service = discoveryService(names[0], alias.split('.')[1]);
-    if (service === fileService) throw new Error('File discovery cannot admit new media sessions');
+    if (fileService && service.split('.', 2).join('.') === fileService.split('.', 2).join('.')) {
+        throw new Error('File discovery cannot admit new media sessions');
+    }
     return resolveControlEndpoints(service, resolver);
 }
 
