@@ -205,6 +205,7 @@ async function runCatalogAdmissionScenario() {
 
 async function runAcceptanceControllerScenario() {
     step('Checking the RTC-owned acceptance controller bootstrap, SIP policy, media smoke and cleanup');
+    const route = 'rtc-acceptance';
     const dockerExec = code => {
         try {
             return execFileSync('docker', ['compose', '-f', composeFile, 'exec', '-T', 'gateway', 'node', '-e', code], {
@@ -217,7 +218,7 @@ async function runAcceptanceControllerScenario() {
         }
     };
     dockerExec(
-        `const fs=require('node:fs');fs.writeFileSync('/tmp/acceptance-token','synthetic-acceptance-token');const child=require('node:child_process').spawn(process.execPath,['dist/acceptance/main.js'],{detached:true,stdio:'ignore',env:{...process.env,RTC_ACCEPTANCE_CONTROL_URL:'ws://127.0.0.1:3001/control',RTC_ACCEPTANCE_TOKEN_FILE:'/tmp/acceptance-token'}});fs.writeFileSync('/tmp/acceptance-pid',String(child.pid));child.unref();`
+        `const fs=require('node:fs');fs.writeFileSync('/tmp/acceptance-token','synthetic-acceptance-token');const child=require('node:child_process').spawn(process.execPath,['dist/acceptance/main.js'],{detached:true,stdio:'ignore',env:{...process.env,RTC_ACCEPTANCE_CONTROL_URL:'ws://127.0.0.1:3001/control',RTC_ACCEPTANCE_TOKEN_FILE:'/tmp/acceptance-token',RTC_ACCEPTANCE_ROUTE:${JSON.stringify(route)}}});fs.writeFileSync('/tmp/acceptance-pid',String(child.pid));child.unref();`
     );
     const invoke = async (path = '/report', body) =>
         JSON.parse(
@@ -228,12 +229,12 @@ async function runAcceptanceControllerScenario() {
     const sip = await SipTcpClient.create();
     try {
         await eventually(async () => assert((await invoke()).controllerReady, 'acceptance owner should register before native admission'), 15000);
-        const denied = sip.buildInvite({ user: 'rtc-acceptance-reject' });
+        const denied = sip.buildInvite({ user: route + '-reject' });
         sip.send(denied.message);
         const rejected = await sip.waitForFinalResponse(denied.callId, 10000);
         assertEqual(rejected.status, 486, 'acceptance reject route');
         sip.send(sip.buildAck(denied, rejected));
-        const invite = sip.buildInvite({ user: 'rtc-acceptance' });
+        const invite = sip.buildInvite({ user: route });
         sip.send(invite.message);
         const answer = await sip.waitForFinalResponse(invite.callId, 10000);
         assertEqual(answer.status, 200, 'acceptance answer');
@@ -247,7 +248,7 @@ async function runAcceptanceControllerScenario() {
         }, 10000);
         const networkReport = JSON.parse(
             dockerExec(
-                `const child=require('node:child_process').spawnSync(process.execPath,['scripts/staging-acceptance.mjs'],{stdio:'inherit',env:{...process.env,RTC_ACCEPTANCE_GATEWAY_URL:'http://127.0.0.1:3001',RTC_ACCEPTANCE_ADVERTISE_IP:'10.89.42.20',RTC_ACCEPTANCE_SIP_HOST:'10.89.42.30',RTC_ACCEPTANCE_SIP_DOMAIN:'localhost',RTC_ACCEPTANCE_SIP_PORT:'5060',RTC_ACCEPTANCE_SIP_PLAINTEXT:'true',RTC_ACCEPTANCE_TOKEN_FILE:'/tmp/acceptance-token'}});process.exit(child.status??1);`
+                `const child=require('node:child_process').spawnSync(process.execPath,['scripts/staging-acceptance.mjs'],{stdio:'inherit',env:{...process.env,RTC_ACCEPTANCE_GATEWAY_URL:'http://127.0.0.1:3001',RTC_ACCEPTANCE_ADVERTISE_IP:'10.89.42.20',RTC_ACCEPTANCE_SIP_HOST:'10.89.42.30',RTC_ACCEPTANCE_SIP_DOMAIN:'localhost',RTC_ACCEPTANCE_SIP_PORT:'5060',RTC_ACCEPTANCE_SIP_PLAINTEXT:'true',RTC_ACCEPTANCE_TOKEN_FILE:'/tmp/acceptance-token',RTC_ACCEPTANCE_ROUTE:${JSON.stringify(route)}}});process.exit(child.status??1);`
             )
         );
         assert(
