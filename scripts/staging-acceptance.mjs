@@ -10,7 +10,7 @@ const env = process.env;
 const base = env.RTC_ACCEPTANCE_GATEWAY_URL;
 const ip = env.RTC_ACCEPTANCE_ADVERTISE_IP;
 const domain = env.RTC_ACCEPTANCE_SIP_DOMAIN;
-const route = env.RTC_ACCEPTANCE_ROUTE || 'rtc-acceptance';
+const route = env.RTC_ACCEPTANCE_ROUTE;
 const report = {
     runId: randomUUID(),
     startedAt: new Date().toISOString(),
@@ -69,7 +69,7 @@ async function sendTone(peer, sdp, frequency) {
 async function main() {
     assert(base && ['http:', 'https:'].includes(new URL(base).protocol), 'RTC_ACCEPTANCE_GATEWAY_URL is required');
     assert(isIP(ip) === 4 && domain, 'Explicit routable IPv4 and SIP domain are required');
-    assert(/^rtc-acceptance(?:-[a-z0-9]+)*$/.test(route), 'Only acceptance routes can be probed');
+    assert(route && /^rtc-acceptance(?:-[a-z0-9]+)*$/.test(route), 'Set RTC_ACCEPTANCE_ROUTE to an exact acceptance route');
     const sip = await SipStreamPeer.create({
         host: env.RTC_ACCEPTANCE_SIP_HOST || domain,
         port: Number(env.RTC_ACCEPTANCE_SIP_PORT || 5061),

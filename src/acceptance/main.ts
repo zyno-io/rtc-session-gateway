@@ -10,7 +10,8 @@ export async function startAcceptance(env: NodeJS.ProcessEnv = process.env) {
     const endpoint = new URL(env.RTC_ACCEPTANCE_CONTROL_URL ?? 'ws://127.0.0.1:3001/control');
     if (!['ws:', 'wss:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
         throw new AcceptanceError('INVALID_CONTROL_URL');
-    const route = env.RTC_ACCEPTANCE_ROUTE ?? 'rtc-acceptance';
+    const route = env.RTC_ACCEPTANCE_ROUTE;
+    if (!route) throw new AcceptanceError('TEST_ROUTE_REQUIRED');
     const tokenFile = env.RTC_ACCEPTANCE_TOKEN_FILE;
     if (!tokenFile) throw new AcceptanceError('TOKEN_FILE_REQUIRED');
     const token = () => {
