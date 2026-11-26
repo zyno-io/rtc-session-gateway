@@ -42,19 +42,23 @@ export async function resolveMediaAlias(alias: string, resolver: EndpointResolve
 export async function resolveControlEndpoints(service: string, resolver: EndpointResolver, names?: ReadonlySet<string>): Promise<DnsEndpoint[]> {
     const records = await resolver.resolveSrv('_control._tcp.' + service);
     if (records.length > 64) throw new Error('Discovery pool exceeds 64 SRV records');
-    const portsByName = new Map<string, Set<number>>();
+    const coordinatesByName = new Map<string, { targets: Set<string>; ports: Set<number> }>();
     for (const record of records) {
-        const [name, ...suffix] = record.name.replace(/\.$/, '').split('.');
-        if (!label.test(name) || suffix.join('.') !== service || (names && !names.has(name))) continue;
+        const target = record.name.replace(/\.$/, '');
+        const [name, ...suffix] = target.split('.');
+        const local = suffix.join('.') === service;
+        const clusterQualified = label.test(suffix[0] ?? '') && suffix.slice(1).join('.') === service;
+        if (!label.test(name) || (!local && !clusterQualified) || (names && !names.has(name))) continue;
         if (typeof record.port !== 'number' || !Number.isInteger(record.port) || record.port < 1 || record.port > 65535) continue;
-        const ports = portsByName.get(name) ?? new Set<number>();
-        ports.add(record.port);
-        portsByName.set(name, ports);
+        const coordinates = coordinatesByName.get(name) ?? { targets: new Set<string>(), ports: new Set<number>() };
+        coordinates.targets.add(target);
+        coordinates.ports.add(record.port);
+        coordinatesByName.set(name, coordinates);
     }
     const observed = await Promise.allSettled(
-        [...portsByName].map(async ([name, ports]) => {
-            if (ports.size !== 1) throw new Error('Ambiguous control port');
-            const addresses = await resolver.resolve4(name + '.' + service);
+        [...coordinatesByName].map(async ([name, { targets, ports }]) => {
+            if (targets.size !== 1 || ports.size !== 1) throw new Error('Ambiguous control target');
+            const addresses = await resolver.resolve4([...targets][0]);
             const hosts = new Set(addresses);
             if (hosts.size !== 1) throw new Error('Ambiguous control address');
             const port = [...ports][0];
