@@ -96,3 +96,24 @@ test('DNS ignores foreign targets and rejects ambiguous control coordinates', as
     const exportedFileService = { ...resolver, resolveCname: async () => ['recording-owners.voice.svc.peers.example.test'] };
     await assert.rejects(() => resolveMediaAlias(alias, exportedFileService, fileService), /File discovery cannot admit new media sessions/);
 });
+
+test('cluster-qualified SRV targets keep the endpoint ID and resolve the complete target', async () => {
+    const target = `${primaryId}.east-cluster.${primary}`;
+    const queries: string[] = [];
+    const resolver = {
+        resolveCname: async () => [primary],
+        resolveSrv: async () => [
+            { name: target + '.', port: 9100 },
+            { name: `${standbyId}.east-cluster.${primary}`, port: 9100 },
+            { name: `${standbyId}.west-cluster.${primary}`, port: 9100 },
+            { name: `invalid.east-cluster.${standby}`, port: 9100 },
+            { name: `invalid.nested.east-cluster.${primary}`, port: 9100 }
+        ],
+        resolve4: async (name: string) => {
+            queries.push(name);
+            return ['172.18.8.205'];
+        }
+    };
+    assert.deepEqual(await resolveMediaAlias(alias, resolver, fileService), [{ name: primaryId, host: '172.18.8.205', port: 9100 }]);
+    assert.deepEqual(queries, [target]);
+});

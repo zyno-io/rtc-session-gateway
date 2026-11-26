@@ -131,7 +131,9 @@ this configuration with `RTC_ENDPOINTS_FILE` unset.
 | `RTPBRIDGE_DNS_LEGACY_SITE` | Optional site label to prepend when an older recording ID has no exact endpoint match. |
 | `RTPBRIDGE_DNS_LEGACY_PREFIXES_JSON` | Optional JSON array of former ID prefixes to strip before trying the configured site label. Prefixes end in a hyphen. |
 
-Services publish control endpoints through `_control._tcp` SRV records. Media
+Services publish control endpoints through `_control._tcp` SRV records. The
+records can use a local endpoint name or include a cluster label between the
+endpoint ID and Service name. Media
 alias discovery also requires `RTPBRIDGE_TLS_SERVERNAME`,
 `RTPBRIDGE_TLS_CA_FILE` and `RTPBRIDGE_AUTH_HMAC_SECRET_FILE`.
 

@@ -15,6 +15,9 @@ file supplies endpoint metadata; it does not proxy control or grant call ownersh
   and EndpointSlices. Deployments supply their Service names, DNS zones, and
   endpoint IDs. The new-media alias resolves within its own namespace and
   cannot target the configured recording Service, including in another zone.
+  Control SRV targets can include one cluster label between the endpoint ID
+  and the exact Service name. DNS resolution uses the complete SRV target.
+  Each endpoint ID must resolve through a single target and port.
   Recording lookup honors exact IDs first and uses deployment-configured legacy
   prefixes and site labels for older IDs.
 - `sipbridge/`: the pinned generated wire contract, strict canonical JSON
