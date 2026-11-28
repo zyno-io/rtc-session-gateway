@@ -150,7 +150,7 @@ class Dialog extends EventEmitter {
         if (!waiter) return;
         clearTimeout(waiter.timer);
         this.waiters.delete(cseq);
-        waiter.reject(new Error('cancelled'));
+        waiter.reject(new Error('canceled'));
     }
 }
 
@@ -244,7 +244,7 @@ async function fixture(
     const requests: { method: string; params: any }[] = [];
     const opened: unknown[] = [];
     const provisionalSeen: number[] = [];
-    let cancelled = 0;
+    let canceled = 0;
     let prepareFailure: Error | undefined;
     let prepareHook: (() => Promise<void>) | undefined;
     let dialHook: (() => Promise<void>) | undefined;
@@ -289,7 +289,7 @@ async function fixture(
             const attempt = {
                 onProvisional: undefined as undefined | ((status: number) => void),
                 cancel: async () => {
-                    cancelled++;
+                    canceled++;
                     if (cancelFailure) throw cancelFailure;
                 },
                 completed: (async () => {
@@ -405,7 +405,7 @@ async function fixture(
         opened,
         provisionalSeen,
         sources,
-        cancelled: () => cancelled,
+        canceled: () => canceled,
         dials: () => opened.length,
         failRecording: () => {
             prepareFailure = new Error('recorder unavailable');
@@ -465,7 +465,7 @@ test('destination provisional responses are ignored: no cancel and no relay', as
     const f = await fixture();
     await f.gateway.transfer(f.params, 'app');
     assert.deepEqual(f.provisionalSeen, [183]);
-    assert.equal(f.cancelled(), 0);
+    assert.equal(f.canceled(), 0);
     assert.equal(f.call.ownership, 'handed-off');
 });
 
@@ -1597,7 +1597,7 @@ test('an application disconnect during post-commit media cleanup cannot cancel o
         'commit published'
     );
     await f.gateway.terminateCallsForControlConnection('app');
-    assert.equal(f.cancelled(), 0, 'the committed destination attempt is no longer cancellable');
+    assert.equal(f.canceled(), 0, 'the committed destination attempt is no longer cancellable');
     assert.equal(f.center.byes, 0);
     assert.equal(f.caller.byes, 0);
     assert.equal(f.call.ownership, 'handed-off');
@@ -1963,7 +1963,7 @@ test('a Replaces return whose named destination left during the answer tears dow
     assert.equal(replacement.byes, 1);
 });
 
-test('a cancelled late-offer outbound that the destination still answers is ACKed with a rejection before its BYE', async () => {
+test('a canceled late-offer outbound that the destination still answers is ACKed with a rejection before its BYE', async () => {
     const f = await fixture();
     const gate = Promise.withResolvers<void>();
     f.delayDial(() => gate.promise);
@@ -1973,7 +1973,7 @@ test('a cancelled late-offer outbound that the destination still answers is ACKe
         controlConnectionId: 'app',
         outboundAttemptId: 'attempt-1'
     } as never);
-    const rejected = assert.rejects(outbound, /cancelled/);
+    const rejected = assert.rejects(outbound, /canceled/);
     await turn();
     await turn();
     await f.gateway.cancelOutbound('attempt-1', 'app');
@@ -2208,7 +2208,7 @@ test('a CANCEL whose retries ran out leaves setup pending: the destination that 
         controlConnectionId: 'app',
         outboundAttemptId: 'attempt-1'
     } as never);
-    const rejected = assert.rejects(outbound, /cancelled/);
+    const rejected = assert.rejects(outbound, /canceled/);
     await turn();
     await turn();
     await assert.rejects(f.gateway.cancelOutbound('attempt-1', 'app'));
@@ -2220,7 +2220,7 @@ test('a CANCEL whose retries ran out leaves setup pending: the destination that 
     );
 });
 
-test('an outbound setup that fails at the native deadline is cancelled once more', async () => {
+test('an outbound setup that fails at the native deadline is canceled once more', async () => {
     const f = await fixture();
     f.delayDial(async () => {
         throw new NativeOperationError('Outbound setup deadline', true);
@@ -2235,7 +2235,7 @@ test('an outbound setup that fails at the native deadline is cancelled once more
         /deadline/
     );
     await turn();
-    assert.equal(f.cancelled(), 1);
+    assert.equal(f.canceled(), 1);
     assert.equal(f.center.byes, 0);
 });
 
@@ -2485,11 +2485,11 @@ test('an app cancel that preceded the failed open result still gets the deadline
     const failed = assert.rejects(outbound, /deadline/);
     await turn();
     await f.gateway.cancelOutbound('attempt-3', 'app');
-    assert.equal(f.cancelled(), 1);
+    assert.equal(f.canceled(), 1);
     gate.reject(new NativeOperationError('Outbound setup deadline', true));
     await failed;
     await turn();
-    assert.equal(f.cancelled(), 2);
+    assert.equal(f.canceled(), 2);
 });
 
 const slowOwner = (f: Fixture) => {
@@ -2670,7 +2670,7 @@ test('carrier hangup after the destination answer was observed sends no CANCEL; 
     gate.resolve();
     await transfer;
     await settle(20);
-    assert.equal(f.cancelled(), 0);
+    assert.equal(f.canceled(), 0);
     assert.ok(f.log.indexOf('center:ack') >= 0 && f.log.indexOf('center:ack') < f.log.indexOf('center:bye'));
     assert.equal(f.center.byes, 1);
 });
@@ -2685,7 +2685,7 @@ test('an app disconnect after the destination answer was observed sends no CANCE
     gate.resolve();
     await transfer;
     await settle(20);
-    assert.equal(f.cancelled(), 0);
+    assert.equal(f.canceled(), 0);
     assert.equal(f.center.byes, 1);
 });
 
@@ -3305,7 +3305,7 @@ test('a failed application-owned Replaces whose restored media moved renegotiate
     const f = await fixture();
     const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
     f.hub.request = async () => ({ action: 'answer', sdp: answers.shift()! }) as never;
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     await f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never
@@ -3322,7 +3322,7 @@ test('a failed application-owned Replaces ends the call when the original peer r
     const answers = [sdp('10.0.0.8', 48000), sdp('10.0.0.9', 49000)];
     f.hub.request = async () => ({ action: 'answer', sdp: answers.shift()! }) as never;
     f.caller.reinviteFailure = new Error('488');
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     await f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never
@@ -3333,12 +3333,12 @@ test('a failed application-owned Replaces ends the call when the original peer r
 
 const withCrypto = (text: string, key: string) => text.replace('a=sendrecv', `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${key}\r\na=sendrecv`);
 
-/** A replacement INVITE that is cancelled, so the application restores media: first answer binds 10.0.0.8, the restore 10.0.0.9. */
+/** A replacement INVITE that is canceled, so the application restores media: first answer binds 10.0.0.8, the restore 10.0.0.9. */
 async function failedReplaceWithRestore(f: Fixture, carrierAnswer: () => Promise<string>, restoreAnswer = sdp('10.0.0.9', 49000)) {
     const answers = [sdp('10.0.0.8', 48000), restoreAnswer];
     f.hub.request = (async () => ({ action: 'answer', sdp: answers.shift()! })) as never;
     f.caller.reinviteHook = carrierAnswer;
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     await f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never
@@ -3414,7 +3414,7 @@ test('a transfer of another call is refused while a replace restore re-INVITE is
         await gate.promise;
         return sdp('10.0.0.1');
     };
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     const pending = f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never
@@ -3545,7 +3545,7 @@ test('an app-owned Replaces restore with the same address but a new SDES key ren
     const answers = [keyed('10.0.0.8', 48000, 'AAAA'), keyed('10.0.0.8', 48000, 'BBBB')];
     f.hub.request = (async () => ({ action: 'answer', sdp: answers.shift()! })) as never;
     f.caller.reinviteHook = async () => sdp('10.0.0.1');
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     await f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never
@@ -3620,7 +3620,7 @@ test('an app-owned Replaces restore answering the carrier-selected codec on the 
     f.caller.remoteSdp = f.call.remoteSdp = media('10.0.0.1', 30000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000']);
     const answers = [sdp('10.0.0.9', 49000), media('10.0.0.8', 48000, '0 101', [PCMU, 'a=rtpmap:101 telephone-event/48000'])];
     f.hub.request = async () => ({ action: 'answer', sdp: answers.shift()! }) as never;
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     await f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never
@@ -4475,7 +4475,7 @@ test('Codex 1 (r21): a carrier 481 takes the registry token before the final NOT
     assert.deepEqual(terminatedReasons(f), ['dialog-gone', 'return-aborted']);
 });
 
-test('Codex 2 (r21): a cancelled Replaces on an offerless call refreshes the baseline from the original dialog and restores media', async () => {
+test('Codex 2 (r21): a canceled Replaces on an offerless call refreshes the baseline from the original dialog and restores media', async () => {
     const f = await fixture();
     f.call.remoteSdp = '';
     f.caller.remoteSdp = '';
@@ -4486,7 +4486,7 @@ test('Codex 2 (r21): a cancelled Replaces on an offerless call refreshes the bas
         return { action: 'answer', sdp: answers.shift()! };
     }) as never;
     f.caller.reinviteHook = async () => sdp('10.0.0.1');
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     await f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never
@@ -4498,12 +4498,12 @@ test('Codex 2 (r21): a cancelled Replaces on an offerless call refreshes the bas
     assert.match(f.registry.get('caller')!.localSdp ?? '', /c=IN IP4 10\.0\.0\.9/);
 });
 
-test('Codex 2 (r21): a cancelled Replaces whose baseline is still unknown ends the call instead of leaving replacement media', async () => {
+test('Codex 2 (r21): a canceled Replaces whose baseline is still unknown ends the call instead of leaving replacement media', async () => {
     const f = await fixture();
     f.call.remoteSdp = '';
     f.caller.remoteSdp = '';
     f.hub.request = (async () => ({ action: 'answer', sdp: sdp('10.0.0.8', 48000) })) as never;
-    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('cancelled before answer'));
+    const response = new Response(new Dialog('replacement', 'new-local', 'new-remote'), new Error('canceled before answer'));
     await f.gateway.handleInvite(
         invite({ replaces: 'caller;to-tag=gateway-tag;from-tag=caller-tag' }, 'replacement', '10.0.0.1') as never,
         response as never

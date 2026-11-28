@@ -169,7 +169,7 @@ test('native outbound parameters and cancellation remain bound to the initiating
                 }),
                 async cancel() {
                     cancellations++;
-                    reject(new Error('cancelled'));
+                    reject(new Error('canceled'));
                 }
             };
         }

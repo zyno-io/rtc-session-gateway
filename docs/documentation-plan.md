@@ -66,7 +66,7 @@ Every event should document:
 - Producer.
 - Delivery channel.
 - Ordering and `sequence` behavior.
-- Required acknowledgements, if any.
+- Required acknowledgments, if any.
 - Retry or drop behavior.
 - Example payload.
 

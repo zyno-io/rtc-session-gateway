@@ -1129,7 +1129,7 @@ export class SipGateway {
             const proxy = shared ? await this.sharedHandoffProxy(params.proxy ?? params.requestUri) : params.proxy;
             if (shared) {
                 this.assertLiveCall(call);
-                if (pending.cancelRequested) throw new InvalidCallStateError('Transfer cancelled');
+                if (pending.cancelRequested) throw new InvalidCallStateError('Transfer canceled');
             }
             attempt = this.signaling.openDialog({
                 requestUri: params.requestUri,
@@ -1153,7 +1153,7 @@ export class SipGateway {
             destinationAnsweredAt = Date.now();
             if (destinationOffer) this.ackOwed.set(destination, { settle: settleDestinationAck, answeredAt: () => destinationAnsweredAt });
             this.assertLiveCall(call);
-            if (pending.cancelRequested) throw new InvalidCallStateError('Transfer cancelled');
+            if (pending.cancelRequested) throw new InvalidCallStateError('Transfer canceled');
             if (shared) {
                 const ready = destination.finalResponse?.headers.filter(h => h.name.toLowerCase() === HANDOFF_HEADER.toLowerCase()) ?? [];
                 const target = targetSession(readHandoff('ready', ready.length === 1 ? ready[0].value : undefined, 4), shared, destination.sipCallId);
@@ -1418,7 +1418,7 @@ export class SipGateway {
             const answeredAt = Date.now();
 
             if (pending.cancelRequested || dialog.isEnded || this.lifecycle?.isStopping) {
-                // A destination that answered a cancelled late-offer setup (CANCEL refused or lost the race) is owed an
+                // A destination that answered a canceled late-offer setup (CANCEL refused or lost the race) is owed an
                 // ACK (a rejection) before its BYE (I6).
                 const offer = dialog.remoteSdp;
                 if (!params.sdp && offer && !dialog.isEnded && !dialog.isFenced) {
@@ -1431,7 +1431,7 @@ export class SipGateway {
                     });
                 }
                 await this.byeLeg(dialog);
-                throw new InvalidCallStateError('Outbound SIP call was cancelled');
+                throw new InvalidCallStateError('Outbound SIP call was canceled');
             }
 
             const localSdp = dialog.localSdp || params.sdp;
@@ -1481,7 +1481,7 @@ export class SipGateway {
             if (pending.attempt && !answered && !this.stopping && !(err instanceof NativeOperationError && err.unavailable)) {
                 void pending.attempt.cancel().catch(() => undefined);
             }
-            if (pending.cancelRequested) this.logger.info(logContext, 'Outbound SIP dialog cancelled');
+            if (pending.cancelRequested) this.logger.info(logContext, 'Outbound SIP dialog canceled');
             else this.logger.warn({ failure: 'signaling-or-owner-operation-failed', ...logContext }, 'Outbound SIP dialog failed');
             if (err instanceof NativeOperationError && (err.uncertain || err.unavailable)) throw err;
             throw new InvalidCallStateError(errorMessage(err));
@@ -1520,7 +1520,7 @@ export class SipGateway {
                 throw pending.cancelError;
             });
         }
-        this.logger.info({ outboundAttemptId, controlConnectionId }, 'Cancelled pending outbound SIP dialog');
+        this.logger.info({ outboundAttemptId, controlConnectionId }, 'Canceled pending outbound SIP dialog');
         return { ok: true as const };
     }
 

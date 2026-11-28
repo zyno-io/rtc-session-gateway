@@ -472,14 +472,14 @@ async function runOutboundCancelScenario(controlClient) {
         await controlClient.request('sip.cancelOutbound', { outboundAttemptId: attemptId });
         await responder.waitForEvent('cancel', 10_000);
         const outcome = await outboundResult;
-        assert(outcome.error, 'cancelled outbound INVITE should reject the original command');
+        assert(outcome.error, 'canceled outbound INVITE should reject the original command');
         await responder.waitForEvent('ack', 10_000);
         const calls = await getJson(`${gatewayBaseUrl}/calls`);
-        assertEqual(calls.calls.length, 0, 'cancelled outbound INVITE should leave no active calls');
+        assertEqual(calls.calls.length, 0, 'canceled outbound INVITE should leave no active calls');
     } finally {
         await responder.close();
     }
-    await assertRtpbridgeSessionsEmpty('cancelled outbound INVITE should leave no media');
+    await assertRtpbridgeSessionsEmpty('canceled outbound INVITE should leave no media');
 }
 
 async function runSipHandoffScenario({ srtp = false } = {}) {
@@ -1161,7 +1161,7 @@ async function runGatewayDrainDeadlineScenario() {
         await pendingRequest;
         const byeRequest = sip.waitForRequest('BYE', invite.callId, 10_000);
         const inboundFinal = sip.waitForFinalResponse(pendingInvite.callId, 10_000);
-        const cancelled = responder.waitForEvent('cancel', 10_000);
+        const canceled = responder.waitForEvent('cancel', 10_000);
         const acknowledged = responder.waitForEvent('ack', 10_000);
         const response = await e2eFetch(`${gatewayBaseUrl}/terminate`, { method: 'POST' });
         assertEqual(response.status, 202, 'legacy terminate should initiate graceful drain');
@@ -1169,7 +1169,7 @@ async function runGatewayDrainDeadlineScenario() {
         sip.send(sip.buildResponse(bye, 200, 'OK'));
         const rejected = await inboundFinal;
         assertEqual(rejected.status, 503, 'deadline should reject admitted but unfinished inbound SIP');
-        await cancelled;
+        await canceled;
         await acknowledged;
         const outcome = await outbound;
         assert(outcome.error, 'deadline should reject pending outbound command without a client attempt ID');

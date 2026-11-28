@@ -335,7 +335,7 @@ export class NativeDialog extends EventEmitter {
         if (!waiter) return;
         clearTimeout(waiter.timer);
         this.ackWaiters.delete(inviteCseq);
-        waiter.reject(new NativeOperationError('ACK wait cancelled'));
+        waiter.reject(new NativeOperationError('ACK wait canceled'));
     }
 }
 export interface OutboundAttempt {
@@ -1122,7 +1122,7 @@ export class SipbridgeSignaling extends EventEmitter {
     }
     openDialog(params: OutboundSipCallParams): OutboundAttempt {
         let state: Context | undefined;
-        let cancelled = false;
+        let canceled = false;
         const completed = (async () => {
             if (!this.isConnected || !this.applicationReady() || this.isDraining())
                 throw new NativeOperationError('Native SIP admission unavailable', false, true);
@@ -1199,7 +1199,7 @@ export class SipbridgeSignaling extends EventEmitter {
                 // The open result can already carry the answer (it projects current state): CANCEL no longer applies to an
                 // answered, ended or fenced context. An answered one is delivered below, so the caller's ACK-aware cleanup
                 // (ACK with a rejection, then BYE) owns it.
-                if (cancelled && !state.ended && !state.uncertain && !state.snapshot.answered) {
+                if (canceled && !state.ended && !state.uncertain && !state.snapshot.answered) {
                     try {
                         await this.sendCancel(state);
                     } catch (error) {
@@ -1240,7 +1240,7 @@ export class SipbridgeSignaling extends EventEmitter {
         const attempt: OutboundAttempt = {
             completed,
             cancel: async () => {
-                cancelled = true;
+                canceled = true;
                 // Once the answer is observed CANCEL no longer applies: sipbridge would mark the selected dialog retiring and
                 // refuse the later BYE while the INVITE awaits its ACK. The caller's ACK-aware cleanup owns the dialog.
                 if (state && !state.ended && !state.snapshot.answered && !state.dialog) await this.sendCancel(state);

@@ -254,7 +254,7 @@ export class RtpbridgeClient extends EventEmitter {
     async transferEndpoint(endpointId: string, targetSessionId: string): Promise<void> {
         const reply = await this.sendRequest('endpoint.transfer', { endpointId, targetSessionId });
         if (reply?.endpointId !== endpointId || reply?.targetSessionId !== targetSessionId)
-            throw new RtpbridgeRequestError('Invalid endpoint.transfer acknowledgement', 'protocol_error');
+            throw new RtpbridgeRequestError('Invalid endpoint.transfer acknowledgment', 'protocol_error');
     }
 
     async hasSessionEndpoint(endpointId: string): Promise<boolean> {
