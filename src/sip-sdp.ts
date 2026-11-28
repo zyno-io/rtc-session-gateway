@@ -130,7 +130,7 @@ function parseMediaSections(sdp: string): MediaSection[] {
     return sections;
 }
 
-/** Formats that carry signalling or repair data, never voice (matched by lowercase rtpmap encoding name). */
+/** Formats that carry signaling or repair data, never voice (matched by lowercase rtpmap encoding name). */
 const NON_VOICE_ENCODINGS = new Set(['telephone-event', 'cn', 'red', 'ulpfec', 'flexfec', 'flexfec-03', 'rtx']);
 
 /** True when the payload type is a real voice codec: not telephone-event, CN (static PT 13), red, ulpfec, flexfec or rtx. */
